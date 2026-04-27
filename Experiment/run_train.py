@@ -7,7 +7,7 @@ import json
 # Configuration Source
 # =============================================================================
 # Specify the experiment key from ExperimentSetting.json to run
-TARGET_EXPERIMENT = "Exp5_AccretionConvNet"  # Change this to the desired experiment key
+TARGET_EXPERIMENT = "Exp1_AccretionConvNet"  # Change this to the desired experiment key 运行第几类实验，使用哪个模型
 
 def load_config(exp_key):
     """
@@ -105,7 +105,7 @@ def main():
     
     # Run
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True) # 执行train
     except subprocess.CalledProcessError as e:
         print(f"\n[Error] Process exited with error code {e.returncode}")
     except KeyboardInterrupt:

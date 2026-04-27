@@ -29,7 +29,7 @@ from Experiment.models import AccretionTransformer, AccretionConvNet, MACNetRes_
 MBH_ONLY_MODELS = (MACNetRes_mbh, MACNetFiLM)
 
 
-def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, mbh: torch.Tensor) -> torch.Tensor:
+def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, mbh: torch.Tensor) -> torch.Tensor: # 利用model输出预测值
     if isinstance(model, MBH_ONLY_MODELS):
         return model(x, mbh)
     r = coord[:, 0:1]
@@ -47,6 +47,9 @@ class RadialCropAugmentor:
 
     The augmentation randomly selects a cutoff radius 'b' between (r_max * min_ratio) and r_max.
     All data points where r > b are masked (set to 0).
+    
+    数据增强。r较小的地方是核心，物理梯度极大；r较大的地方则可能受到初始条件和人为边界的干扰，对真实吸积率影响较小甚至可能包含噪音
+    如何实现？有50%的概率触发裁剪，在[r_max * 0.8, r_max] 之间随机抽取一个半径 b，然后对所有半径大于b的网格强行设置为0
     """
 
     def __init__(self, min_crop_ratio: float = 0.8, p_crop: float = 0.5):
@@ -95,15 +98,15 @@ class GalPTDataset(Dataset):
     def __init__(self, pt_path, *, augmentor: Optional[RadialCropAugmentor] = None):
         super().__init__()
         try:
-            loaded = torch.load(pt_path, weights_only=False)
+            loaded = torch.load(pt_path, weights_only=False) # 从prepare_data输出的pt文件中读取
         except Exception as exc:
             raise RuntimeError(f"Failed to load dataset cache '{pt_path}'. ") from exc
 
         if isinstance(loaded, (list, tuple)):
-            if len(loaded) == 6:
+            if len(loaded) == 6: # 兼容旧版本，只有6个元素，没有邦迪吸积率
                 self.x, self.coord, self.y, self.mbh, self.groups, self.n_groups = loaded
                 self.y_bondi = None
-            elif len(loaded) >= 7:
+            elif len(loaded) >= 7: # 新版本，包含邦迪吸积率，忽略多余的字段
                 self.x, self.coord, self.y, self.mbh, self.y_bondi, self.groups, self.n_groups = loaded[:7]
                 if len(loaded) > 7:
                     print(
@@ -133,14 +136,14 @@ class GalPTDataset(Dataset):
                     f"Cached field '{name}' in '{pt_path}' cannot be converted " "to a float32 tensor."
                 ) from inner_exc
 
-        self.x = _ensure_tensor(self.x, name="x").contiguous()
+        self.x = _ensure_tensor(self.x, name="x").contiguous() # 强制把特征图（x，y）和坐标coord在内存中连续排列，可以大幅提升GPU读取数据的速度
         self.coord = _ensure_tensor(self.coord, name="coord").contiguous()
-        self.y = _ensure_tensor(self.y, name="y").view(-1, 1)
+        self.y = _ensure_tensor(self.y, name="y").view(-1, 1) # 将吸积率、黑洞质量等一维标量强行变形为[样本数，1]的二维张量，为了和神经网络的输出形状对齐
         self.mbh = _ensure_tensor(self.mbh, name="mbh").view(-1, 1)
         self.y_bondi = _ensure_tensor(self.y_bondi, name="y_bondi").view(-1, 1) if self.y_bondi is not None else None
 
         groups_raw = _ensure_tensor(self.groups, name="groups")
-        if isinstance(groups_raw, np.ndarray) and groups_raw.dtype.kind in "SU":
+        if isinstance(groups_raw, np.ndarray) and groups_raw.dtype.kind in "SU": # 如果groups是字符串类型（如星系类型），则保持为numpy字符串数组，稍后在内存中转换为整数标签；否则直接转换为float32张量
             # Handle string groups
             raw_groups = groups_raw.reshape(-1, 1)
             unique_groups, inv = np.unique(raw_groups, return_inverse=True)
@@ -169,81 +172,91 @@ class GalPTDataset(Dataset):
         x = self.x[idx]
         coord = self.coord[idx]
         if self.augmentor is not None:
-            x, coord = self.augmentor(x, coord)
+            x, coord = self.augmentor(x, coord) # 调用augmentor对特征图和坐标进行随机裁剪
         return x, coord, self.mbh[idx], self.y[idx], self.groups[idx], self.n_groups
 
 
 # =============================================
 # 2) Args
 # =============================================
-def parse_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace: # 能够输入哪些训练参数
     parser = argparse.ArgumentParser(description="Train MACNetRes with MBH input")
-    parser.add_argument("--cache_dir", type=str, default=".cache", help="Directory containing cached .pt datasets")
-    parser.add_argument("--exp_name", type=str, default="Exp5_", help="Experiment name prefix used for saving results")
-    parser.add_argument(
+    parser.add_argument("--cache_dir", type=str, default=".cache", help="Directory containing cached .pt datasets") # 去哪拿.pt数据
+    parser.add_argument("--exp_name", type=str, default="Exp5_", help="Experiment name prefix used for saving results") # 这次做哪个实验
+    parser.add_argument( # 从哪个实验的数据中加载.pt文件，默认和当前实验名相同
         "--data_exp", type=str, default=None, help="Experiment name prefix for loading data (default: same as exp_name)"
     )
-    parser.add_argument("--batch_size", type=int, default=64, help="Training batch size")
-    parser.add_argument("--epochs", type=int, default=500, help="Maximum number of training epochs")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0, help="AdamW weight decay (L2 regularization)")
-    parser.add_argument("--lr_min", type=float, default=0.0, help="Minimum learning rate once cosine decay completes")
-    parser.add_argument(
+
+    # ↓ 训练的超参数
+    parser.add_argument("--batch_size", type=int, default=64, help="Training batch size") # 每次训练送入模型的样本数量
+    parser.add_argument("--epochs", type=int, default=500, help="Maximum number of training epochs") # 最大训练轮数
+    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate") # 初始学习率
+    parser.add_argument("--weight_decay", type=float, default=0, help="AdamW weight decay (L2 regularization)") # 权重衰减，AdamW优化器的L2正则化强度
+    parser.add_argument("--lr_min", type=float, default=0.0, help="Minimum learning rate once cosine decay completes") # 余弦退火完成后的最大学习率，通常设置为0或一个很小的值，以允许学习率在训练后期非常小，从而微调模型参数
+    parser.add_argument( # 学习率预热的参数，预热阶段学习率从lr_warmup_start_factor * lr线性增加到lr，持续lr_warmup_steps步；如果lr_warmup_steps=0，则禁用预热并直接使用lr
         "--lr_warmup_steps",
         type=int,
         default=0,
         help="Number of linear warmup steps before cosine decay (0 to disable)",
     )
-    parser.add_argument(
+    parser.add_argument( # 如果lr_warmup_steps=0，则使用lr_warmup_ratio指定预热占总训练步数的比例（如0.2表示20%），否则忽略lr_warmup_ratio
         "--lr_warmup_ratio",
         type=float,
         default=0.2,
         help="If warmup steps is 0, use this fraction of total steps for warmup (0 disables)",
     )
-    parser.add_argument(
+    parser.add_argument( # 预热阶段学习率的起始相对因子，0.0表示从0开始预热，1.0表示从lr开始预热（即没有预热效果），通常设置为0.0以实现完整的预热效果
         "--lr_warmup_start_factor",
         type=float,
         default=0.0,
         help="Relative learning rate factor to start warmup from (0.0 starts from zero)",
     )
-    default_workers = 0 if os.name == "nt" else min(16, (os.cpu_count() or 2) // 2)
-    parser.add_argument("--num_workers", type=int, default=default_workers, help="Number of dataloader workers")
+    default_workers = 0 if os.name == "nt" else min(16, (os.cpu_count() or 2) // 2) 
+    parser.add_argument("--num_workers", type=int, default=default_workers, help="Number of dataloader workers") # 加载数据的子进程数量，Windows系统默认0（主进程加载），Unix系统默认CPU核心数的一半（但不超过16）
     parser.add_argument(
-        "--persistent_workers", action="store_true", help="Keep dataloader workers persistent between epochs"
+        "--persistent_workers", action="store_true", help="Keep dataloader workers persistent between epochs" # 是否在epoch之间保持数据加载器的子进程持续运行，启用后可以减少每个epoch开始时的启动开销，但会占用更多系统资源；通常在num_workers > 0且系统资源允许的情况下启用
     )
-    parser.add_argument("--prefetch_factor", type=int, default=3, help="Prefetch factor for dataloader (per worker)")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--print_group_counts", action="store_true", help="Print per-group sample counts for loaders")
-    parser.add_argument(
+    parser.add_argument("--prefetch_factor", type=int, default=3, help="Prefetch factor for dataloader (per worker)") # 每个数据加载器子进程预取的批次数量，默认3表示每个子进程在当前批次处理时预取3个批次的数据，以提高数据加载效率；如果num_workers=0，则此参数被忽略
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility") # 随机种子，用于保证实验的可重现性
+    parser.add_argument("--print_group_counts", action="store_true", help="Print per-group sample counts for loaders") # 打印每个组的样本数量，有助于检查数据分布是否平衡
+    
+    # ↓ cpu/gpu相关的参数
+    parser.add_argument( # 选择cpu还是cuda训练
         "--device",
         type=str,
         choices=["auto", "cpu", "cuda"],
         default="auto",
         help="Device to use: 'auto', 'cpu' or 'cuda'",
     )
-    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs without improvement)")
-    parser.add_argument(
+    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience (epochs without improvement)") # 早停耐心值，如果验证集指标在连续patience个epoch内没有改善，则提前停止训练
+    parser.add_argument( # 是否禁用自动混合精度（AMP），即使CUDA可用。启用AMP可以在支持的GPU上加速训练并减少显存使用，但在某些情况下可能导致数值不稳定或性能下降；如果遇到问题，可以尝试添加--no_amp参数禁用AMP
         "--no_amp", action="store_true", help="Disable automatic mixed precision (AMP) even if CUDA is available"
     )
-    parser.add_argument("--grad_clip", type=float, default=0.3, help="Max norm for gradient clipping (0 to disable)")
-    parser.add_argument(
+    parser.add_argument("--grad_clip", type=float, default=0.3, help="Max norm for gradient clipping (0 to disable)") # 梯度裁剪的最大范数，默认0.3表示如果启用梯度裁剪，当梯度的总范数超过0.3时，将其缩放回0.3以防止梯度爆炸；如果设置为0或负值，则禁用梯度裁剪
+    parser.add_argument( # 是否启用cuDNN benchmark模式，启用后cuDNN会在训练开始时进行一些性能测试，以选择最适合当前模型和输入大小的卷积算法，从而可能加速训练；但在某些情况下（如输入大小变化较大时）可能导致性能不稳定或增加启动时间；如果遇到问题，可以尝试添加--cudnn_benchmark参数启用该模式
         "--cudnn_benchmark", action="store_true", help="Enable cuDNN benchmark mode for potential speedup"
     )
-    parser.add_argument("--loss", type=str, choices=["mse", "l1", "huber"], default="mse", help="Loss function to use")
-    parser.add_argument("--huber_delta", type=float, default=1, help="Delta parameter for Huber loss")
-    parser.add_argument(
+
+    # ↓ 损失函数的参数
+    parser.add_argument("--loss", type=str, choices=["mse", "l1", "huber"], default="mse", help="Loss function to use") # 损失函数类型，支持均方误差（MSE）、平均绝对误差（L1）和Huber损失，默认使用MSE损失；Huber损失在误差较小时表现为MSE，在误差较大时表现为L1，可以在存在异常值时提供更稳健的训练；huber_delta参数控制Huber损失的转折点，默认为1
+    parser.add_argument("--huber_delta", type=float, default=1, help="Delta parameter for Huber loss") # Huber损失的delta参数，控制损失函数从MSE模式切换到L1模式的阈值，默认值为1；较小的delta会使模型更快地切换到L1模式，从而对异常值更鲁棒；较大的delta会使模型在更大的误差范围内保持MSE模式，从而可能更好地拟合数据但对异常值更敏感
+    
+    # ↓ 目标加权模式的参数
+    parser.add_argument( # 目标加权模式，支持基于指数函数的权重（exp_clamp），基于组内z-score的指数权重（group_zscore_exp）和基于组内分位数的线性权重（group_quantile）；默认使用group_zscore_exp，这种方法根据每个样本相对于其组内分布的位置动态调整权重，可能有助于处理不同组之间的分布差异；exp_clamp在极端值上会限制权重，group_quantile则根据样本在组内的相对位置（如前10%或后10%）调整权重
         "--weight_mode",
         type=str,
         choices=["exp_clamp", "group_zscore_exp", "group_quantile"],
         default="group_zscore_exp",
         help="Weighting mode for targets",
     )
-    parser.add_argument("--weight_alpha", type=float, default=0.5, help="Alpha for target weighting")
-    parser.add_argument("--weight_tau", type=float, default=3.0, help="Temperature for z-score exp weights")
-    parser.add_argument("--weight_power", type=float, default=1.0, help="Power for quantile weights")
-    parser.add_argument("--weight_q_low", type=float, default=0.1, help="Lower quantile for group quantile weights")
-    parser.add_argument("--weight_q_high", type=float, default=0.9, help="Upper quantile for group quantile weights")
-    parser.add_argument(
+    parser.add_argument("--weight_alpha", type=float, default=0.5, help="Alpha for target weighting") # 权重函数的alpha参数，控制权重调整的强度，默认0.5表示在基础权重（1.0）的基础上增加最多50%的权重；较大的alpha会使权重调整更显著，可能有助于强调某些样本，但也可能导致训练不稳定；较小的alpha会使权重调整更温和，可能更稳定但效果有限
+    parser.add_argument("--weight_tau", type=float, default=3.0, help="Temperature for z-score exp weights") # z-score指数权重的温度参数，控制权重对z-score的敏感度，默认3.0表示权重对z-score的变化较为平滑；较小的tau会使权重对z-score的变化更敏感，从而可能更强调极端样本；较大的tau会使权重对z-score的变化更平滑，从而可能更稳定但效果有限
+    parser.add_argument("--weight_power", type=float, default=1.0, help="Power for quantile weights") # 分位数权重的幂参数，控制权重对样本在组内相对位置的敏感度，默认1.0表示线性调整；较小的power会使权重对相对位置的变化更温和；较大的power会使权重对相对位置的变化更显著，从而可能更强调位于分位数边界附近的样本
+    parser.add_argument("--weight_q_low", type=float, default=0.1, help="Lower quantile for group quantile weights") # 分位数权重的下分位数参数，控制计算分位数权重时使用的下分位数，默认0.1表示使用组内第10百分位数作为下分位数；较小的weight_q_low会使更多样本被视为高权重样本；较大的weight_q_low会使只有相对较高的样本被视为高权重样本
+    parser.add_argument("--weight_q_high", type=float, default=0.9, help="Upper quantile for group quantile weights") # 分位数权重的上分位数参数，控制计算分位数权重时使用的上分位数，默认0.9表示使用组内第90百分位数作为上分位数；较小的weight_q_high会使更多样本被视为低权重样本；较大的weight_q_high会使只有相对较低的样本被视为低权重样本
+    
+    # ↓ 各种模型的超参数
+    parser.add_argument( # 选取哪种模型进行架构，参考model.py
         "--model_type",
         type=str,
         choices=["transformer", "resnet", "resfilm", "convnet"],
@@ -254,9 +267,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_layers", type=int, default=4, help="Number of transformer layers")
     parser.add_argument("--n_heads", type=int, default=4, help="Number of attention heads")
     parser.add_argument("--d_ff", type=int, default=512, help="Feed-forward network hidden dimension")
-    parser.add_argument("--pos_num_bands", type=int, default=32, help="Number of positional encoding frequency bands")
-    parser.add_argument("--pos_max_freq", type=float, default=101, help="Maximum positional encoding frequency")
-    parser.add_argument("--p_drop", type=float, default=0.3, help="Dropout probability")
+    parser.add_argument("--pos_num_bands", type=int, default=32, help="Number of positional encoding frequency bands") 
+    parser.add_argument("--pos_max_freq", type=float, default=101, help="Maximum positional encoding frequency") # 前6个都是transformer架构的超参数
+    parser.add_argument("--p_drop", type=float, default=0.3, help="Dropout probability") # p_drop，base_ch，se_reduction是用于神经网络的超参数，需要控制
     parser.add_argument("--base_ch", type=int, default=64, help="ConvNet base channels (convnet only)")
     parser.add_argument(
         "--stage_depths",
@@ -264,7 +277,7 @@ def parse_args() -> argparse.Namespace:
         default="2,2,2,2",
         help="ConvNet stage depths as comma list (e.g., 2,2,2,2)",
     )
-    parser.add_argument("--se_reduction", type=int, default=4, help="ConvNet SE reduction ratio (convnet only)")
+    parser.add_argument("--se_reduction", type=int, default=4, help="ConvNet SE reduction ratio (convnet only)") #
     parser.add_argument(
         "--hpo_params",
         type=str,
@@ -272,7 +285,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to Optuna/JSON HPO params file. Matching CLI args will be overridden",
     )
 
-    # Augmentation args
+    # ↓ 数据增强（augmentation）的参数
     parser.add_argument("--aug_prob", type=float, default=0.8, help="Probability to apply radial crop")
     parser.add_argument("--aug_min_crop_ratio", type=float, default=0.6, help="Minimum ratio r_cut/r_max for cropping")
 
@@ -282,7 +295,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _parse_stage_depths(value: str) -> Tuple[int, ...]:
+def _parse_stage_depths(value: str) -> Tuple[int, ...]: # 字符串转化为pytorch能够识别的元组的解析器
     raw = value.strip()
     if not raw:
         return (2, 2, 2, 2)
@@ -301,7 +314,7 @@ def _parse_stage_depths(value: str) -> Tuple[int, ...]:
         raise ValueError(f"Invalid stage_depths value: {value!r}") from exc
 
 
-def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace:
+def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace: # 在每一轮训练中加载.json文件，转化为正确的数据类型，然后覆盖手动输入的预设参数。这样能够实现自动化的多次训练，只要给多个.json文件即可
     path = getattr(args, "hpo_params", None)
     if not path:
         return args
@@ -367,7 +380,7 @@ def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def set_seed(seed: int):
+def set_seed(seed: int): # 固定随机数种子，保证实验的可复现性
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # For full determinism users can also set CUDNN flags; keep perf by default.
@@ -376,12 +389,16 @@ def set_seed(seed: int):
 # =============================================
 # 3) Train and evaluate
 # =============================================
+'''
+由于标准的神经网络损失函数（如MSE）对所有样本一视同仁，不适用于像吸积率这样瞬间爆发的长尾分布。
+因此先计算基础误差loss，然后再乘以一个动态权重矩阵weights。这样预测错平庸样本问题不大，但是预测错罕见的吸积爆发则会被放大权重惩罚。
+'''
 class WeightedLoss(nn.Module):
     def __init__(self, base_criterion: nn.Module, weights_fn: callable = None):
         """
         A loss wrapper that applies per-sample weights to the base criterion.
          Args:
-             base_criterion (nn.Module): The base loss function (e.g., nn.MSELoss).
+             base_criterion (nn.Module  ): The base loss function (e.g., nn.MSELoss).
              weights_fn (callable, optional): A function that takes the target tensor `y` and returns
                  a tensor of weights with the same shape as `y`. If None, uniform weights are used.
         """
@@ -397,7 +414,7 @@ class WeightedLoss(nn.Module):
         return weighted_loss.mean()
 
 
-def _compute_group_stats(
+def _compute_group_stats( # 不同星系的吸积率标准不一样，所以这个函数遍历训练集，计算每一种星系的均值mean和标准差std，以及10%分位数p10和90%分位数p90
     y: torch.Tensor,
     groups: torch.Tensor,
     n_groups: int,
@@ -421,8 +438,11 @@ def _compute_group_stats(
         p90[g] = torch.quantile(y_g, q_high)
     return {"mean": means, "std": stds, "p10": p10, "p90": p90}
 
-
-def make_criterion(
+'''
+有四种计算权重的策略，mse、l1、huber是计算基础误差loss的方式。然后通过weight_group_zscore_exp计算动态矩阵权重weights。
+计算方法：将当前样本的吸积率与该星系的平均值比较，如果相当，则权重为1+α，如果远超平均值，则权重会指数级增加
+'''
+def make_criterion( 
     kind: str,
     delta: float,
     alpha: float = 1.0,
@@ -474,15 +494,18 @@ def make_criterion(
     if weight_mode == "exp_clamp":
         weights_fn = weight_exp_clamp
     elif weight_mode == "group_zscore_exp":
-        weights_fn = weight_group_zscore_exp
+        weights_fn = weight_group_zscore_exp # 输出动态权重矩阵
     elif weight_mode == "group_quantile":
         weights_fn = weight_group_quantile
     else:
         raise ValueError(weight_mode)
 
-    return WeightedLoss(base_criterion=base, weights_fn=weights_fn)
+    return WeightedLoss(base_criterion=base, weights_fn=weights_fn)  # 根据基础损失函数loss和动态权重矩阵，算出加权损失
 
 
+'''
+学习率调整：预热warmup+余弦退火。刚开始训练时，学习率从很小的值线性增加到预设的初始学习率，然后沿着一个平滑的余弦曲线慢慢下降。
+'''
 class WarmupCosineScheduler:
     def __init__(
         self,
@@ -535,10 +558,13 @@ class WarmupCosineScheduler:
         return list(self._last_lr)
 
 
+'''
+标准的一轮训练主循环，整合loader，model，输出prediction，计算加权损失，反向传播，更新权重和学习率
+'''
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, grad_clip=None, scheduler=None):
     model.train()
-    total, n = 0.0, 0
-    for batch in loader:
+    total, n = 0.0, 0 
+    for batch in loader: # 从data里面依次提取数据(x,coord,mbh,y,groups)，送入模型进行训练 
         x = batch[0].to(device, non_blocking=True)  # (B, C_in, H, W)
         coord = batch[1].to(device, non_blocking=True)  # (B, 2, H, W)
         mbh = batch[2].to(device, non_blocking=True).view(-1)  # (B,)
@@ -548,14 +574,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, gr
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                pred = predict_batch(model, x, coord, mbh)
-                loss = criterion(pred, y, groups)
+                pred = predict_batch(model, x, coord, mbh) # 前向传播，输出预测值
+                loss = criterion(pred, y, groups) # 根据权重函数计算加权损失值
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
                 scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+                nn.utils.clip_grad_norm_(model.parameters(), grad_clip) # 梯度裁剪，强行限制梯度<grad_clip,防止梯度爆炸
+            scaler.step(optimizer) # 根据缩放后的梯度更新模型参数
+            scaler.update() # 更新学习率和缩放因子，准备下一步迭代
             if scheduler is not None:
                 scheduler.step()
         else:
@@ -568,12 +594,15 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, gr
             if scheduler is not None:
                 scheduler.step()
 
-        bs = y.size(0)
-        total += loss.detach().item() * bs
+        bs = y.size(0)  # 当前批次的样本数量
+        total += loss.detach().item() * bs # 累积加权损失总和，乘以批次大小以获得当前批次的总损失
         n += bs
-    return total / max(1, n)
+    return total / max(1, n) # 返回当前轮次的平均加权损失
 
 
+'''
+打印当前dataloader里每一种星系（group）的样本数量，用于验证oversample平衡是否生效
+'''
 @torch.no_grad()
 def print_group_counts(loader, name: str):
     counts = None
@@ -594,7 +623,9 @@ def print_group_counts(loader, name: str):
     else:
         print(f"[{name}] group counts: {counts}")
 
-
+'''
+评估函数，计算每个组的平均损失，并返回worst domain loss（所有组中平均损失最大的那个）和所有组的平均损失列表。
+'''
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, device, writer, epoch):
     model.eval()
@@ -657,7 +688,7 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
             per_sample_loss = per_sample_loss.view(per_sample_loss.size(0), -1).mean(dim=1)
 
         # Cumulative by domain
-        for g in range(n_groups):
+        for g in range(n_groups): # 累加每个group的损失总和，计算每一种星系的平均损失
             m = groups == g
             if m.any():
                 groups_sum[g] += per_sample_loss[m].mean().item() * m.sum().item()
@@ -673,7 +704,7 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         )
         worst = float("nan")
     else:
-        worst = max(valid_means)
+        worst = max(valid_means) # 在所有组的平均损失中找到最大的那个作为worst，并把worst作为核心指标返回
 
     # Write to TensorBoard
     for d, v in enumerate(groups_mean):
@@ -691,8 +722,8 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
 def main(args=None):
     if args is None:
         args = parse_args()
-    args = _apply_hpo_overrides(args)
-    set_seed(args.seed)
+    args = _apply_hpo_overrides(args) # 取命令行参数，并允许 HPO（自动化调参）覆盖手写参数。
+    set_seed(args.seed) # 固定随机数种子，保证实验的可复现性
     if args.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
 
@@ -703,7 +734,7 @@ def main(args=None):
     )
     print(f"Using device: {device}")
     # Initialize TensorBoard writer
-    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S") # 根据当前时间生成一个独一无二的 TensorBoard 文件夹，准备记录即将产生的海量数据。
     log_dir = os.path.join(args.log_dir, f"{args.exp_name}_{run_stamp}")
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
@@ -713,13 +744,13 @@ def main(args=None):
     exp = args.exp_name
     data_exp = args.data_exp if args.data_exp else exp
 
-    train_augmentor = RadialCropAugmentor(min_crop_ratio=args.aug_min_crop_ratio, p_crop=args.aug_prob)
+    train_augmentor = RadialCropAugmentor(min_crop_ratio=args.aug_min_crop_ratio, p_crop=args.aug_prob) # 加入数据增强Augmentor
 
-    train_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "train.pt"), augmentor=train_augmentor)
-    val_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "val.pt"))
-    test_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "test.pt"))
+    train_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "train.pt"), augmentor=train_augmentor) # 训练集
+    val_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "val.pt")) # 验证集
+    test_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "test.pt")) # 测试集
 
-    group_stats = _compute_group_stats(
+    group_stats = _compute_group_stats( # 调用_compute_group_stats函数，计算训练集中每个组的吸积率分布统计信息（均值、标准差、10%分位数和90%分位数），这些统计信息将用于动态权重计算
         train_ds.y,
         train_ds.groups,
         int(train_ds.n_groups),
@@ -729,7 +760,7 @@ def main(args=None):
 
     common = dict(batch_size=args.batch_size, pin_memory=(device.type == "cuda"), drop_last=False)
     dl_extra = {}
-    if args.num_workers > 0:
+    if args.num_workers > 0: # 调用cpu准备数据
         # On Windows, persistent_workers=True is highly recommended to avoid repeated spawning
         pw = args.persistent_workers or (os.name == "nt")
         dl_extra.update(dict(persistent_workers=pw, prefetch_factor=max(1, args.prefetch_factor)))
@@ -743,7 +774,7 @@ def main(args=None):
         print_group_counts(val_loader, "val")
         print_group_counts(test_loader, "test")
 
-    # Model
+    # Model 根据指令调用model，发射到GPU上
     c_in = train_ds.x.shape[1]
     if args.model_type == "hybrid":
         raise ValueError("Hybrid model type is not implemented in this script.")
@@ -810,11 +841,11 @@ def main(args=None):
         tau=args.weight_tau,
         power=args.weight_power,
     )
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) # AdamW优化器，结合了Adam的自适应学习率和权重衰减weight_decay
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * max(0, args.epochs)
     scheduler = None
-    if total_steps > 0:
+    if total_steps > 0: # warmup+余弦退火
         warmup_steps = max(0, args.lr_warmup_steps)
         warmup_ratio = max(0.0, min(1.0, args.lr_warmup_ratio))
         if warmup_steps == 0 and warmup_ratio > 0.0:
@@ -862,10 +893,10 @@ def main(args=None):
 
     patience = max(0, args.patience)
     no_improve = 0
-    print("Starting training")
+    print("Starting training") 
 
-    for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(
+    for epoch in range(1, args.epochs + 1): # 多轮训练
+        tr_loss = train_one_epoch( # 一轮训练主循环
             model,
             train_loader,
             criterion,
@@ -875,7 +906,7 @@ def main(args=None):
             grad_clip=(args.grad_clip if args.grad_clip > 0 else None),
             scheduler=scheduler,
         )
-        worst_val, group_means = eval_epoch(model, val_loader, criterion, device, writer, epoch)
+        worst_val, group_means = eval_epoch(model, val_loader, criterion, device, writer, epoch) # 在验证集上测试，返回每个组的worst loss和mean loss
 
         valid_vals = [v for v in group_means if v == v]
         mean_val = sum(valid_vals) / len(valid_vals) if valid_vals else float("nan")
@@ -888,7 +919,7 @@ def main(args=None):
         writer.add_scalar("val/loss_mean_over_domains", mean_val, epoch)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
-        if worst_val < best_val - 1e-8:
+        if worst_val < best_val - 1e-8: # 记录最好成绩，更新权重
             best_val = worst_val
             no_improve = 0
             if args.no_save:
@@ -899,12 +930,12 @@ def main(args=None):
                 )
         else:
             no_improve += 1
-            if patience > 0 and no_improve >= patience:
+            if patience > 0 and no_improve >= patience:  # 如果连续训练patience轮都没有提升，说明很可能过拟合了，触发早停机制
                 print(f"Early stopping at epoch {epoch}")
                 break
 
     has_best = False
-    if args.no_save:
+    if args.no_save: # 训练结束后，加载最好的模型，去测试集验证泛化能力
         if best_val != float("inf") and best_model_state is not None:
             has_best = True
     else:
@@ -923,7 +954,7 @@ def main(args=None):
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model"])
 
-    test_loss, group_means = eval_epoch(model, test_loader, criterion, device, writer, epoch=0)
+    test_loss, group_means = eval_epoch(model, test_loader, criterion, device, writer, epoch=0) # 在测试集中评估训练出来的最好的模型，依旧返回worst loss和mean loss列表。worst loss是核心指标，mean loss列表可以用来分析不同组的表现差异。
     print(f"Test loss: {test_loss:.6f}, per-domain: {group_means}")
     if not args.no_save:
         print(f"Best model saved to: {best_path}")

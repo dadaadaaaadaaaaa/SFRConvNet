@@ -68,6 +68,7 @@ try:
         FourierPositionalEncoding2D,
         FiLMConditioner,
         MLP,
+        AccretionConvNet,
     )
 
     # Import Preprocess paths if available
@@ -277,23 +278,7 @@ def load_analysis_model(model_path, device, datasets_dict=None):
     raw_state = state.get("model", state.get("state_dict", state))
     keys = list(raw_state.keys())
 
-    # Infer Type
-    model_type = "macnet"
-    if any(k.startswith("film_generator") for k in keys):
-        model_type = "resfilm"
-    elif any(k.startswith("cls_token") or k.startswith("posenc") for k in keys) or any(
-        k.startswith("blocks") for k in keys
-    ):
-        model_type = "vit"
-
-    # Infer Input Channels
-    in_ch = 14  # Default
-    if datasets_dict:
-        ref_ds = next((ds for ds in datasets_dict.values() if ds is not None), None)
-        if ref_ds:
-            in_ch = int(ref_ds.x.shape[1])
-
-    # Check for hyperparams
+    # Check for hyperparams FIRST
     config_path = model_path.parent / "hyperparameters.json"
     loaded_params = {}
     if config_path.exists():
@@ -302,6 +287,28 @@ def load_analysis_model(model_path, device, datasets_dict=None):
                 loaded_params = json.load(f)
         except:
             pass
+
+    # Infer Type
+    model_type = "macnet"
+    if loaded_params and "model_type" in loaded_params:
+        model_type = loaded_params["model_type"]
+    else:
+        if any(k.startswith("film_generator") for k in keys):
+            model_type = "resfilm"
+        elif any(k.startswith("cls_token") or k.startswith("posenc") for k in keys) or any(
+            k.startswith("blocks") for k in keys
+        ):
+            if any(k.startswith("stem.") for k in keys):
+                model_type = "convnet"
+            else:
+                model_type = "vit"
+
+    # Infer Input Channels
+    in_ch = 14  # Default
+    if datasets_dict:
+        ref_ds = next((ds for ds in datasets_dict.values() if ds is not None), None)
+        if ref_ds:
+            in_ch = int(ref_ds.x.shape[1])
 
     # Initialize
     model = None
@@ -350,6 +357,36 @@ def load_analysis_model(model_path, device, datasets_dict=None):
                 c_in=in_ch, d_model=d_model, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff, pos_num_bands=pos_num_bands
             ).to(device)
 
+    elif model_type == "convnet":
+        base_ch = 64
+        stage_depths = (2, 2, 2, 2)
+        pos_num_bands = 32
+        pos_max_freq = 64.0
+        p_drop = 0.1
+        se_reduction = 4
+
+        if loaded_params:
+            base_ch = loaded_params.get("base_ch", base_ch)
+            sd_val = loaded_params.get("stage_depths", "2,2,2,2")
+            if isinstance(sd_val, str):
+                stage_depths = tuple(int(x) for x in sd_val.split(","))
+            elif isinstance(sd_val, (list, tuple)):
+                stage_depths = tuple(sd_val)
+            pos_num_bands = loaded_params.get("pos_num_bands", pos_num_bands)
+            pos_max_freq = loaded_params.get("pos_max_freq", pos_max_freq)
+            p_drop = loaded_params.get("p_drop", p_drop)
+            se_reduction = loaded_params.get("se_reduction", se_reduction)
+
+        model = AccretionConvNet(
+            c_in=in_ch,
+            base_ch=base_ch,
+            stage_depths=stage_depths,
+            pos_num_bands=pos_num_bands,
+            pos_max_freq=pos_max_freq,
+            p_drop=p_drop,
+            se_reduction=se_reduction
+        ).to(device)
+
     elif model_type == "resfilm":
         model = MACNetFiLM(in_channels=in_ch).to(device)
     else:
@@ -381,20 +418,31 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
     preds = []
     feats_list = []
 
-    bs = 8 if model_type == "vit" else batch_size
+    bs = 8 if (model_type == "vit" or model_type == "convnet") else batch_size
 
     # Hook for features if requested
     hook_handle = None
-    if return_feats and model_type == "vit":
+    if return_feats:
+        if model_type == "vit":
+            def get_activation(storage):
+                def hook(model, input, output):
+                    storage.append(output[:, 0, :].detach().cpu())
+                return hook
 
-        def get_activation(storage):
-            def hook(model, input, output):
-                storage.append(output[:, 0, :].detach().cpu())
-
-            return hook
-
-        if hasattr(model, "blocks") and len(model.blocks) > 0:
-            hook_handle = model.blocks[-1].register_forward_hook(get_activation(feats_list))
+            if hasattr(model, "blocks") and len(model.blocks) > 0:
+                hook_handle = model.blocks[-1].register_forward_hook(get_activation(feats_list))
+        elif model_type == "convnet":
+            def get_activation_convnet(storage):
+                def hook(model, input, output):
+                    # output from head is tensor. The layer is head[5] or head[3]?
+                    # Actually wait, let's just append the output of the hook
+                    storage.append(output.detach().cpu())
+                return hook
+            # Maybe attach to the flattened output or final feature
+            if hasattr(model, "head") and len(model.head) >= 3:
+                # model.head is nn.Sequential(AdaptiveAvgPool2d, Flatten, LayerNorm(last_ch), Linear, GELU, Dropout, Linear)
+                # We can hook onto LayerNorm
+                hook_handle = model.head[2].register_forward_hook(get_activation_convnet(feats_list))
 
     try:
         for start in range(0, total, bs):
@@ -402,8 +450,8 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
             x_batch = x_all[start:end].to(device)
             mbh_batch = mbh_all[start:end].to(device).view(-1)
 
-            if model_type == "vit":
-                # if coord_all is None: raise ValueError("ViT requires coords")
+            if model_type in ["vit", "convnet"]:
+                # if coord_all is None: raise ValueError("Requires coords")
                 c_batch = coord_all[start:end].to(device)
                 y_out = model(x_batch, c_batch[:, 0:1], c_batch[:, 1:2], mbh_batch)
             else:
@@ -481,8 +529,14 @@ def save_plot(plt_obj, name, fig_dir, fmt="png"):
 
 
 def plot_scatter(df, title, fig_dir, limit_range=True):
-    vmin = min(df["y_true"].min(), df["y_pred"].min()) - 0.5
-    vmax = max(df["y_true"].max(), df["y_pred"].max()) + 0.5
+    # To correctly calculate bounds that include all data: sum up min and max of y_true, y_pred, and y_bondi (if it exists)
+    has_bondi = "y_bondi" in df.columns
+    cols_to_check = ["y_true", "y_pred"]
+    if has_bondi:
+        cols_to_check.append("y_bondi")
+        
+    vmin = df[cols_to_check].min().min() - 0.5
+    vmax = df[cols_to_check].max().max() + 0.5
 
     def _plot_base(ax, show_bondi=False):
         ax.plot([vmin, vmax], [vmin, vmax], "r--", lw=1.5, label="Ideal", zorder=5)
@@ -503,12 +557,14 @@ def plot_scatter(df, title, fig_dir, limit_range=True):
             )
 
         if show_bondi and "y_bondi" in df.columns:
+            # We must drop NaN before scatter, otherwise warning or incorrect display
+            valid_bondi = df.dropna(subset=["y_bondi"])
             ax.scatter(
-                df["y_true"],
-                df["y_bondi"],
+                valid_bondi["y_true"],
+                valid_bondi["y_bondi"],
                 s=15,
                 marker="x",
-                alpha=0.2,
+                alpha=0.4,
                 color="gray",
                 label="Bondi",
                 zorder=1,

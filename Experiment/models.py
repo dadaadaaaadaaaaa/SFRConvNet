@@ -1,3 +1,7 @@
+"""
+基于pytorch的深度学习神经网络
+终极目的：输入一张代表星系中心气体状态的多通道 2D 物理特征图（如密度场、温度场），再加上一个额外的标量条件（黑洞质量 $M_{BH}$），让模型预测出一个精确真实的黑洞吸积率y。
+"""
 import math
 import torch
 import torch.nn as nn
@@ -7,48 +11,55 @@ from typing import List, Tuple, Optional
 # =============================================
 # Module Definition
 # =============================================
-class Residual(nn.Module):
+'''
+Residual, resnet_block, MACNetRes_mbh
+粗暴的卷积神经网络，输入15张2D物理场（特征图），经过卷积层、池化、线性层后，合并mbh，输出黑洞吸积率
+局限性：在最后一部才将mbh加入，在对特征图的处理过程中没有考虑中心黑洞的存在。
+所以下一步就是需要FilM来将mbh融入到特征图的每一层中。
+'''
+class Residual(nn.Module): # 残差块
 
     def __init__(self, in_channels, out_channels, use_1x1conv=False, strides=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=strides)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=strides) # 卷积层1 
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1) # 卷积层2
         if use_1x1conv:
-            self.conv3 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=strides)
+            self.conv3 = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=strides) # 1*1卷积层，目的是使输入X与Y的维度强行对齐。只会在阶段中第一个块使用。
         else:
             self.conv3 = None
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels) # 批归一化层1
+        self.bn2 = nn.BatchNorm2d(out_channels) # 批归一化层2
 
     def forward(self, X):
-        Y = nn.functional.relu(self.bn1(self.conv1(X)))
-        Y = self.bn2(self.conv2(Y))
+        Y = nn.functional.relu(self.bn1(self.conv1(X))) # 卷积层1的输出 
+        Y = self.bn2(self.conv2(Y)) # 卷积层2的输出
         if self.conv3:
-            X = self.conv3(X)
-        return nn.functional.relu(Y + X)
+            X = self.conv3(X) # 如果使用1*1卷积，则对X应用卷积层3
+        return nn.functional.relu(Y + X) # 将残差块的输出与输入相加，并使用ReLU激活函数
 
 
-def resnet_block(num_residuals, in_channels, out_channels, half=False):
+def resnet_block(num_residuals, in_channels, out_channels, half=False): # 将多个残差快串联成一个残差块，命名为layer
     layers = []
     for i in range(num_residuals):
-        if i == 0:
+        if i == 0: # layer中第一个块，会使用卷积层3（1*1卷积层）
             if half:
-                layers.append(Residual(in_channels, out_channels, use_1x1conv=True, strides=2))
+                layers.append(Residual(in_channels, out_channels, use_1x1conv=True, strides=2)) # 如果half为True，则会用步幅为2的卷积层来对输入降维
             else:
                 layers.append(Residual(in_channels, out_channels, use_1x1conv=True))
-        else:
+        else:  
             layers.append(Residual(out_channels, out_channels))
-    return nn.Sequential(*layers)
+    return nn.Sequential(*layers) # 将layers中的所有模块组合成一个序列
 
 
 class MACNetRes_mbh(nn.Module):
 
-    def __init__(self, in_channels=15):
+    def __init__(self, in_channels=15): # 输入通道数=15，即输入15种2D物理场   # 输入二维物理网格，输出256通道的高维特征图，构建一个res_block
         super().__init__()
         in_channels = in_channels
         # Define the Residual blocks
         blocks = []
-        res_arch = ((2, 32, True), (2, 64, True), (2, 128, False), (2, 256, False))
+        res_arch = ((2, 32, True), (2, 64, True), (2, 128, False), (2, 256, False)) # 建立4个layer，每个阶段都是2个块，输出通道依次翻倍。前两次空间分辨率减半，后两次不变。
+                                                                                    # 输入的二维物理网格被浓缩成256通道的高维特征图
         for num_residuals, out_channels, half in res_arch:
             # print(in_channels, out_channels, num_residuals, first_block)
             blocks.append(
@@ -59,30 +70,31 @@ class MACNetRes_mbh(nn.Module):
                     half=half,
                 )
             )
-            in_channels = out_channels
-        self.res_blocks = nn.Sequential(*blocks)
+            in_channels = out_channels # 后一个输入通道数=前一个输入通道数
+        self.res_blocks = nn.Sequential(*blocks) # 将blocks中的所有模块组合成一个序列
 
         # Define the Linear blocks
-        self.flatten_block = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten())
+        self.flatten_block = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten()) # 全局池化，对每个通道在空间维度上求平均值，浓缩成1*1的特征图。然后全局压平，变成1*256的特征图。
         self.liner_block = nn.Sequential(
-            nn.Linear(in_channels + 1, in_channels // 2),
+            nn.Linear(in_channels + 1, in_channels // 2), # 线性层，输入维度=256+1=257，输出维度=256/2=128
             nn.LeakyReLU(),
-            nn.Linear(in_channels // 2, 1),
+            nn.Linear(in_channels // 2, 1), # 线性层，输入维度=128，输出维度=1
         )
 
     def forward(self, x, mbh):
-        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh
-        mbh = mbh.float().to(x.device).view(-1, 1)
+        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh # 输入mb，并转化为tensor
+        mbh = mbh.float().to(x.device).view(-1, 1) # 将mbh展平维1*1
 
         x = self.res_blocks(x)
         x = self.flatten_block(x)
-        x = torch.cat((x, mbh), dim=1)
+        x = torch.cat((x, mbh), dim=1) # 合并flatten后的输出和mbh，形成256*1的特征图
         x = self.liner_block(x)
-        return x.view(-1)
+        return x.view(-1) # 输出最终的黑洞吸积率预测值
+
 
 
 class FiLMResidual(nn.Module):
-    def __init__(self, in_channels, out_channels, use_1x1conv=False, strides=1):
+    def __init__(self, in_channels, out_channels, use_1x1conv=False, strides=1): # 和Residual一样
         super().__init__()
         self.out_channels = out_channels
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, stride=strides)
@@ -94,18 +106,18 @@ class FiLMResidual(nn.Module):
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
-    def forward(self, X, gamma, beta):
+    def forward(self, X, gamma, beta): # 引入gamma和beta
         Y = nn.functional.relu(self.bn1(self.conv1(X)))
-        Y = self.bn2(self.conv2(Y))
+        Y = self.bn2(self.conv2(Y)) # 依旧经历两个卷积层
 
         # FiLM modulation
         if gamma is not None and beta is not None:
-            # gamma, beta: [B, C] -> [B, C, 1, 1]
-            Y = (1 + gamma.view(-1, self.out_channels, 1, 1)) * Y + beta.view(-1, self.out_channels, 1, 1)
+            # gamma, beta: [B, C] -> [B, C, 1, 1] # reshape gamma & beta，将单一数值广播到整个二维平面上
+            Y = (1 + gamma.view(-1, self.out_channels, 1, 1)) * Y + beta.view(-1, self.out_channels, 1, 1) # 使用gamma和beta对Y进行调制，Y  = (1 + gamma) * Y + beta
 
         if self.conv3:
             X = self.conv3(X)
-        return nn.functional.relu(Y + X)
+        return nn.functional.relu(Y + X) # 将调制后的Y与X相加，并使用ReLU激活函数
 
 
 class MACNetFiLM(nn.Module):
@@ -113,9 +125,9 @@ class MACNetFiLM(nn.Module):
         super().__init__()
         in_c = in_channels
         self.blocks = nn.ModuleList()
-        self.channel_counts = []
+        self.channel_counts = [] # 记录每个阶段的输出通道数，以便后续生成对应维度的gamma和beta
 
-        # Consistent with MACNetRes_mbh
+        # Consistent with MACNetRes_mbh 与前文一致
         res_arch = ((2, 32, True), (2, 64, True), (2, 128, False), (2, 256, False))
 
         for num_residuals, out_channels, half in res_arch:
@@ -134,30 +146,30 @@ class MACNetFiLM(nn.Module):
 
             in_c = out_channels
 
-        self.total_features = sum(self.channel_counts)
+        self.total_features = sum(self.channel_counts) # 统计多少个通道需要被控制
         # FiLM Generator
-        self.film_generator = nn.Sequential(nn.Linear(1, 64), nn.LeakyReLU(), nn.Linear(64, self.total_features * 2))
+        self.film_generator = nn.Sequential(nn.Linear(1, 64), nn.LeakyReLU(), nn.Linear(64, self.total_features * 2)) # 一个全连接神经网络，输入标量黑洞质量，输出两组参数gamma和beta
 
-        self.flatten_block = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten())
+        self.flatten_block = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten()) # 池化操作，与前文一致
 
         # Final regression from last block features
         last_out_channels = res_arch[-1][1]
         self.liner_block = nn.Sequential(
             nn.Linear(last_out_channels, last_out_channels // 2),
             nn.LeakyReLU(),
-            nn.Linear(last_out_channels // 2, 1),
+            nn.Linear(last_out_channels // 2, 1), # 输入维度=256（而非257），输出一个预测值
         )
 
     def forward(self, x, mbh):
-        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh
+        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh # 输入mbh，转化为tensor
         mbh = mbh.float().to(x.device).view(-1, 1)
 
         film_params = self.film_generator(mbh)
-        gammas_betas = torch.split(film_params, [c * 2 for c in self.channel_counts], dim=1)
+        gammas_betas = torch.split(film_params, [c * 2 for c in self.channel_counts], dim=1) # 按照每个阶段的通道数对gamma和beta进行切分，切分成8组
 
         for block, params in zip(self.blocks, gammas_betas):
-            gamma, beta = torch.chunk(params, 2, dim=1)
-            x = block(x, gamma, beta)
+            gamma, beta = torch.chunk(params, 2, dim=1) # 分离gamma和beta
+            x = block(x, gamma, beta) # 将gamma和beta传入每个块中进行调制
 
         x = self.flatten_block(x)
         x = self.liner_block(x)
@@ -165,12 +177,16 @@ class MACNetFiLM(nn.Module):
 
 
 # Continuous Fourier feature for (r, theta) coordinates
-class FourierPositionalEncoding2D(nn.Module):
-    """
+'''
+卷积神经网络无法理解当前输入特征图中每个像素点的空间位置关系（具有平移不变性），所以我们需要为每个像素点提供一个位置编码，告诉模型这个像素点在空间中的位置。
+这里我们使用傅里叶特征来编码每个像素点的极坐标位置（r, theta）。傅里叶特征通过对输入坐标进行不同频率的正弦和余弦变换，生成一个高维的特征向量，使得模型能够捕捉到不同尺度的空间关系。
+'''
+"""
     Encode continuous (r, theta) with fixed (non-trainable) sinusoidal features.
     Works across arbitrary grids/resolutions.
-    """
+"""
 
+class FourierPositionalEncoding2D(nn.Module):
     def __init__(
         self,
         num_bands: int = 32,
@@ -195,14 +211,18 @@ class FourierPositionalEncoding2D(nn.Module):
         self.eps = eps
         self.register_buffer(
             "freq_bands",
-            torch.logspace(0.0, math.log10(max_frequency), steps=num_bands),
-        )
+            torch.logspace(0.0, math.log10(max_frequency), steps=num_bands), # 生成num_bands个频率，呈对数空间分布，从1到max_frequency
+                                                                         )   # 低轨道频率捕捉大尺度空间，高频率捕捉小尺度空间
 
     @staticmethod
-    def _wrap_pi(theta: torch.Tensor) -> torch.Tensor:
+    def _wrap_pi(theta: torch.Tensor) -> torch.Tensor: # 将角度映射到[0, π)范围内，适用于θ具有π周期性的情况
         # map to [0, π)
         return torch.remainder(theta, math.pi)
 
+    """
+    计算输出特征的维度：如果include_input为True，则包含原始的r和theta（2维），每个坐标经过num_bands个频率的sin和cos变换后会产生2*num_bands维特征，
+    所以总维度是2（原始输入） + 4*num_bands（sin和cos特征）。
+    """
     @property
     def out_dim(self) -> int:
         base = 2 if self.include_input else 0  # r, theta
@@ -217,7 +237,7 @@ class FourierPositionalEncoding2D(nn.Module):
         B, _, H, W = r.shape
 
         # r normalization
-        if self.r_log_scale:
+        if self.r_log_scale: # 对r取对数并归一化，以更好地处理跨越多个数量级的半径值。每个r都属于[0,1]
             r_safe = torch.clamp(r, min=self.eps)
             r_n = (torch.log(r_safe) - torch.log(r_safe).amin((2, 3), True)) / (
                 torch.log(r_safe).amax((2, 3), True) - torch.log(r_safe).amin((2, 3), True) + self.eps
@@ -229,14 +249,14 @@ class FourierPositionalEncoding2D(nn.Module):
                 r_n = (r - r.min()) / (r.max() - r.min() + self.eps)
 
         # theta handling
-        if self.theta_pi_periodic:
+        if self.theta_pi_periodic: # 如果θ具有π周期性，我们将θ映射到[0, π)范围内，并使用2倍频率的傅里叶特征来捕捉这种周期性。这样可以更有效地表示θ的空间关系。
             theta = self._wrap_pi(theta)  # [0, π)
             # theta_unit = theta / math.pi  # [0,1) for optional raw export
             # even harmonics: 2k * theta
             # we reuse log-spaced freq_bands on the base, then multiply by 2
             fb_theta = (2.0 * self.freq_bands).view(1, -1, 1).to(theta.device)
         else:
-            # fallback to 2π periodic if ever needed
+            # fallback to 2π periodic if ever needed # 如果θ没有π周期性，我们将θ映射到[0, 2π)范围内，并使用原始频率的傅里叶特征来表示θ。这样可以捕捉到θ的完整周期性。
             theta = torch.remainder(theta, 2 * math.pi)
             # theta_unit = theta / (2 * math.pi)
             fb_theta = self.freq_bands.view(1, -1, 1).to(theta.device)
@@ -249,7 +269,7 @@ class FourierPositionalEncoding2D(nn.Module):
         #     th_max = theta.amax(dim=(2, 3), keepdim=True)
         #     theta = (theta - th_min) / (th_max - th_min + 1e-6)
 
-        r_flat = r_n.view(B, 1, H * W)
+        r_flat = r_n.view(B, 1, H * W) # 去掉H和W的二维结构，展平为H*W的一维结构
         t_flat = theta.view(B, 1, H * W)
 
         # (1, num_bands, 1)
@@ -257,9 +277,9 @@ class FourierPositionalEncoding2D(nn.Module):
 
         # project
         r_proj = r_flat * fb_r  # (B, num_bands, HW)
-        t_proj = t_flat * fb_theta
+        t_proj = t_flat * fb_theta # (B, num_bands, HW)
 
-        # sin/cos
+        # sin/cos # 傅里叶激活
         r_sin = torch.sin(2 * math.pi * r_proj)
         r_cos = torch.cos(2 * math.pi * r_proj)
         t_sin = torch.sin(2 * t_proj)
@@ -268,14 +288,14 @@ class FourierPositionalEncoding2D(nn.Module):
         pos_list = []
         if self.include_input:
             pos_list += [r_flat, t_flat]  # (B,1,HW) each
-        pos_list += [r_sin, r_cos, t_sin, t_cos]  # (B,num_bands,HW) each
+        pos_list += [r_sin, r_cos, t_sin, t_cos]  # (B,num_bands,HW) each 将1个r，1个θ，num_bands个r_sin,r_cos,theta_sin,theta_cos拼接起来，形成一个高维的特征向量，告诉模型每个像素点在空间中的位置关系
 
-        pos = torch.cat(pos_list, dim=1).view(B, -1, H, W)  # (B, Dpos, HW)
+        pos = torch.cat(pos_list, dim=1).view(B, -1, H, W)  # (B, Dpos, HW) 重新将展平的H*W恢复为二维的H和W，形状为(B, Dim_pos, H, W)
         return pos
 
 
 # FiLM conditioner for BH mass
-class FiLMConditioner(nn.Module):
+class FiLMConditioner(nn.Module):  # Transformer架构，独立于前面的cnn架构
     """
     Map scalar BH mass to (gamma, beta) for feature modulation.
     Can produce one pair per Transformer layer.
@@ -376,11 +396,11 @@ class AccretionTransformer(nn.Module):
     def __init__(
         self,
         c_in: int,
-        d_model: int = 256,
+        d_model: int = 256, 
         n_layers: int = 8,
         n_heads: int = 8,
         d_ff: int = 1024,
-        pos_num_bands: int = 32,
+        pos_num_bands: int = 32, 
         pos_max_freq: float = 64.0,
         p_drop: float = 0.1,
     ):
@@ -468,13 +488,17 @@ class AccretionTransformer(nn.Module):
 # CNN-based model with Fourier PE + FiLM (append to models.py)
 # =============================================
 
-
+'''
+通道注意力机制
+在普通CNN中，所有通道的地位都是平等的，但实际上，某个通道可能及其重要（比如代表“激波”的通道，而某个噪音通道则不重要
+因此需要为网络赋予通道注意力
+'''
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation: lightweight channel attention."""
 
     def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        mid = max(channels // reduction, 8)
+        mid = max(channels // reduction, 8) # 为每一个通道生成一个权重。所有权重对应的矩阵为w，通过一个MLP生成
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channels, mid),
@@ -485,9 +509,9 @@ class SEBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, _, _ = x.shape
-        w = self.pool(x).view(B, C)
-        w = self.fc(w).view(B, C, 1, 1)
-        return x * w
+        w = self.pool(x).view(B, C) # 强行压缩(B,C,H,W) -> (B, C, 1, 1) -> (B,C)
+        w = self.fc(w).view(B, C, 1, 1) 
+        return x * w # 每个通道乘以对应的权重，实现通道注意力机制
 
 
 class ConvFiLMBlock(nn.Module):
@@ -508,7 +532,7 @@ class ConvFiLMBlock(nn.Module):
         se_reduction: int = 4,
     ):
         super().__init__()
-        self.bn1 = nn.BatchNorm2d(in_ch)
+        self.bn1 = nn.BatchNorm2d(in_ch) # bn: 归一化
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
@@ -531,21 +555,21 @@ class ConvFiLMBlock(nn.Module):
 
         out = self.bn1(x)
         out = torch.relu(out)
-        out = self.conv1(out)
+        out = self.conv1(out) # 归一化 -> 激活 -> 卷积，比老版的卷积->归一化->激活更早引入非线性，能让梯度回传更加顺畅
 
         out = self.bn2(out)
         # FiLM modulation: scale + shift after normalization
         if gamma is not None and beta is not None:
-            out = (1 + gamma) * out + beta
+            out = (1 + gamma) * out + beta # 第二层卷积前引入gamma和beta，也就是FiLM调制
         out = torch.relu(out)
-        out = self.drop(out)
+        out = self.drop(out) # 卷积层之间引入dropout，让模型随机丢弃一些特征，防止过拟合
         out = self.conv2(out)
 
-        out = self.se(out)
+        out = self.se(out) # 卷积层2后引入SEBlock，进行通道注意力机制，让模型学会关注重要的特征通道
         return out + identity
 
 
-class ConvFiLMConditioner(nn.Module):
+class ConvFiLMConditioner(nn.Module): # FiLM调制
     """
     Map scalar BH mass → per-stage (γ, β) for 2D feature maps.
     Each γ/β has shape (B, C_stage, 1, 1) to broadcast over spatial dims.
@@ -604,13 +628,13 @@ class AccretionConvNet(nn.Module):
 
     def __init__(
         self,
-        c_in: int,
-        base_ch: int = 64,
-        stage_depths: Tuple[int, ...] = (2, 2, 2, 2),
-        pos_num_bands: int = 32,
-        pos_max_freq: float = 64.0,
-        p_drop: float = 0.1,
-        se_reduction: int = 4,
+        c_in: int, # 输入通道数，即输入的二维物理场的数量
+        base_ch: int = 64, # 第一阶段的输出通道数，后续阶段的输出通道数依次翻倍。比如base_ch=64，则四个阶段的输出通道数分别为64, 128, 256, 512
+        stage_depths: Tuple[int, ...] = (2, 2, 2, 2), # 每个阶段的块数，默认为4个阶段，每个阶段2个块
+        pos_num_bands: int = 32, # 傅里叶变换通道数
+        pos_max_freq: float = 64.0, # 傅里叶变换最大频率
+        p_drop: float = 0.1, # dropout机制的概率
+        se_reduction: int = 4, # SEBlock的通道数缩减率，控制SEBlock中隐藏层的大小，较小的reduction会增加模型容量，但也可能导致过拟合
     ):
         """
         Args:
@@ -625,7 +649,7 @@ class AccretionConvNet(nn.Module):
         super().__init__()
 
         # ---- Positional encoding (reuse existing module) ----
-        self.posenc = FourierPositionalEncoding2D(
+        self.posenc = FourierPositionalEncoding2D( # 傅里叶变换，提取位置信息 (15.32.32) -> (145,32,32)
             num_bands=pos_num_bands,
             max_frequency=pos_max_freq,
             include_input=True,
@@ -633,15 +657,15 @@ class AccretionConvNet(nn.Module):
         )
         d_pos = self.posenc.out_dim
 
-        # ---- Stem: fuse content + positional features ----
-        stem_in = c_in + d_pos
+        # ---- Stem: fuse content + positional features ---- # stem层，压缩通道数。 (145,32,32) -> (64,32,32)
+        stem_in = c_in + d_pos # 
         self.stem = nn.Sequential(
             nn.Conv2d(stem_in, base_ch, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(base_ch),
             nn.ReLU(inplace=True),
         )
 
-        # ---- Residual stages ----
+        # ---- Residual stages ---- # CNN主体部分
         stage_channels = []
         stages = []
         in_ch = base_ch
@@ -668,9 +692,9 @@ class AccretionConvNet(nn.Module):
         last_ch = stage_channels[-1]
 
         # ---- FiLM conditioner ----
-        self.film = ConvFiLMConditioner(stage_channels=stage_channels, hidden=128)
+        self.film = ConvFiLMConditioner(stage_channels=stage_channels, hidden=128) # FiLM调制
 
-        # ---- Regression head ----
+        # ---- Regression head ---- # 池化，压平，归一化，线性层，激活，dropout，线性层，输出
         self.head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -696,7 +720,7 @@ class AccretionConvNet(nn.Module):
         feat = self.stem(feat)
 
         # FiLM conditioning from BH mass
-        gammas, betas = self.film(bh_mass)
+        gammas, betas = self.film(bh_mass) # 引入Mbh，FiLM调制gamma和beta
 
         # Residual stages with FiLM
         for stage_idx, stage in enumerate(self.stages):
@@ -706,5 +730,5 @@ class AccretionConvNet(nn.Module):
                 feat = block(feat, gamma=g, beta=b)
 
         # Regression
-        y = self.head(feat).squeeze(-1)  # (B,)
+        y = self.head(feat).squeeze(-1)  # (B,) 预测值
         return y

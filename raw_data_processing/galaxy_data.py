@@ -62,34 +62,34 @@ class GalData:
         for original_name, new_name in self._corr.items():
             arr = self._data_hdfra.select(original_name)[:]
             data[new_name] = arr[0, ...]
-        data["temperature"] = 93 * data["gas_energy"] / data["density"]
+        data["temperature"] = 93 * data["gas_energy"] / data["density"]  # temprature
         return data
 
     @property
-    def snapshot_array(self) -> np.ndarray:
+    def snapshot_array(self) -> np.ndarray:     # 把snapshot字典里的所有值提取出来打包成numpy多维数组，方便后续矩阵运算
         return np.array(list(self.snapshot.values()))
 
     @property
-    def raw_axes(self) -> list:
+    def raw_axes(self) -> list: # 返回原始的坐标轴数组。
         self.__validate_coords()
         return self._axes
 
     @property
-    def broadcast_coords(self) -> np.ndarray:
+    def broadcast_coords(self) -> np.ndarray: # 返回“广播”（Broadcast）后的坐标数组。这是一种节省内存的 NumPy 结构，用来对齐数据矩阵的形状。
         self.__validate_coords()
         return self._coord
 
     @property
-    def coordinate(self) -> Tuple[np.ndarray, ...]:
+    def coordinate(self) -> Tuple[np.ndarray, ...]: # 用 np.meshgrid 生成的完整的坐标网格矩阵。
         self.__validate_coords()
         return np.meshgrid(*self._axes)
 
-    def axes(self) -> list:
+    def axes(self) -> list: # 下面是极坐标系和直角坐标系的互相转换
         self.__validate_coords()
         return self._axes
 
     @property
-    def r(self) -> np.ndarray:
+    def r(self) -> np.ndarray: # 极坐标系下的r
         self.__validate_coords()
         if self._coordinate_mode == "polar":
             return self._coord[0]
@@ -97,7 +97,7 @@ class GalData:
             return np.sqrt(sum(c**2 for c in self._coord))
 
     @property
-    def theta(self) -> np.ndarray:
+    def theta(self) -> np.ndarray: # 极坐标系下的theta
         self.__validate_coords()
         if self._coordinate_mode == "polar":
             return self._coord[1]
@@ -108,7 +108,7 @@ class GalData:
                 return np.arccos(self._coord[2] / self.r)
 
     @property
-    def phi(self) -> np.ndarray:
+    def phi(self) -> np.ndarray: # 极坐标系下的phi
         if self.ndim == 2:
             raise ValueError("Phi coordinate not available in 2D data.")
         self.__validate_coords()
@@ -118,7 +118,7 @@ class GalData:
             return np.arctan2(self._coord[1], self._coord[0])
 
     @property
-    def x(self) -> np.ndarray:
+    def x(self) -> np.ndarray: # 直角坐标系下的x
         self.__validate_coords()
         if self._coordinate_mode == "cartesian":
             return self._coord[0]
@@ -128,7 +128,7 @@ class GalData:
             return self.r * np.sin(self.theta) * np.cos(self.phi)
 
     @property
-    def y(self) -> np.ndarray:
+    def y(self) -> np.ndarray: # 直角坐标系下的y
         self.__validate_coords()
         if self._coordinate_mode == "cartesian":
             return self._coord[1]
@@ -138,7 +138,7 @@ class GalData:
             return self.r * np.sin(self.theta) * np.sin(self.phi)
 
     @property
-    def z(self) -> np.ndarray:
+    def z(self) -> np.ndarray: # 直角坐标系下的z
         if self.ndim == 2:
             raise ValueError("Z coordinate not available in 2D data.")
         self.__validate_coords()
@@ -148,7 +148,7 @@ class GalData:
             return self.r * np.cos(self.theta)
 
     @property
-    def grid_volume(self) -> np.ndarray:
+    def grid_volume(self) -> np.ndarray: # 计算单位网格的体积元dV
         self.__validate_coords()
 
         spacings = []
@@ -175,84 +175,98 @@ class GalData:
             return dV
 
     @property
-    def gas_mass(self) -> float:
+    def gas_mass(self) -> float: # 网格密度*网格体积=网格质量
         return self.snapshot["density"] * self.grid_volume
 
     @property
-    def mbh(self) -> float:
+    def mbh(self) -> float: # 提取该snapshot的黑洞质量
         return self._data_log["mbh"]
 
     @property
-    def mdot_macer(self) -> float:
-        return self._data_log["mdot_macer"]
+    # def mdot_macer(self) -> float: # 提取吸积率
+    #     return self._data_log["mdot_macer"]
+    def sfr_target(self) -> float: # 提取恒星形成率
+        return self._data_log["sfr_target"]
 
     @property
-    def mdot_edd(self) -> float:
+    def mdot_edd(self) -> float: # 提取爱丁顿吸积率
         return self._data_log["mdot_edd"]
 
     # -------- Calculation Methods --------
 
-    def mdot_bondi(self, r_acc: float = 1.0, G: float = 112.0, gamma: float = 5 / 3) -> float:
+    # def mdot_bondi(self, r_acc: float = 1.0, G: float = 112.0, gamma: float = 5 / 3) -> float:
+    #     """
+    #     Calculates the Bondi accretion rate.
+    #     Args:
+    #         r_max (float): 计算恒星形成率的星系有效半径区域 (kpc)。默认 10.0 kpc。
+    #         A_ks (float): KS 定律的经验常数，单位随质量系、引力单位而变。
+    #         N_ks (float): KS 定律的幂指数，通常取 1.4 左右。
+    #     """
+    #     mask = self.r < r_max
+    #     if not np.any(mask):
+    #         r_values = np.sort(np.unique(self.r.reshape(-1)))
+    #         idx = np.searchsorted(r_values, r_acc)
+    #         if idx >= len(r_values):
+    #             idx = len(r_values) - 1
+    #         effective_r_acc = float(r_values[max(idx, 0)])
+    #         mask = self.r <= effective_r_acc
+    #
+    #         if not np.any(mask):
+    #             raise ValueError("No cells found within r_acc even after expanding to the smallest available radius.")
+    #
+    #         warnings.warn(
+    #             (
+    #                 "No grid cells lie within the requested r_acc=%.3f kpc; "
+    #                 "using the innermost available radius at %.3f kpc instead."
+    #             )
+    #             % (r_acc, effective_r_acc),
+    #             RuntimeWarning,
+    #         )
+    #
+    #     # Broadcast mask to match the shape of density and other snapshot data
+    #     density_shape = self.snapshot["density"].shape
+    #     mask_broadcasted = np.broadcast_to(mask, density_shape)
+    #
+    #     rho = self.snapshot["density"][mask_broadcasted]
+    #     e = self.snapshot["gas_energy"][mask_broadcasted]
+    #     cs = np.sqrt((gamma * gamma1) * e / rho) # 计算声速
+    #     m = self.gas_mass[mask_broadcasted]
+    #     M_bh = self.mbh
+    #
+    #     # Weighted averages (default: mass-weighted)
+    #     rho_inf = np.sum(m * rho) / np.sum(m)
+    #     cs_inf = np.sum(m * cs) / np.sum(m)
+    #
+    #     return 4 * np.pi * lambda_c * G**2 * M_bh**2 * rho_inf / cs_inf**3 # 计算邦迪吸积率
+
+    def sfr_ks(self, r_max: float = 10.0, A_ks: float = 2.5e-4, N_ks: float = 1.4) -> float:
         """
-        Calculates the Bondi accretion rate.
+        根据全局 Kennicutt-Schmidt (KS) 定律计算参考的恒星形成率。
+        SFR_KS = A_ks * (Sigma_gas)^N_ks * Area
         Args:
-            r_acc (float): Accretion radius within which to compute the Bondi rate (kpc). Default is 1.0 kpc.
-            G (float): Gravitational constant in the simulation units. Default is 112.  (kpc^3 / (2.5e7 Msun * Gyr^2))
-            gamma (float): Adiabatic index of the gas. Default is 5/3
+            r_max (float): 计算恒星形成率的星系有效半径区域 (kpc)。默认 10.0 kpc。
+            A_ks (float): KS 定律的经验常数，单位随质量系、引力单位而变。
+            N_ks (float): KS 定律的幂指数，通常取 1.4 左右。
         """
-        gamma1 = gamma - 1
-
-        # lambda_c stable calculation
-        if abs(gamma - 5 / 3) < 1e-8:
-            lambda_c = 0.25
-        else:
-            denom = 5.0 - 3.0 * gamma
-            if abs(denom) < 1e-12:
-                raise ValueError("gamma too close to 5/3 causing numerical instability in lambda_c.")
-            exponent = (5.0 - 3.0 * gamma) / (2.0 * gamma1)
-            lambda_c = 0.25 * (2.0 / denom) ** exponent
-
-        mask = self.r < r_acc
-        effective_r_acc = r_acc
+        mask = self.r < r_max
         if not np.any(mask):
-            r_values = np.sort(np.unique(self.r.reshape(-1)))
-            idx = np.searchsorted(r_values, r_acc)
-            if idx >= len(r_values):
-                idx = len(r_values) - 1
-            effective_r_acc = float(r_values[max(idx, 0)])
-            mask = self.r <= effective_r_acc
+            return 0.0
 
-            if not np.any(mask):
-                raise ValueError("No cells found within r_acc even after expanding to the smallest available radius.")
+        # 取出所有给定半径部分的气体质量总和
+        total_gas_mass = np.sum(self.gas_mass[mask])
+        
+        # 计算有效投影面积 (Area = pi * R_{eff}^2) 和气体表面密度 (Sigma_gas)
+        area = np.pi * (r_max ** 2)
+        sigma_gas = total_gas_mass / area
+        
+        # 计算全局 SFR (KS定律给出的是面密度，乘以面积得总SFR)
+        sfr_estimated = A_ks * (sigma_gas ** N_ks) * area
+        
+        return float(sfr_estimated)
 
-            warnings.warn(
-                (
-                    "No grid cells lie within the requested r_acc=%.3f kpc; "
-                    "using the innermost available radius at %.3f kpc instead."
-                )
-                % (r_acc, effective_r_acc),
-                RuntimeWarning,
-            )
+    # -------- Public Methods -------- # 用户直接调用的接口
 
-        # Broadcast mask to match the shape of density and other snapshot data
-        density_shape = self.snapshot["density"].shape
-        mask_broadcasted = np.broadcast_to(mask, density_shape)
-
-        rho = self.snapshot["density"][mask_broadcasted]
-        e = self.snapshot["gas_energy"][mask_broadcasted]
-        cs = np.sqrt((gamma * gamma1) * e / rho)
-        m = self.gas_mass[mask_broadcasted]
-        M_bh = self.mbh
-
-        # Weighted averages (default: mass-weighted)
-        rho_inf = np.sum(m * rho) / np.sum(m)
-        cs_inf = np.sum(m * cs) / np.sum(m)
-
-        return 4 * np.pi * lambda_c * G**2 * M_bh**2 * rho_inf / cs_inf**3
-
-    # -------- Public Methods --------
-
-    def read_hdfra(
+    def read_hdfra( # 使用 pyhdf 库读取 HDF4 格式的Snapshot
         self,
         hdfra_path: str,
         time: float,
@@ -272,7 +286,7 @@ class GalData:
         self._load_snapshot_hdfra(hdfra_path, time)._load_log(log_path, func_parse_log, scope)
         return self
 
-    def rescale(self, new_shape: Tuple[int, ...], weights: List[np.ndarray | None] = None) -> "GalData":
+    def rescale(self, new_shape: Tuple[int, ...], weights: List[np.ndarray | None] = None) -> "GalData": # 将高分辨率模拟转为机器学习输入的关键，如果原始网格是256*256，模型需要8*8，它会进行下采样。
         """
         Returns a new GalData instance with snapshot data rescaled to new_shape.
 
@@ -293,20 +307,20 @@ class GalData:
         new_instance._data_log = self._data_log.copy() if self._data_log is not None else None
 
         new_snapshot = {}
-        for i, (name, data) in enumerate(self.snapshot.items()):
+        for i, (name, data) in enumerate(self.snapshot.items()):  # 遍历所有的物理场，将高分辨率的网格粗化为低分辨率的网格，用的是质量加权平均。
             weight = weights[name] if name in weights else self.gas_mass
             new_snapshot[name] = self._scale_transform(data, new_shape, weight)
-        new_snapshot["temperature"] = 93 * new_snapshot["gas_energy"] / new_snapshot["density"]
+        new_snapshot["temperature"] = 93 * new_snapshot["gas_energy"] / new_snapshot["density"] # 温度不适合求平均，重新用大网格的平均内能和平均密度计算
         new_instance._data_hdfra = new_snapshot
 
         new_axes = []
-        for old_axis, n in zip(self._axes, new_shape):
+        for old_axis, n in zip(self._axes, new_shape): # 重新构建粗的坐标轴网格
             edges = 0.5 * (old_axis[1:] + old_axis[:-1])
             first_edge = old_axis[0] - (edges[0] - old_axis[0])
             last_edge = old_axis[-1] + (old_axis[-1] - edges[-1])
             edges = np.concatenate(([first_edge], edges, [last_edge]))
 
-            factor = len(old_axis) // n
+            factor = len(old_axis) // n # 降采样比例
             new_edges = edges[::factor]
             if len(new_edges) < n + 1:
                 new_edges = np.append(new_edges, edges[-1])
@@ -319,7 +333,7 @@ class GalData:
 
         return new_instance
 
-    def set_corr(self, corr: List[Tuple[str, str]] | Tuple[str, str]) -> "GalData":
+    def set_corr(self, corr: List[Tuple[str, str]] | Tuple[str, str]) -> "GalData": # 坐标轴重映射，允许手动指定轴的对应关系，如设定第一个轴是theta
         """
         Sets the correlation mapping for hdfra file data to new names.
         Note: This class requires the presence of 'density' and 'gas_energy' in the snapshot data.
@@ -351,7 +365,7 @@ class GalData:
         self._coord = np.ix_(*self._axes)
         return self
 
-    def save_h5(self, file_path: str) -> None:
+    def save_h5(self, file_path: str) -> None: # 将Galdata保存为HDF5格式
         """
         Saves core data of GalData instance to an HDF5 file.
         Args:
@@ -382,7 +396,7 @@ class GalData:
 
             # print(f"GalData saved to HDF5: {file_path}")
 
-    def load_h5(self, file_path: str) -> "GalData":
+    def load_h5(self, file_path: str) -> "GalData": # 打开已经保存数据的HDF5文件
         """
 
         Loads GalData instance from an HDF5 file.
@@ -427,7 +441,9 @@ class GalData:
         # Validate file path
         path = _validate_file_path(path)
         self.time = time
-        self._data_hdfra = SD(path)
+        # Convert path to relative path to avoid pyhdf C-library issues with Chinese chars on Windows
+        rel_path = os.path.relpath(path)
+        self._data_hdfra = SD(rel_path)
         return self
 
     def _load_log(self, path: str, f: Callable, scope: float) -> "GalData":
@@ -446,7 +462,7 @@ class GalData:
         self._data_log = f(path, time=self.time, scope=scope)
         return self
 
-    def _scale_transform(self, data: np.ndarray, new_shape: Tuple[int, ...], weights: np.ndarray = None) -> np.ndarray:
+    def _scale_transform(self, data: np.ndarray, new_shape: Tuple[int, ...], weights: np.ndarray = None) -> np.ndarray: # 用numpy的张量操作实现无循环的快速降采样（物理场粗化）
         """
         Rescales the input data array to a new shape using specified method.
         Args:
@@ -465,13 +481,13 @@ class GalData:
 
         factors = (old_shape // new_shape).astype(int)
 
-        reshaped = data.reshape(*[n for pair in zip(new_shape, factors) for n in pair])
+        reshaped = data.reshape(*[n for pair in zip(new_shape, factors) for n in pair]) # 把原来的2D矩阵（256，256）变成了一个4D张量（8，32，8，32）
 
         axes = tuple(range(1, 2 * len(new_shape), 2))
         if weights is None:
-            reshaped = reshaped.sum(axis=axes)
+            reshaped = reshaped.sum(axis=axes) # 直接平均
         else:
-            w_reshaped = weights.reshape(*[n for pair in zip(new_shape, factors) for n in pair])
+            w_reshaped = weights.reshape(*[n for pair in zip(new_shape, factors) for n in pair]) # 质量加权平均
             reshaped = (reshaped * w_reshaped).sum(axis=axes) / w_reshaped.sum(axis=axes)
 
         return reshaped
@@ -483,7 +499,7 @@ class GalData:
             raise ValueError("Coordinates not set. Please call set_coord() first.")
 
 
-# =============== Galaxy DataSet Class ===============
+# =============== Galaxy DataSet Class =============== 将多个galdata对象聚合为张量形式，为了对接机器学习框架
 
 
 class GalDataSet:
@@ -497,76 +513,85 @@ class GalDataSet:
         self._x_keys = None
         self._coord_keys = None
 
-    # --------- Properties --------
+    # --------- Properties -------- 将零散的天体物理快照数据，无缝转化为 Python 机器学习框架可以直接摄入的标准张量格式
 
     @property
     def raw_data(self) -> dict:
         return self._raw_data
 
     @property
-    def x(self) -> np.ndarray:
-        self.__verify_data_loaded()
+    def x(self) -> np.ndarray: 
+        '''
+        提取_x_keys (如密度、能量、气体质量等) 对应的所有数据。原始组装出来的数据形状是 (Channels, Batch_size, Height, Width)。通过 moveaxis 变换后，
+        形状变成了 (Batch_size, Channels, Height, Width)。这是计算机视觉中卷积神经网络 (CNN) 最标准的输入格式。它将物理场直接转化为了多通道的“图像”。
+        '''
+        self.__verify_data_loaded() # 确保数据已经成功加载到内存中
         return np.moveaxis(np.array([self._raw_data[k] for k in self._x_keys]), 0, 1)
 
     @property
-    def y(self) -> np.ndarray:
+    def y(self) -> np.ndarray: # 提取恒星形成率并计算对数
         self.__verify_data_loaded()
-        mdot_macer = np.array(self._raw_data["mdot_macer"])
-        mdot_edd = np.array(self._raw_data["mdot_edd"])
+        sfr_target = np.array(self._raw_data["sfr_target"])
 
-        return np.log10(mdot_macer / mdot_edd)
+        return np.log10(sfr_target + 1e-9) # 添加微小数防止log(0)例外
 
     @property
-    def mbh(self) -> np.ndarray:
+    def mbh(self) -> np.ndarray: # 将黑洞质量转化为一维数组
         self.__verify_data_loaded()
         return np.array(self._raw_data["mbh"])
 
     @property
-    def coordinate(self) -> np.ndarray:
+    def coordinate(self) -> np.ndarray: # 提取 _coord_keys 对应的数据，同样使用了 np.moveaxis(..., 0, 1)，从而返回与特征张量 x 完全对齐的坐标网格张量
         self.__verify_data_loaded()
         return np.moveaxis(np.array([self._raw_data[k] for k in self._coord_keys]), 0, 1)
 
     @property
-    def time(self) -> np.ndarray:
+    def time(self) -> np.ndarray: # 返回每个样本对应的模拟时间戳数组
         self.__verify_data_loaded()
         return np.array(self._raw_data["time"])
 
     @property
-    def mdot_edd(self) -> np.ndarray:
+    def mdot_edd(self) -> np.ndarray: # 将爱丁顿吸积率转化为一维数组
         self.__verify_data_loaded()
         return np.array(self._raw_data["mdot_edd"])
 
     @property
-    def mdot_macer(self) -> np.ndarray:
+    def sfr_target(self) -> np.ndarray: # 将恒星形成率转化为一维数组
         self.__verify_data_loaded()
-        return np.array(self._raw_data["mdot_macer"])
+        return np.array(self._raw_data["sfr_target"])
 
     @property
-    def groups(self) -> np.ndarray:
+    def groups(self) -> np.ndarray: # 将内部的 _group_labels 列表转化为字符串数组返回。这对应了原始数据属于哪个模拟子目录（如不同的星系初始条件或 AGN 反馈参数）。它是后续进行分层切分和样本均衡的核心依据。
         self.__verify_data_loaded()
         if self._group_labels is None:
             raise ValueError("Group labels not initialized. Please call load_data() first.")
         return np.asarray(self._group_labels, dtype=str)
 
     @property
-    def n_groups(self) -> int:
+    def n_groups(self) -> int: # 利用 np.unique 统计 groups 中不重复的标签数量，快速获知当前数据集中混合了多少种不同物理环境的星系数据。
         self.__verify_data_loaded()
         return len(np.unique(self.groups))
 
+    # @property
+    # def y_baseline(self) -> np.ndarray: # 计算邦迪吸积率和爱丁顿吸积率的对数比值，是一个物理基准，用来评判机器预测的y的好坏。
+    #     self.__verify_data_loaded()
+    #     mdot_bondi = np.array(self._raw_data["mdot_bondi"])
+    #     mdot_edd = np.array(self._raw_data["mdot_edd"])
+    #     return np.log10(mdot_bondi / mdot_edd)
+
     @property
-    def y_baseline(self) -> np.ndarray:
+    def y_baseline(self) -> np.ndarray: # 计算基于KS定律预测的恒星形成率SFR，作为物理基准。
         self.__verify_data_loaded()
-        mdot_bondi = np.array(self._raw_data["mdot_bondi"])
-        mdot_edd = np.array(self._raw_data["mdot_edd"])
-        return np.log10(mdot_bondi / mdot_edd)
+        sfr_ks_val = np.array(self._raw_data["sfr_ks"])
+        return np.log10(sfr_ks_val + 1e-9)
 
-    # --------- Dunder Methods --------
+    # --------- Dunder Methods -------- 重载 Python 的内置操作符或函数，让自定义对象（比如这里的 GalDataSet）能够像 Python 原生的列表或数字一样去行动。
 
-    def __len__(self):
+    def __len__(self): # 这段代码允许使得可以直接在外部脚本中使用 length = len(dataset) 来获取数据集的大小。
         self.__verify_data_loaded()
         return len(self._raw_data[self._x_keys[0]])
     
-    def __add__(self, other: "GalDataSet") -> "GalDataSet":
+    def __add__(self, other: "GalDataSet") -> "GalDataSet": # 使让数据集支持 + 拼接
         self.__verify_data_loaded()
         other.__verify_data_loaded()
 
@@ -576,7 +601,7 @@ class GalDataSet:
 
         new_dataset._raw_data = {}
         for key in self._raw_data:
-            new_dataset._raw_data[key] = self._raw_data[key] + other._raw_data[key]
+            new_dataset._raw_data[key] = self._raw_data[key] + other._raw_data[key] # 利用 Python 原生的列表加法 list1 + list2，把两个数据集的每一个物理量列表拼接在一起。
 
         new_dataset._group_labels = self._group_labels + other._group_labels
         return new_dataset
@@ -585,38 +610,67 @@ class GalDataSet:
 
     def load_data(self, folder_path) -> "GalDataSet":
         """
+        整个数据集的入口。它接收一个或多个文件夹路径，遍历里面所有的 HDF5 数据文件。
+        它把每个文件里的物理场（如密度、能量）、坐标网格、黑洞质量（mbh）、实际吸积率（mdot_macer 和 mdot_edd）提取出来，分别追加到内部的 _raw_data 字典中。
+        在读取时，它会实时调用 GalData 的 mdot_bondi() 方法计算邦迪吸积率并存入数据集。同时，它会用 _group_labels 记录每个切片属于哪个星系文件夹，为后续的分组提供依据。
+        """
+        """
         Loads data from the specified folder path(s).
         Args:
             folder_path (str | list[str]): Path to the folder(s) containing the data files.
         """
         # Handle folder paths
         folder_path = folder_path if isinstance(folder_path, list) else [folder_path]
-        self.folder_path = [fp[0] for fp in folder_path]
+        
+        valid_folder_path = []
+        for fp in folder_path:
+            # 兼容 fp 是一维列表 [path] 或是二维列表 [path, group_idx] 的情况
+            path = fp[0] if isinstance(fp, (list, tuple)) else fp
+            if os.path.exists(path) and any(f.endswith('.h5') for f in os.listdir(path)):
+                valid_folder_path.append(fp)
+            else:
+                print(f"  [Warning] Missing or empty data directory: {path}. Skipping...")
+                
+        if not valid_folder_path:
+            raise ValueError("No valid data directories found with .h5 files to load.")
+            
+        self.folder_path = [fp[0] if isinstance(fp, (list, tuple)) else fp for fp in valid_folder_path]
 
         # Initialize raw data dictionary
         self._group_labels = []
         data = GalData()
-        data_path = os.path.join(self.folder_path[0], os.listdir(self.folder_path[0])[0])
+        
+        # 寻找第一个合法的 .h5 文件用来初始化数据集结构
+        first_file = [f for f in os.listdir(self.folder_path[0]) if f.endswith(".h5")][0]
+        data_path = os.path.join(self.folder_path[0], first_file)
+        
         data.load_h5(data_path)
         self._x_keys = list(data.snapshot.keys())
         self._coord_keys = [f"coordinate_{i}" for i in range(len(data.coordinate))]
-        self._x_keys += ["gas_mass", "grid_volume"]
+        self._x_keys += ["gas_mass", "grid_volume"] 
         keys = (
             self._x_keys
             + self._coord_keys
             + [
                 "mbh",
-                "mdot_macer",
+                "sfr_target",
                 "mdot_edd",
                 "time",
-                "mdot_bondi",
+                "sfr_ks",
+                # "mdot_bondi",
             ]
         )
         self._raw_data = {k: [] for k in keys}
 
         # Load data from all specified folder paths
-        for fp, group_idx in folder_path:
+        for fp_info in valid_folder_path:
+            # 安全地解包 fp 和 group_idx
+            fp = fp_info[0] if isinstance(fp_info, (list, tuple)) else fp_info
+            group_idx = fp_info[1] if isinstance(fp_info, (list, tuple)) and len(fp_info) > 1 else None
+            
             for file_name in os.listdir(fp):
+                if not file_name.endswith('.h5'):
+                    continue
                 file_path = os.path.join(fp, file_name)
                 data = GalData().load_h5(file_path)
                 for key, value in data.snapshot.items():
@@ -626,20 +680,22 @@ class GalDataSet:
                 self._raw_data["gas_mass"].append(data.gas_mass)
                 self._raw_data["grid_volume"].append(data.grid_volume)
                 self._raw_data["mbh"].append(data.mbh)
-                self._raw_data["mdot_macer"].append(data.mdot_macer)
+                self._raw_data["sfr_target"].append(data.sfr_target)
                 self._raw_data["mdot_edd"].append(data.mdot_edd)
                 self._raw_data["time"].append(data.time)
-                self._raw_data["mdot_bondi"].append(data.mdot_bondi())
-                self._group_labels.append(group_idx)
+                # self._raw_data["mdot_bondi"].append(data.mdot_bondi()) # 计算邦迪吸积率
+                self._raw_data["sfr_ks"].append(data.sfr_ks()) # 计算KS定律SFR
+                self._group_labels.append(group_idx) # 为每个galaxydata添加group标签
 
         return self
 
-    def drop_invalid(
+    def drop_invalid( # 专门剔除“有毒”数据。在天体物理模拟中，黑洞附近极端的物理条件有时会导致数值溢出，产生 NaN（非数）或 Inf（无穷大）。
         self,
         *,
-        require_positive_targets: bool = True,
-        require_positive_mbh: bool = True,
-        require_positive_bondi: bool = True,
+        require_positive_targets: bool = True, 
+        require_positive_mbh: bool = True, # 要求黑洞质量必须大于0
+        # require_positive_bondi: bool = True, # 要求吸积率必须大于0
+        require_positive_ks: bool = True, # 要求KS恒星形成率必须大于0
     ) -> "GalDataSet":
         """
         Removes samples whose target-related scalars contain NaN/Inf (or non-positive values if requested).
@@ -648,18 +704,22 @@ class GalDataSet:
             require_positive_mbh (bool): Enforce mbh to be strictly positive.
         """
         self.__verify_data_loaded()
-        mdot_macer = np.asarray(self._raw_data["mdot_macer"], dtype=float)
+        sfr_target = np.asarray(self._raw_data["sfr_target"], dtype=float) # 将rawdata中的数据转化为一维数组
         mdot_edd = np.asarray(self._raw_data["mdot_edd"], dtype=float)
-        mdot_bondi = np.asarray(self._raw_data["mdot_bondi"], dtype=float)
+        # mdot_bondi = np.asarray(self._raw_data["mdot_bondi"], dtype=float)
+        sfr_ks_val = np.asarray(self._raw_data["sfr_ks"], dtype=float)
         mbh = np.asarray(self._raw_data["mbh"], dtype=float)
 
-        mask = np.isfinite(mdot_macer) & np.isfinite(mdot_edd) & np.isfinite(mdot_bondi) & np.isfinite(mbh)
+        mask = np.isfinite(sfr_target) & np.isfinite(mdot_edd) & np.isfinite(sfr_ks_val) & np.isfinite(mbh)
+        # mask = np.isfinite(sfr_target) & np.isfinite(mdot_edd) & np.isfinite(mdot_bondi) & np.isfinite(mbh)
         if require_positive_targets:
-            mask &= (mdot_macer > 0.0) & (mdot_edd > 0.0)
+            mask &= (sfr_target > 0.0) & (mdot_edd > 0.0)
         if require_positive_mbh:
             mask &= mbh > 0.0
-        if require_positive_bondi:
-            mask &= mdot_bondi > 0.0
+        # if require_positive_bondi:
+        #     mask &= mdot_bondi > 0.0
+        if require_positive_ks:
+            mask &= sfr_ks_val > 0.0
 
         removed = np.count_nonzero(~mask)
         if removed:
@@ -668,7 +728,7 @@ class GalDataSet:
             self.__subset(np.flatnonzero(mask))
         return self
 
-    def filter(self, threshold: float) -> "GalDataSet":
+    def filter(self, threshold: float) -> "GalDataSet": # 过滤掉y小于一定值的样本，需要输入一个threshold
         """
         Filters out data points where the target variable y is below the specified threshold.
         Args:
@@ -682,6 +742,10 @@ class GalDataSet:
 
     def mirror_data(self) -> "GalDataSet":
         """
+        它利用 NumPy 的 np.fliplr 和 np.hstack 将物理场和坐标场沿着第一个轴（通常是横轴或方位角）进行镜像拼接。
+        对于极坐标下的盘状星系，这相当于利用物理对称性把半个星系的模拟数据补全成整个星系，让模型学到更完整的空间结构。
+        """
+        """
         Mirrors the data along the first coordinate axis (e.g., x-axis).
         """
         self.__verify_data_loaded()
@@ -693,7 +757,7 @@ class GalDataSet:
             self._raw_data[key] = [np.hstack([np.fliplr(x), x]) for x in self._raw_data[key]]
         return self
 
-    def split(
+    def split( # 数据集划分，将一整块数据集切分为训练集、验证集和测试集。
         self,
         train_size: float,
         validation_size: float = 0.0,
@@ -706,7 +770,7 @@ class GalDataSet:
         """
         Split dataset into train / validation / test sets.
 
-        stratify options:
+        *** stratify options:
             None        : random split
             "groups"    : stratify by self._group_labels
             "y"         : stratify by y (equal-frequency bins)
@@ -722,8 +786,7 @@ class GalDataSet:
         rng = np.random.default_rng(random_state)
         indices = np.arange(len(self))
 
-        labels = self._build_stratified_labels(stratify, n_bins)
-
+        labels = self._build_stratified_labels(stratify, n_bins) # private method 中构建了_build_stratified_labels函数，用于构建stratify,这是对数据分成训练集、验证集和测试集的依据
         train_idx, val_idx, test_idx = [], [], []
         if labels is None:
             tr, va, te = self._split_group(indices, train_size, validation_size, rng, shuffle)
@@ -761,7 +824,7 @@ class GalDataSet:
 
         return (train_set, val_set, test_set) if validation_size > 0 else (train_set, test_set)
 
-    def standardize(
+    def standardize( #消除不同物理量量纲差异带来的影响，加速神经网络收敛。
         self, mean: np.ndarray = None, std: np.ndarray = None, log_transform: bool = True
     ) -> np.ndarray | Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -773,7 +836,7 @@ class GalDataSet:
         """
         self.__verify_data_loaded()
         x = self.x.copy()  # Use copy to avoid modifying original data
-        if log_transform:
+        if log_transform: # 对非负物理场应用log（1+x）变换，压缩极端数值
             # Safely apply log1p only to non-negative channels (scalars like density, temperature, etc.)
             # Velocities and other signed quantities should remain linear.
             # We check the minimum value across all samples for each channel.
@@ -787,7 +850,7 @@ class GalDataSet:
             std_safe = np.where(std == 0, 1.0, std)
             x = (x - mean) / std_safe
             return x, mean, std_safe
-        elif mean is not None and std is not None:
+        elif mean is not None and std is not None: # 标准化，使得测试集上应用完全相同的缩放比例。
             std_safe = np.where(std == 0, 1, std)
             x = (x - mean) / std_safe
             return x
@@ -795,6 +858,10 @@ class GalDataSet:
             raise ValueError("Both mean and std must be provided for standardization.")
 
     def balance_groups(self, method: str = "oversample") -> "GalDataSet":
+        """
+        解决样本不平衡问题。假设 A 星系模拟了 1000 个快照，B 星系只模拟了 100 个，不处理的话模型会偏向 A 星系。
+        用oversample来增加少样本星系的快照，用undersample来随机去除多样本星系的快照
+        """
         """
         Balance samples across groups by random over- or under-sampling.
 
@@ -833,15 +900,15 @@ class GalDataSet:
 
     # ------- Private Methods -------
 
-    def _build_stratified_labels(self, stratify: str | np.ndarray | None, n_bins: int) -> np.ndarray | None:
+    def _build_stratified_labels(self, stratify: str | np.ndarray | None, n_bins: int) -> np.ndarray | None: #statify可以是str，也可以是n维数组，也可以是none。
         """
         Constructs stratification labels based on the specified method.
         """
-        if stratify is None:
+        if stratify is None: # 如果stratify是none，则对数据随机切分
             return None
 
         if isinstance(stratify, str):
-            if stratify == "groups":
+            if stratify == "groups": # 如果stratify是groups，则对数据按星系组别进行切分    
                 items = [
                     tuple(np.asarray(g).tolist()) if np.asarray(g).ndim > 0 else np.asarray(g).item()
                     for g in self._group_labels
@@ -850,9 +917,9 @@ class GalDataSet:
                 res[:] = items
                 return res
 
-            if stratify == "y":
+            if stratify == "y": # 如果stratify是y，则按目标变量y（吸积率比值对数）进行切分，切分的依据是分位数
                 y = self.y
-                quantiles = np.linspace(0, 1, n_bins + 1)
+                quantiles = np.linspace(0, 1, n_bins + 1) # 生成n_bins+1个分位数
                 edges = np.unique(np.quantile(y, quantiles))
                 if edges.size < 2:
                     edges = np.array([y.min() - 1e-9, y.max() + 1e-9])
@@ -860,12 +927,12 @@ class GalDataSet:
 
             raise ValueError("stratify must be None, 'groups', 'y', or a 1D array.")
 
-        labels = np.asarray(stratify)
+        labels = np.asarray(stratify) # stratify也可以是用户传入的自定义的一维数组，比如金属丰度
         if labels.shape != (len(self),):
             raise ValueError("Provided stratify array must be 1D and match dataset length.")
         return labels
 
-    def _split_group(
+    def _split_group( 
         self,
         group_idx: np.ndarray,
         train_size: float,
@@ -890,18 +957,18 @@ class GalDataSet:
             n_val -= reduce_val
             n_train = max(0, n_train - (excess - reduce_val))
 
-        train = group_idx[:n_train]
+        train = group_idx[:n_train] # 进行切片
         val = group_idx[n_train : n_train + n_val]
         test = group_idx[n_train + n_val :]
         return train, val, test
 
     # ------- Validation Methods -------
 
-    def __verify_data_loaded(self) -> None:
+    def __verify_data_loaded(self) -> None: # 验证数据是否加载
         if self._raw_data is None:
             raise ValueError("Data not loaded. Please call load_data() first.")
 
-    def __subset(self, indices: np.ndarray) -> "GalDataSet":
+    def __subset(self, indices: np.ndarray) -> "GalDataSet": # 原地修改，只保留索引为keep的样本
         """
         Retains only the samples specified by indices across all stored fields.
         """
@@ -912,7 +979,7 @@ class GalDataSet:
             self._group_labels = [self._group_labels[i] for i in keep]
         return self
 
-    def __subset_by_idx(self, idx: np.ndarray) -> "GalDataSet":
+    def __subset_by_idx(self, idx: np.ndarray) -> "GalDataSet": # 创建一个新副本
         """
         Returns a new GalDataSet instance containing only the samples specified by idx.
         """
@@ -933,33 +1000,46 @@ if __name__ == "__main__":
     except ModuleNotFoundError:
         from parse_log_file import load_config, ll_eg, ll_dg
 
-    configs = load_config(".config")
+    configs = load_config(".config") # 从外部加载.config文件
     raw_data_dir = configs["BaseConfig"]["raw_data_dir"]
     data_dir = configs["BaseConfig"]["data_dir"]
 
-    ndim = 2
-    coordinate_mode = "polar"
+    ndim = 2 # 2D模拟（MACER2D）
+    coordinate_mode = "polar" # 采用极坐标系
 
-    for gal_type, gal_group in configs["RawDataConfig"].items():
+    for gal_type, gal_group in configs["RawDataConfig"].items(): # 便利所有星系类型和组
         # if gal_type == "elliptical_galaxy":
         #     continue  # Skip elliptical galaxies for 2D processing
         for gal_nickname, gal_config in gal_group.items():
-            gal_name = f"{gal_type}_{gal_nickname}"
+            gal_name = f"{gal_type}_{gal_nickname}" # 星系是椭圆星系还是盘星系
 
             hdfra_folder = os.path.join(raw_data_dir, gal_config["folder_name"], "data")
-            hdfra_paths = sorted([f for f in os.listdir(hdfra_folder) if f.startswith("hdfra.")])
+            if not os.path.exists(hdfra_folder):
+                # 如果 "data" 子文件夹不存在，尝试直接在 folder_name 寻找（适配您当前的文件结构）
+                hdfra_folder = os.path.join(raw_data_dir, gal_config["folder_name"])
+            
+            if not os.path.exists(hdfra_folder):
+                print(f"  [Warning] Data folder not found for {gal_name} at {hdfra_folder}. Skipping...")
+                continue
+                
+            hdfra_files = [f for f in os.listdir(hdfra_folder) if f.startswith("hdfra.")]
+            if not hdfra_files:
+                print(f"  [Warning] No hdfra files found for {gal_name} in {hdfra_folder}. Skipping...")
+                continue
+                
+            hdfra_paths = sorted(hdfra_files)
             log_path = os.path.join(data_dir, f"{gal_name}.parquet")
-            func_parse_log = ll_eg if "elliptical" in gal_type else ll_dg
+            func_parse_log = ll_eg if "elliptical" in gal_type else ll_dg # 按照星系类型（椭圆or盘）选择不同的日志解析函数
             corr = configs["HdfraConfig"][gal_type]["correspondence"]
 
             # Initialize the time of snapshots
-            snapshot_dt = gal_config["snapshot_dt"]
+            snapshot_dt = gal_config["snapshot_dt"] # config中包含时间步长的输入
             scope = snapshot_dt * 0.5
             if gal_config.get("mode") != "concatenate":
-                time_range = gal_config["range"]
-                time_seq = np.arange(time_range[0], time_range[1]) * snapshot_dt + gal_config.get("offset", 0)
+                time_range = gal_config["range"] # config中包含时间范围的呼入
+                time_seq = np.arange(time_range[0], time_range[1]) * snapshot_dt + gal_config.get("offset", 0) # 生成时间序列
             else:
-                indices = np.concatenate([np.arange(start, end) for start, end in gal_config["ranges"]])
+                indices = np.concatenate([np.arange(start, end) for start, end in gal_config["ranges"]]) # 如果mode是concatenate，则将所有时间范围的索引合并
                 time_seq = indices * snapshot_dt + gal_config.get("offset", 0)
 
             save_path_fine = os.path.join(data_dir, gal_name, "fine")
@@ -968,11 +1048,11 @@ if __name__ == "__main__":
             os.makedirs(save_path_coarse, exist_ok=True)
 
             for index, file_name in tenumerate(hdfra_paths, desc=f"Processing {gal_name}"):
-                if gal_name not in ["disk_galaxy_fiducial", "disk_galaxy_supplement", "disk_galaxy_fiducial_4", "disk_galaxy_fiducial_7"] and index <= 45:
+                if gal_name not in ["disk_galaxy_fiducial", "disk_galaxy_supplement", "disk_galaxy_fiducial_4", "disk_galaxy_fiducial_7"] and index <= 45: # 跳过最初的45个不稳定的快照
                     continue  # Skip first unstable snapshots
 
                 file_path = os.path.join(hdfra_folder, file_name)
-                file = GalData(ndim=ndim, coordinate_mode=coordinate_mode)
+                file = GalData(ndim=ndim, coordinate_mode=coordinate_mode) # 创建GalData类
                 file.read_hdfra(
                     hdfra_path=file_path,
                     time=time_seq[index],
@@ -980,9 +1060,9 @@ if __name__ == "__main__":
                     func_parse_log=func_parse_log,
                     scope=scope,
                 )
-                file.set_corr(corr).set_coord(["fakeDim2", "fakeDim1"])
-                file.save_h5(os.path.join(save_path_fine, f"{str(index).zfill(5)}.h5"))
+                file.set_corr(corr).set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射
+                file.save_h5(os.path.join(save_path_fine, f"{str(index).zfill(5)}.h5")) # 将原始分辨率数据的HDF5文件保存至fine文件夹
 
                 # Scale transform to coarse grid
-                file_coarse = file.rescale(new_shape=(8, 8), weights={"density": file.grid_volume})
-                file_coarse.save_h5(os.path.join(save_path_coarse, f"{str(index).zfill(5)}.h5"))
+                file_coarse = file.rescale(new_shape=(8, 8), weights={"density": file.grid_volume}) # 调用rescale方法，将原始分辨率数据下采样到8*8
+                file_coarse.save_h5(os.path.join(save_path_coarse, f"{str(index).zfill(5)}.h5")) # 将下采样后的数据保存至coarse文件夹

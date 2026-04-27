@@ -8,3 +8,6 @@ runs/
 .cache/
 
 __pycache__/
+
+ResultByCheng/
+*.docx
