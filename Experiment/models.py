@@ -1,6 +1,6 @@
 """
 基于pytorch的深度学习神经网络
-终极目的：输入一张代表星系中心气体状态的多通道 2D 物理特征图（如密度场、温度场），再加上一个额外的标量条件（黑洞质量 $M_{BH}$），让模型预测出一个精确真实的黑洞吸积率y。
+终极目的：输入一张代表星系中心气体状态的多通道 2D 物理特征图（如密度场、温度场），再加上一个额外的标量条件（如用于残差预测的物理基准 SFR），让模型预测出一个精确真实的吸积率或恒星形成率 (SFR) y。
 """
 import math
 import torch
@@ -81,15 +81,15 @@ class MACNetRes_mbh(nn.Module):
             nn.Linear(in_channels // 2, 1), # 线性层，输入维度=128，输出维度=1
         )
 
-    def forward(self, x, mbh):
-        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh # 输入mb，并转化为tensor
-        mbh = mbh.float().to(x.device).view(-1, 1) # 将mbh展平维1*1
+    def forward(self, x, y_baseline):
+        y_baseline = torch.tensor(y_baseline, dtype=torch.float32, device=x.device) if not isinstance(y_baseline, torch.Tensor) else y_baseline # 输入y_baseline，并转化为tensor
+        y_baseline = y_baseline.float().to(x.device).view(-1, 1) # 将y_baseline展平维1*1
 
         x = self.res_blocks(x)
         x = self.flatten_block(x)
-        x = torch.cat((x, mbh), dim=1) # 合并flatten后的输出和mbh，形成256*1的特征图
+        x = torch.cat((x, y_baseline), dim=1) # 合并flatten后的输出和y_baseline，形成256*1的特征图
         x = self.liner_block(x)
-        return x.view(-1) # 输出最终的黑洞吸积率预测值
+        return x.view(-1) # 输出最终预测值
 
 
 
@@ -160,11 +160,11 @@ class MACNetFiLM(nn.Module):
             nn.Linear(last_out_channels // 2, 1), # 输入维度=256（而非257），输出一个预测值
         )
 
-    def forward(self, x, mbh):
-        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh # 输入mbh，转化为tensor
-        mbh = mbh.float().to(x.device).view(-1, 1)
+    def forward(self, x, y_baseline):
+        y_baseline = torch.tensor(y_baseline, dtype=torch.float32, device=x.device) if not isinstance(y_baseline, torch.Tensor) else y_baseline # 输入y_baseline，转化为tensor
+        y_baseline = y_baseline.float().to(x.device).view(-1, 1)
 
-        film_params = self.film_generator(mbh)
+        film_params = self.film_generator(y_baseline)
         gammas_betas = torch.split(film_params, [c * 2 for c in self.channel_counts], dim=1) # 按照每个阶段的通道数对gamma和beta进行切分，切分成8组
 
         for block, params in zip(self.blocks, gammas_betas):
@@ -294,10 +294,10 @@ class FourierPositionalEncoding2D(nn.Module):
         return pos
 
 
-# FiLM conditioner for BH mass
+# FiLM conditioner for y_baseline
 class FiLMConditioner(nn.Module):  # Transformer架构，独立于前面的cnn架构
     """
-    Map scalar BH mass to (gamma, beta) for feature modulation.
+    Map scalar baseline (e.g. KS SFR) to (gamma, beta) for feature modulation.
     Can produce one pair per Transformer layer.
     """
 
@@ -313,16 +313,16 @@ class FiLMConditioner(nn.Module):  # Transformer架构，独立于前面的cnn�
             nn.Linear(hidden, 2 * n_layers * d_model),
         )
 
-    def forward(self, bh_mass: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    def forward(self, y_baseline: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
-        bh_mass: (B,) or (B,1)
+        y_baseline: (B,) or (B,1)
         Returns lists gamma_list, beta_list each len=n_layers,
         with tensors of shape (B, 1, d_model) ready to broadcast over tokens.
         """
-        if bh_mass.dim() == 1:
-            bh_mass = bh_mass.unsqueeze(-1)
-        B = bh_mass.shape[0]
-        out = self.net(bh_mass)  # (B, 2*n_layers*d_model)
+        if y_baseline.dim() == 1:
+            y_baseline = y_baseline.unsqueeze(-1)
+        B = y_baseline.shape[0]
+        out = self.net(y_baseline)  # (B, 2*n_layers*d_model)
         out = out.view(B, self.n_layers, 2, self.d_model)  # (B,L,2,D)
         gammas = out[:, :, 0, :].unsqueeze(1)  # (B,1,L,D)
         betas = out[:, :, 1, :].unsqueeze(1)  # (B,1,L,D)
@@ -388,9 +388,9 @@ class AccretionTransformer(nn.Module):
         x: (B, C_in, H, W)   -- multi-channel galaxy "image"
         r: (B, 1, H, W)      -- radial coordinate
         theta: (B, 1, H, W)  -- azimuthal coordinate
-        bh_mass: (B,)        -- scalar BH mass
+        y_baseline: (B,)     -- scalar baseline
     Output:
-        y: (B,)              -- scalar (e.g., log accretion rate)
+        y: (B,)              -- scalar (e.g., log SFR)
     """
 
     def __init__(
@@ -446,10 +446,10 @@ class AccretionTransformer(nn.Module):
         x: torch.Tensor,  # (B, C_in, H, W)
         r: torch.Tensor,  # (B, 1,    H, W)
         theta: torch.Tensor,  # (B, 1,    H, W)
-        bh_mass: torch.Tensor,  # (B,)
+        y_baseline: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """
-        x: (B, C_in, H, W), r, theta: (B, 1, H, W), bh_mass: (B,)
+        x: (B, C_in, H, W), r, theta: (B, 1, H, W), y_baseline: (B,)
         """
         B, C, H, W = x.shape
 
@@ -469,8 +469,8 @@ class AccretionTransformer(nn.Module):
         cls = self.cls_token.expand(B, -1, -1)  # (B,1,D)
         tokens = torch.cat([cls, tokens], dim=1)  # (B, N+1, D)
 
-        # FiLM params from BH mass
-        gammas, betas = self.film(bh_mass)  # lists of (B,1,D)
+        # FiLM params from baseline
+        gammas, betas = self.film(y_baseline)  # lists of (B,1,D)
 
         # Pass through layers
         x_tok = tokens
@@ -571,7 +571,7 @@ class ConvFiLMBlock(nn.Module):
 
 class ConvFiLMConditioner(nn.Module): # FiLM调制
     """
-    Map scalar BH mass → per-stage (γ, β) for 2D feature maps.
+    Map scalar baseline → per-stage (γ, β) for 2D feature maps.
     Each γ/β has shape (B, C_stage, 1, 1) to broadcast over spatial dims.
     """
 
@@ -588,12 +588,12 @@ class ConvFiLMConditioner(nn.Module): # FiLM调制
         )
 
     def forward(
-        self, bh_mass: torch.Tensor
+        self, y_baseline: torch.Tensor
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        if bh_mass.dim() == 1:
-            bh_mass = bh_mass.unsqueeze(-1)
-        B = bh_mass.shape[0]
-        out = self.net(bh_mass)  # (B, total_out)
+        if y_baseline.dim() == 1:
+            y_baseline = y_baseline.unsqueeze(-1)
+        B = y_baseline.shape[0]
+        out = self.net(y_baseline)  # (B, total_out)
 
         gamma_list, beta_list = [], []
         offset = 0
@@ -605,7 +605,7 @@ class ConvFiLMConditioner(nn.Module): # FiLM调制
         return gamma_list, beta_list
 
 
-class AccretionConvNet(nn.Module):
+class SFRConvNet(nn.Module):
     """
     CNN backbone with Fourier positional encoding + FiLM conditioning.
 
@@ -620,7 +620,6 @@ class AccretionConvNet(nn.Module):
         x:       (B, C_in, H, W)
         r:       (B, 1,    H, W)
         theta:   (B, 1,    H, W)
-        bh_mass: (B,)
 
     Output:
         y: (B,)
@@ -635,6 +634,7 @@ class AccretionConvNet(nn.Module):
         pos_max_freq: float = 64.0, # 傅里叶变换最大频率
         p_drop: float = 0.1, # dropout机制的概率
         se_reduction: int = 4, # SEBlock的通道数缩减率，控制SEBlock中隐藏层的大小，较小的reduction会增加模型容量，但也可能导致过拟合
+        use_film: bool = False, # 是否使用 FiLM 将物理定律基准(baseline)注给模型进行残差预测
     ):
         """
         Args:
@@ -690,9 +690,11 @@ class AccretionConvNet(nn.Module):
         self.stages = nn.ModuleList(stages)
         self.stage_channels = stage_channels
         last_ch = stage_channels[-1]
+        self.use_film = use_film
 
         # ---- FiLM conditioner ----
-        self.film = ConvFiLMConditioner(stage_channels=stage_channels, hidden=128) # FiLM调制
+        if self.use_film:
+            self.film = ConvFiLMConditioner(stage_channels=stage_channels, hidden=128)
 
         # ---- Regression head ---- # 池化，压平，归一化，线性层，激活，dropout，线性层，输出
         self.head = nn.Sequential(
@@ -710,7 +712,7 @@ class AccretionConvNet(nn.Module):
         x: torch.Tensor,        # (B, C_in, H, W)
         r: torch.Tensor,        # (B, 1,    H, W)
         theta: torch.Tensor,    # (B, 1,    H, W)
-        bh_mass: torch.Tensor,  # (B,)
+        y_baseline: Optional[torch.Tensor] = None, # (B,) 可以传入基准值
     ) -> torch.Tensor:
         # Positional features
         pos = self.posenc(r, theta, normalize=True)  # (B, D_pos, H, W)
@@ -719,15 +721,18 @@ class AccretionConvNet(nn.Module):
         feat = torch.cat([x, pos], dim=1)  # (B, C_in + D_pos, H, W)
         feat = self.stem(feat)
 
-        # FiLM conditioning from BH mass
-        gammas, betas = self.film(bh_mass) # 引入Mbh，FiLM调制gamma和beta
+        # 生成 FiLM 参数
+        if self.use_film and y_baseline is not None:
+            gammas, betas = self.film(y_baseline)
+        else:
+            gammas, betas = [None] * len(self.stages), [None] * len(self.stages)
 
-        # Residual stages with FiLM
-        for stage_idx, stage in enumerate(self.stages):
-            g = gammas[stage_idx]   # (B, C_stage, 1, 1)
-            b = betas[stage_idx]
+        # Residual stages
+        for i, stage in enumerate(self.stages):
+            gamma = gammas[i]
+            beta = betas[i]
             for block in stage:
-                feat = block(feat, gamma=g, beta=b)
+                feat = block(feat, gamma=gamma, beta=beta)
 
         # Regression
         y = self.head(feat).squeeze(-1)  # (B,) 预测值

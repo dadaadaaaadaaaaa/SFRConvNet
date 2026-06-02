@@ -7,7 +7,7 @@ import json
 # Configuration Source
 # =============================================================================
 # Specify the experiment key from ExperimentSetting.json to run
-TARGET_EXPERIMENT = "Exp1_AccretionConvNet"  # Change this to the desired experiment key 运行第几类实验，使用哪个模型
+TARGET_EXPERIMENT = "Exp1_SFRConvNet"  # Change this to the desired experiment key 运行第几类实验，使用哪个模型
 
 def load_config(exp_key):
     """

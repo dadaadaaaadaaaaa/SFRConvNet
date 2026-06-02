@@ -1,6 +1,6 @@
 '''
 1. CachePt数据预处理，整合raw_data_processing中的功能对数据进行预处理
-2. 设计了7个实验，椭圆星系、盘状星系、所有星系、剔除一个星系的椭圆、盘状，剔除低分辨率的椭圆、同时剔除低分辨率和一个星系的盘状，测试模型的泛化能力
+2. 设计了4个实验，盘状星系、剔除一个星系的盘状，剔除低分辨率的盘状、同时剔除低分辨率和一个星系的盘状，测试模型的泛化能力
 '''
 
 import os
@@ -57,7 +57,7 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
     def process(self, threshold: float = None, mirror: bool = True, balance: str = None):
         data = self._dataset
         if threshold is not None:
-            data.filter(threshold) # 过滤掉吸积率小于threshold的样本
+            data.filter(threshold) # 过滤掉恒星形成率小于threshold的样本
         if mirror:
             data.mirror_data() # mirror，镜像扩增数据
         if balance is not None: # balance，过采样或欠采样平衡数据
@@ -82,7 +82,7 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                 x,
                 data.coordinate,
                 data.y,
-                data.mbh,
+                # data.mbh,
                 data.y_baseline,
                 data.groups,
                 data.n_groups,
@@ -134,50 +134,56 @@ if __name__ == "__main__":
 
     exp_all_folder_paths = exp_eg_folder_paths + exp_dg_folder_paths # 所有星系的路径
 
-    # Create each type galaxy cache
-    for i, path in enumerate([exp_eg_folder_paths, exp_dg_folder_paths, exp_all_folder_paths]): # 进行实验1-3，分别训练椭圆星系、盘状星系和所有星系
-        print(f"Processing Experiment {i+1}...")
-        save_path = os.path.join(".cache", f"Exp{i+1}_")
+    # ==========================================
+    # Modifications for SFR Architecture
+    # ==========================================
+    # As SFR (Star Formation Rate) physics model is highly relevant and tailored to Disk Galaxies with gas disks.
+    # We will exclude Elliptical Galaxies from standard training pools to prevent physical domain confusion.
 
-        cache = CachePt().load(path)
-        train_cache, val_cache, test_cache = cache.split(train_size=0.6, validation_size=0.2, stratify="groups")
+    # 1. Main Default Experiment (Exp1_) - Disk Galaxies Only (Fiducial setup)
+    print("Processing Experiment 1 (Disk Galaxies)...")
+    save_path = os.path.join(".cache", "Exp1_")
+    cache = CachePt().load(exp_dg_folder_paths)
+    train_cache, val_cache, test_cache = cache.split(train_size=0.6, validation_size=0.2, stratify="groups")
+    
+    train_cache = train_cache.process(balance="oversample")
+    val_cache = val_cache.process()
+    test_cache = test_cache.process()
+    
+    print(f"  Training set size:   {len(train_cache)}")
+    print(f"  Validation set size: {len(val_cache)}")
+    print(f"  Testing set size:    {len(test_cache)}")
 
-        train_cache = train_cache.process(balance="oversample")
-        val_cache = val_cache.process()
-        test_cache = test_cache.process()
-        print(f"  Training set size:   {len(train_cache)}")
-        print(f"  Validation set size: {len(val_cache)}")
-        print(f"  Testing set size:    {len(test_cache)}")
+    mean, std = train_cache.to_pt(save_path + "train.pt")
+    _save_norm_stats(save_path, mean, std)
+    val_cache.to_pt(save_path + "val.pt", mean, std)
+    test_cache.to_pt(save_path + "test.pt", mean, std)
 
-        mean, std = train_cache.to_pt(save_path + "train.pt")
-        _save_norm_stats(save_path, mean, std)
-        val_cache.to_pt(save_path + "val.pt", mean, std)
-        test_cache.to_pt(save_path + "test.pt", mean, std)
+    import random
 
-    # Create in- and out-datasets for each galaxy type
-    exp_eg_folder_paths_in = exp_eg_folder_paths.copy()
+    # 2. Generalization Experiment (Exp2_) - In/Out Sample on Disk Galaxies
+    # (Hold out one disk galaxy to test generalization)
     exp_dg_folder_paths_in = exp_dg_folder_paths.copy()
-    exp_eg_folder_paths_in.pop(2) # 故意把某个椭圆星系的数据从训练集中剔除，最后用这个星系的数据作为测试集，验证模型的泛化能力
-    exp_dg_folder_paths_in.pop(2) # 与上面同理
-    exp_eg_folder_paths_out = [exp_eg_folder_paths[2]]
-    exp_dg_folder_paths_out = [exp_dg_folder_paths[2]]
-
-    for i, (in_paths, out_path) in enumerate( # 进行实验4和5，分别训练椭圆星系、盘状星系和所有星系，且每种类型都剔除一个星系作为测试集
-        [
-            (exp_eg_folder_paths_in, exp_eg_folder_paths_out),
-            (exp_dg_folder_paths_in, exp_dg_folder_paths_out),
-        ]
-    ):
-        print(f"Processing Experiment {i+4}...")
-        save_path = os.path.join(".cache", f"Exp{i+4}_")
-
+    
+    if len(exp_dg_folder_paths_in) > 1:
+        # 随机剔除一个盘星系作为留出集（设定固定随机种子以保证复现性与缓存一致）
+        random.seed(42)
+        held_out_idx = random.randint(0, len(exp_dg_folder_paths_in) - 1)
+        held_out_dg = exp_dg_folder_paths_in.pop(held_out_idx)
+        exp_dg_folder_paths_out = [held_out_dg]
+        
+        print(f"Processing Experiment 2 (Disk Galaxies Generalization: Hold-out test)...")
+        print(f"  Hold-out Galaxy: {held_out_dg[1]}")
+        save_path = os.path.join(".cache", "Exp2_")
+        
         try:
-            cache_in = CachePt().load(in_paths)
+            cache_in = CachePt().load(exp_dg_folder_paths_in)
             train_cache, val_cache, test_cache = cache_in.split(train_size=0.6, validation_size=0.2, stratify="groups")
 
             train_cache = train_cache.process(balance="oversample")
             val_cache = val_cache.process()
             test_cache = test_cache.process()
+            
             print(f"  Training set size:   {len(train_cache)}")
             print(f"  Validation set size: {len(val_cache)}")
             print(f"  Testing set size:    {len(test_cache)}")
@@ -187,53 +193,63 @@ if __name__ == "__main__":
             val_cache.to_pt(save_path + "val.pt", mean, std)
             test_cache.to_pt(save_path + "test.pt", mean, std)
 
-            cache_out = CachePt().load(out_path)
-
+            # Process out-of-distribution (held out) test set
+            cache_out = CachePt().load(exp_dg_folder_paths_out)
             cache_out = cache_out.process()
-            print(f"  Out-set size: {len(cache_out)}")
-
+            print(f"  Out-set size (Generalization): {len(cache_out)}")
             cache_out.to_pt(save_path + "out.pt", mean, std)
         except ValueError as e:
-            print(f"  [Skip] Skipped Experiment {i+4}: {e}")
+            print(f"  [Skip] Skipped Experiment 2: {e}")
+    else:
+        print("[Skip] Not enough Disk Galaxies to do hold-out Exp2_")
 
     # Create disk galaxies without low-res data
-    exp_dg_folder_paths_nolow = exp_dg_folder_paths.copy() # 实验6：测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
-    exp_dg_folder_paths_nolow.pop(5)
-    print(f"Processing Experiment 6...")
-    save_path = os.path.join(".cache", f"Exp6_")
-    cache = CachePt().load(exp_dg_folder_paths_nolow)
-    train_cache, val_cache, test_cache = cache.split(train_size=0.6, validation_size=0.2, stratify="groups")
-    train_cache = train_cache.process(balance="oversample")
-    val_cache = val_cache.process()
-    test_cache = test_cache.process()
-    print(f"  Training set size:   {len(train_cache)}")
-    print(f"  Validation set size: {len(val_cache)}")
-    print(f"  Testing set size:    {len(test_cache)}")
-    mean, std = train_cache.to_pt(save_path + "train.pt")
-    _save_norm_stats(save_path, mean, std)
-    val_cache.to_pt(save_path + "val.pt", mean, std)
-    test_cache.to_pt(save_path + "test.pt", mean, std)
+    exp_dg_folder_paths_nolow = exp_dg_folder_paths.copy() # 实验3：测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
+    try:
+        if len(exp_dg_folder_paths_nolow) > 5:
+            exp_dg_folder_paths_nolow.pop(5)
+        print(f"Processing Experiment 3...")
+        save_path = os.path.join(".cache", f"Exp3_")
+        cache = CachePt().load(exp_dg_folder_paths_nolow)
+        train_cache, val_cache, test_cache = cache.split(train_size=0.6, validation_size=0.2, stratify="groups")
+        train_cache = train_cache.process(balance="oversample")
+        val_cache = val_cache.process()
+        test_cache = test_cache.process()
+        print(f"  Training set size:   {len(train_cache)}")
+        print(f"  Validation set size: {len(val_cache)}")
+        print(f"  Testing set size:    {len(test_cache)}")
+        mean, std = train_cache.to_pt(save_path + "train.pt")
+        _save_norm_stats(save_path, mean, std)
+        val_cache.to_pt(save_path + "val.pt", mean, std)
+        test_cache.to_pt(save_path + "test.pt", mean, std)
+    except Exception as e:
+        print(f"  [Skip] Skipped Experiment 3: {e}")
 
     # Create in- and out-datasets for disk galaxies without low-res data
-    print(f"Processing Experiment 7...") # 实验7：在实验4的基础上，测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
-    save_path = os.path.join(".cache", f"Exp7_")
+    print(f"Processing Experiment 4...") # 实验4：在实验2的基础上，测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
+    save_path = os.path.join(".cache", f"Exp4_")
     exp_dg_folder_paths_nolow_in = exp_dg_folder_paths_nolow.copy()
-    exp_dg_folder_paths_nolow_in.pop(2)
-    exp_dg_folder_paths_nolow_out = [exp_dg_folder_paths_nolow[2]]
-    cache_in = CachePt().load(exp_dg_folder_paths_nolow_in)
-    train_cache, val_cache, test_cache = cache_in.split(train_size=0.6, validation_size=0.2, stratify="groups")
-    train_cache = train_cache.process(balance="oversample")
-    val_cache = val_cache.process()
-    test_cache = test_cache.process()
-    print(f"  Training set size:   {len(train_cache)}")
-    print(f"  Validation set size: {len(val_cache)}")
-    print(f"  Testing set size:    {len(test_cache)}")
-    mean, std = train_cache.to_pt(save_path + "train.pt")
-    _save_norm_stats(save_path, mean, std)
-    val_cache.to_pt(save_path + "val.pt", mean, std)
-    test_cache.to_pt(save_path + "test.pt", mean, std)
+    
+    try:
+        exp_dg_folder_paths_nolow_in.pop(2)
+        exp_dg_folder_paths_nolow_out = [exp_dg_folder_paths_nolow[2]]
+        
+        cache_in = CachePt().load(exp_dg_folder_paths_nolow_in)
+        train_cache, val_cache, test_cache = cache_in.split(train_size=0.6, validation_size=0.2, stratify="groups")
+        train_cache = train_cache.process(balance="oversample")
+        val_cache = val_cache.process()
+        test_cache = test_cache.process()
+        print(f"  Training set size:   {len(train_cache)}")
+        print(f"  Validation set size: {len(val_cache)}")
+        print(f"  Testing set size:    {len(test_cache)}")
+        mean, std = train_cache.to_pt(save_path + "train.pt")
+        _save_norm_stats(save_path, mean, std)
+        val_cache.to_pt(save_path + "val.pt", mean, std)
+        test_cache.to_pt(save_path + "test.pt", mean, std)
 
-    cache_out = CachePt().load(exp_dg_folder_paths_nolow_out)
-    cache_out = cache_out.process()
-    print(f"  Out-set size: {len(cache_out)}")
-    cache_out.to_pt(save_path + "out.pt", mean, std)
+        cache_out = CachePt().load(exp_dg_folder_paths_nolow_out)
+        cache_out = cache_out.process()
+        print(f"  Out-set size: {len(cache_out)}")
+        cache_out.to_pt(save_path + "out.pt", mean, std)
+    except Exception as e:
+        print(f"  [Skip] Skipped Experiment 4: {e}")

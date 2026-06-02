@@ -23,24 +23,25 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
-from Experiment.models import AccretionTransformer, AccretionConvNet, MACNetRes_mbh, MACNetFiLM
+from Experiment.models import AccretionTransformer, SFRConvNet, MACNetRes_mbh, MACNetFiLM
 
 
 MBH_ONLY_MODELS = (MACNetRes_mbh, MACNetFiLM)
 
 
-def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, mbh: torch.Tensor) -> torch.Tensor: # 利用model输出预测值
+def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, y_baseline: torch.Tensor) -> torch.Tensor: # 利用model输出预测值
     if isinstance(model, MBH_ONLY_MODELS):
-        return model(x, mbh)
+        return model(x, y_baseline)
     r = coord[:, 0:1]
     theta = coord[:, 1:2]
-    return model(x, r, theta, mbh)
+    # 所有模型（包括SFRConvNet）都接收y_baseline，是否使用由它内部的use_film决定
+    return model(x, r, theta, y_baseline)
 
 
 # =============================================
 # 0) Augmentations
 # =============================================
-class RadialCropAugmentor:
+class RadialCropAugmentor: # 在针对SFR的预测中，不再需要该功能，触发概率设置为0
     """
     Implements radial cropping from outer to inner.
     Data format: (C, H, W), Coord format: (2, H, W) where coord[0] is r, coord[1] is theta.
@@ -90,12 +91,46 @@ class RadialCropAugmentor:
 
         return x, coord
 
+class SFRSpatialAugmentor:
+    """
+    针对恒星形成率(SFR)的数据增强。
+    保留全空间信息，利用物理系统的旋转对称性和镜像对称性进行数据增强。
+    假设输入图像空间维度为 (H, W)，根据网格特性进行翻转或平移。
+    """
+    def __init__(self, p_flip: float = 0.5, p_rot: float = 0.5):
+        self.p_flip = p_flip
+        self.p_rot = p_rot
 
+    def __call__(self, x: torch.Tensor, coord: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_aug, coord_aug = x.clone(), coord.clone()
+
+        # 1. 随机镜像翻转 (假设 W 维度为某空间轴，或者 H,W 都是直角坐标轴)
+        if random.random() < self.p_flip:
+            # 水平翻转特征图
+            x_aug = torch.flip(x_aug, dims=[-1])
+            # 注意：如果 coord 包含 r 和 theta，翻转需要对应修改 theta
+            # 假设 coord[1] 是 theta，范围是 [0, 2pi]，水平翻转等价于 theta -> pi - theta
+            # 如果是笛卡尔坐标的图像，可以直接 flip coord 的对应轴
+            coord_aug[1] = math.pi - coord_aug[1] 
+            # 规范化到 [0, 2pi]或其他您的设定范围
+            # coord_aug[1] = torch.remainder(coord_aug[1], 2 * math.pi)
+
+        # 2. 若数据是极坐标网格 (r 在 H 轴，theta 在 W 轴)
+        # 通过在 W 轴上循环平移(roll) 来实现物理上的随机旋转
+        if random.random() < self.p_rot:
+            w_size = x_aug.shape[-1]
+            shift = random.randint(0, w_size - 1)
+            x_aug = torch.roll(x_aug, shifts=shift, dims=-1)
+            coord_aug = torch.roll(coord_aug, shifts=shift, dims=-1)
+            #平移后，更新 theta 坐标数值（视您的坐标系范围而定）
+
+        return x_aug, coord_aug
+    
 # =============================================
 # 1) Dataset: load .pt [x, coord, y, mbh, (Optional: y_bondi)]
 # =============================================
 class GalPTDataset(Dataset):
-    def __init__(self, pt_path, *, augmentor: Optional[RadialCropAugmentor] = None):
+    def __init__(self, pt_path, *, augmentor: Optional[SFRSpatialAugmentor] = None):
         super().__init__()
         try:
             loaded = torch.load(pt_path, weights_only=False) # 从prepare_data输出的pt文件中读取
@@ -103,15 +138,12 @@ class GalPTDataset(Dataset):
             raise RuntimeError(f"Failed to load dataset cache '{pt_path}'. ") from exc
 
         if isinstance(loaded, (list, tuple)):
-            if len(loaded) == 6: # 兼容旧版本，只有6个元素，没有邦迪吸积率
-                self.x, self.coord, self.y, self.mbh, self.groups, self.n_groups = loaded
-                self.y_bondi = None
-            elif len(loaded) >= 7: # 新版本，包含邦迪吸积率，忽略多余的字段
-                self.x, self.coord, self.y, self.mbh, self.y_bondi, self.groups, self.n_groups = loaded[:7]
-                if len(loaded) > 7:
+            if len(loaded) >= 6: # 新版本，针对SFR：[x, coord, y, y_baseline, groups, n_groups, ...]
+                self.x, self.coord, self.y, self.y_baseline, self.groups, self.n_groups = loaded[:6]
+                if len(loaded) > 6:
                     print(
                         f"[Warning] Dataset '{pt_path}' has {len(loaded)} items; "
-                        "extra fields are ignored."
+                        "extra fields (like time) are ignored."
                     )
             else:
                 raise RuntimeError(f"Unexpected number of items in cached dataset '{pt_path}': {len(loaded)}")
@@ -138,9 +170,8 @@ class GalPTDataset(Dataset):
 
         self.x = _ensure_tensor(self.x, name="x").contiguous() # 强制把特征图（x，y）和坐标coord在内存中连续排列，可以大幅提升GPU读取数据的速度
         self.coord = _ensure_tensor(self.coord, name="coord").contiguous()
-        self.y = _ensure_tensor(self.y, name="y").view(-1, 1) # 将吸积率、黑洞质量等一维标量强行变形为[样本数，1]的二维张量，为了和神经网络的输出形状对齐
-        self.mbh = _ensure_tensor(self.mbh, name="mbh").view(-1, 1)
-        self.y_bondi = _ensure_tensor(self.y_bondi, name="y_bondi").view(-1, 1) if self.y_bondi is not None else None
+        self.y = _ensure_tensor(self.y, name="y").view(-1, 1) # 将目标标量强行变形为[样本数，1]的二维张量，为了和神经网络的输出形状对齐
+        self.y_baseline = _ensure_tensor(self.y_baseline, name="y_baseline").view(-1, 1) # SFR基准值
 
         groups_raw = _ensure_tensor(self.groups, name="groups")
         if isinstance(groups_raw, np.ndarray) and groups_raw.dtype.kind in "SU": # 如果groups是字符串类型（如星系类型），则保持为numpy字符串数组，稍后在内存中转换为整数标签；否则直接转换为float32张量
@@ -172,8 +203,8 @@ class GalPTDataset(Dataset):
         x = self.x[idx]
         coord = self.coord[idx]
         if self.augmentor is not None:
-            x, coord = self.augmentor(x, coord) # 调用augmentor对特征图和坐标进行随机裁剪
-        return x, coord, self.mbh[idx], self.y[idx], self.groups[idx], self.n_groups
+            x, coord = self.augmentor(x, coord) # 调用augmentor对特征图和坐标进行数据增强
+        return x, coord, self.y_baseline[idx], self.y[idx], self.groups[idx], self.n_groups
 
 
 # =============================================
@@ -242,11 +273,11 @@ def parse_args() -> argparse.Namespace: # 能够输入哪些训练参数
     parser.add_argument("--huber_delta", type=float, default=1, help="Delta parameter for Huber loss") # Huber损失的delta参数，控制损失函数从MSE模式切换到L1模式的阈值，默认值为1；较小的delta会使模型更快地切换到L1模式，从而对异常值更鲁棒；较大的delta会使模型在更大的误差范围内保持MSE模式，从而可能更好地拟合数据但对异常值更敏感
     
     # ↓ 目标加权模式的参数
-    parser.add_argument( # 目标加权模式，支持基于指数函数的权重（exp_clamp），基于组内z-score的指数权重（group_zscore_exp）和基于组内分位数的线性权重（group_quantile）；默认使用group_zscore_exp，这种方法根据每个样本相对于其组内分布的位置动态调整权重，可能有助于处理不同组之间的分布差异；exp_clamp在极端值上会限制权重，group_quantile则根据样本在组内的相对位置（如前10%或后10%）调整权重
+    parser.add_argument( # 目标加权模式，支持基于指数函数的权重（exp_clamp），基于组内z-score的指数权重（group_zscore_exp）和基于组内分位数的线性权重（group_quantile）；由于SFR分布相对平滑，默认改为 none
         "--weight_mode",
         type=str,
-        choices=["exp_clamp", "group_zscore_exp", "group_quantile"],
-        default="group_zscore_exp",
+        choices=["none", "exp_clamp", "group_zscore_exp", "group_quantile"],
+        default="none",
         help="Weighting mode for targets",
     )
     parser.add_argument("--weight_alpha", type=float, default=0.5, help="Alpha for target weighting") # 权重函数的alpha参数，控制权重调整的强度，默认0.5表示在基础权重（1.0）的基础上增加最多50%的权重；较大的alpha会使权重调整更显著，可能有助于强调某些样本，但也可能导致训练不稳定；较小的alpha会使权重调整更温和，可能更稳定但效果有限
@@ -278,6 +309,7 @@ def parse_args() -> argparse.Namespace: # 能够输入哪些训练参数
         help="ConvNet stage depths as comma list (e.g., 2,2,2,2)",
     )
     parser.add_argument("--se_reduction", type=int, default=4, help="ConvNet SE reduction ratio (convnet only)") #
+    parser.add_argument("--use_film", action="store_true", help="Enable FiLM modulation with y_baseline for ConvNet") # 是否使用 sft_ks 作为基准注入模型
     parser.add_argument(
         "--hpo_params",
         type=str,
@@ -286,8 +318,9 @@ def parse_args() -> argparse.Namespace: # 能够输入哪些训练参数
     )
 
     # ↓ 数据增强（augmentation）的参数
-    parser.add_argument("--aug_prob", type=float, default=0.8, help="Probability to apply radial crop")
+    parser.add_argument("--aug_prob", type=float, default=0.0, help="Probability to apply radial crop") # 设置触发RadialCropAugmentor的概率为0，从而移除这个功能
     parser.add_argument("--aug_min_crop_ratio", type=float, default=0.6, help="Minimum ratio r_cut/r_max for cropping")
+    parser.add_argument("--sfr_aug_prob", type=float, default=0.5, help="Probability to apply SFR spatial augmentation")
 
     parser.add_argument("--log_dir", type=str, default="runs", help="Directory to write TensorBoard logs")
     parser.add_argument("--no_save", action="store_true", help="Disable saving results to disk (useful for HPO)")
@@ -356,6 +389,7 @@ def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace: # 在�
         "seed": int,
         "aug_prob": float,
         "aug_min_crop_ratio": float,
+        "use_film": bool,
     }
 
     applied = []
@@ -414,7 +448,7 @@ class WeightedLoss(nn.Module):
         return weighted_loss.mean()
 
 
-def _compute_group_stats( # 不同星系的吸积率标准不一样，所以这个函数遍历训练集，计算每一种星系的均值mean和标准差std，以及10%分位数p10和90%分位数p90
+def _compute_group_stats( # 不同星系的 SFR或其它预测目标 分布不一样，这个函数遍历训练集，计算每一种星系目标的均值mean和标准差std，以及10%分位数p10和90%分位数p90
     y: torch.Tensor,
     groups: torch.Tensor,
     n_groups: int,
@@ -491,7 +525,12 @@ def make_criterion(
         q = ((target - p10) / denom).clamp(0.0, 1.0)
         return 1.0 + alpha * torch.pow(q, max(1e-6, power))
 
-    if weight_mode == "exp_clamp":
+    def weight_uniform(target: torch.Tensor, groups: torch.Tensor | None = None):
+        return torch.ones_like(target)
+
+    if weight_mode == "none":
+        weights_fn = weight_uniform
+    elif weight_mode == "exp_clamp":
         weights_fn = weight_exp_clamp
     elif weight_mode == "group_zscore_exp":
         weights_fn = weight_group_zscore_exp # 输出动态权重矩阵
@@ -564,17 +603,17 @@ class WarmupCosineScheduler:
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, grad_clip=None, scheduler=None):
     model.train()
     total, n = 0.0, 0 
-    for batch in loader: # 从data里面依次提取数据(x,coord,mbh,y,groups)，送入模型进行训练 
+    for batch in loader: # 从data里面依次提取数据(x,coord,y_baseline,y,groups)，送入模型进行训练 
         x = batch[0].to(device, non_blocking=True)  # (B, C_in, H, W)
         coord = batch[1].to(device, non_blocking=True)  # (B, 2, H, W)
-        mbh = batch[2].to(device, non_blocking=True).view(-1)  # (B,)
-        y = batch[3].to(device, non_blocking=True).view(-1)  # (B,)
+        y_baseline = batch[2].to(device, non_blocking=True).view(-1)  # (B,) 基准预测值
+        y = batch[3].to(device, non_blocking=True).view(-1)  # (B,) 真实SFR值
         groups = batch[4].to(device, non_blocking=True).view(-1)  # (B,)
 
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                pred = predict_batch(model, x, coord, mbh) # 前向传播，输出预测值
+                pred = predict_batch(model, x, coord, y_baseline) # 前向传播，输出预测值
                 loss = criterion(pred, y, groups) # 根据权重函数计算加权损失值
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
@@ -585,7 +624,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, gr
             if scheduler is not None:
                 scheduler.step()
         else:
-            pred = predict_batch(model, x, coord, mbh)
+            pred = predict_batch(model, x, coord, y_baseline)
             loss = criterion(pred, y, groups)
             loss.backward()
             if grad_clip and grad_clip > 0:
@@ -649,9 +688,9 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         for batch in loader:
             x = batch[0].to(device, non_blocking=True)
             coord = batch[1].to(device, non_blocking=True)
-            mbh = batch[2].to(device, non_blocking=True).view(-1)
+            y_baseline = batch[2].to(device, non_blocking=True).view(-1)
             y = batch[3].to(device, non_blocking=True).view(-1)
-            pred = predict_batch(model, x, coord, mbh)
+            pred = predict_batch(model, x, coord, y_baseline)
             loss = criterion(pred, y).mean().item()
             total_loss += loss * y.size(0)
             n_samples += y.size(0)
@@ -664,11 +703,11 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
     for batch in loader:
         x = batch[0].to(device, non_blocking=True)
         coord = batch[1].to(device, non_blocking=True)
-        mbh = batch[2].to(device, non_blocking=True).view(-1)
+        y_baseline = batch[2].to(device, non_blocking=True).view(-1)
         y = batch[3].to(device, non_blocking=True).view(-1)
-        groups = batch[4].view(-1).to(device=mbh.device, dtype=torch.long)
+        groups = batch[4].view(-1).to(device=y.device, dtype=torch.long)
 
-        pred = predict_batch(model, x, coord, mbh)
+        pred = predict_batch(model, x, coord, y_baseline)
 
         if isinstance(criterion, WeightedLoss):
             base_loss = criterion.base_criterion(pred, y)  # shape: (B, ...) or (B,)
@@ -702,18 +741,18 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         print(
             f"[{epoch}] Warning: eval_epoch found no valid group means. n_groups={n_groups}, groups_count={groups_count}"
         )
-        worst = float("nan")
+        metric = float("nan")
     else:
-        worst = max(valid_means) # 在所有组的平均损失中找到最大的那个作为worst，并把worst作为核心指标返回
+        metric = sum(valid_means) / len(valid_means) # 恒星形成率是一个更平缓的宏观物理量，对于它的预测，核心指标改为所有星系组的平均损失更为合理
 
     # Write to TensorBoard
     for d, v in enumerate(groups_mean):
         if v == v:
             writer.add_scalar(f"val/loss_domain_{d}", v, epoch)
-    writer.add_scalar("val/loss_worst_domain", worst, epoch)
+    writer.add_scalar("val/loss_metric", metric, epoch)
 
-    # Return worst domain loss and all domain means
-    return worst, groups_mean
+    # Return main metric loss and all domain means
+    return metric, groups_mean
 
 
 # =============================================
@@ -744,7 +783,7 @@ def main(args=None):
     exp = args.exp_name
     data_exp = args.data_exp if args.data_exp else exp
 
-    train_augmentor = RadialCropAugmentor(min_crop_ratio=args.aug_min_crop_ratio, p_crop=args.aug_prob) # 加入数据增强Augmentor
+    train_augmentor = SFRSpatialAugmentor(p_flip=args.sfr_aug_prob, p_rot=args.sfr_aug_prob) # 加入数据增强Augmentor
 
     train_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "train.pt"), augmentor=train_augmentor) # 训练集
     val_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "val.pt")) # 验证集
@@ -799,7 +838,7 @@ def main(args=None):
         ).to(device)
     elif args.model_type == "convnet":
         stage_depths = _parse_stage_depths(args.stage_depths)
-        model = AccretionConvNet(
+        model = SFRConvNet(
             c_in=c_in,
             base_ch=args.base_ch,
             stage_depths=stage_depths,
@@ -807,6 +846,7 @@ def main(args=None):
             pos_max_freq=args.pos_max_freq,
             p_drop=args.p_drop,
             se_reduction=args.se_reduction,
+            use_film=args.use_film, # 传入命令行控制的 FiLM 参数
         ).to(device)
 
     try:
@@ -815,9 +855,19 @@ def main(args=None):
         with torch.no_grad():
             # Use a tiny temp loader with 0 workers to fetch a sample for the graph
             temp_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0)
-            sample_x, sample_coord, sample_mbh, _, _, _ = next(iter(temp_loader))
+            sample_x, sample_coord, sample_y_baseline, _, _, _ = next(iter(temp_loader))
             if isinstance(model, MBH_ONLY_MODELS):
-                writer.add_graph(model, (sample_x.to(device), sample_mbh.view(-1).to(device)))
+                writer.add_graph(model, (sample_x.to(device), sample_y_baseline.view(-1).to(device)))
+            elif isinstance(model, SFRConvNet):
+                writer.add_graph(
+                    model,
+                    (
+                        sample_x.to(device),
+                        sample_coord[:, 0:1].to(device),
+                        sample_coord[:, 1:2].to(device),
+                        sample_y_baseline.view(-1).to(device),
+                    ),
+                )
             else:
                 writer.add_graph(
                     model,
@@ -825,7 +875,7 @@ def main(args=None):
                         sample_x.to(device),
                         sample_coord[:, 0:1].to(device),
                         sample_coord[:, 1:2].to(device),
-                        sample_mbh.view(-1).to(device),
+                        sample_y_baseline.view(-1).to(device),
                     ),
                 )
     except Exception as exc:
@@ -906,21 +956,21 @@ def main(args=None):
             grad_clip=(args.grad_clip if args.grad_clip > 0 else None),
             scheduler=scheduler,
         )
-        worst_val, group_means = eval_epoch(model, val_loader, criterion, device, writer, epoch) # 在验证集上测试，返回每个组的worst loss和mean loss
+        val_metric, group_means = eval_epoch(model, val_loader, criterion, device, writer, epoch) # 在验证集上测试，返回综合指标与各星系均值
 
         valid_vals = [v for v in group_means if v == v]
         mean_val = sum(valid_vals) / len(valid_vals) if valid_vals else float("nan")
 
         print(
-            f"Epoch {epoch:03d} | train {tr_loss:.6f} | val {mean_val:.6f} | worst {worst_val:.6f} | lr {optimizer.param_groups[0]['lr']:.3e}"
+            f"Epoch {epoch:03d} | train {tr_loss:.6f} | val {mean_val:.6f} | metric {val_metric:.6f} | lr {optimizer.param_groups[0]['lr']:.3e}"
         )
 
         writer.add_scalar("loss/train", tr_loss, epoch)
         writer.add_scalar("val/loss_mean_over_domains", mean_val, epoch)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
-        if worst_val < best_val - 1e-8: # 记录最好成绩，更新权重
-            best_val = worst_val
+        if val_metric < best_val - 1e-8: # 记录最好成绩，更新权重
+            best_val = val_metric
             no_improve = 0
             if args.no_save:
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -946,7 +996,7 @@ def main(args=None):
         print("No improvement was found during training. Best model not saved (or not found).")
         return float("inf")
 
-    print(f"Best val loss: {best_val:.6f}. Loading best and testing.")
+    print(f"Best val metric loss: {best_val:.6f}. Loading best and testing.")
 
     if args.no_save:
         model.load_state_dict(best_model_state)
@@ -954,8 +1004,8 @@ def main(args=None):
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model"])
 
-    test_loss, group_means = eval_epoch(model, test_loader, criterion, device, writer, epoch=0) # 在测试集中评估训练出来的最好的模型，依旧返回worst loss和mean loss列表。worst loss是核心指标，mean loss列表可以用来分析不同组的表现差异。
-    print(f"Test loss: {test_loss:.6f}, per-domain: {group_means}")
+    test_metric, group_means = eval_epoch(model, test_loader, criterion, device, writer, epoch=0) # 在测试集中评估训练出来的最好的模型。
+    print(f"Test metric loss: {test_metric:.6f}, per-domain: {group_means}")
     if not args.no_save:
         print(f"Best model saved to: {best_path}")
 

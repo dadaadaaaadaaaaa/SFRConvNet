@@ -68,7 +68,7 @@ try:
         FourierPositionalEncoding2D,
         FiLMConditioner,
         MLP,
-        AccretionConvNet,
+        SFRConvNet,
     )
 
     # Import Preprocess paths if available
@@ -158,6 +158,34 @@ def ensure_tensor(arr, dtype=torch.float32):
     return torch.as_tensor(arr, dtype=dtype).contiguous()
 
 
+def ensure_numpy(arr):
+    if arr is None:
+        return None
+    if isinstance(arr, torch.Tensor):
+        return arr.detach().cpu().numpy()
+    return np.asarray(arr)
+
+
+def get_baseline_column(df):
+    if "y_baseline" in df.columns:
+        return "y_baseline"
+    return None
+
+
+def get_baseline_error_column(df):
+    if "baseline_error" in df.columns:
+        return "baseline_error"
+    return None
+
+
+def get_target_label(df=None):
+    return r"$\log_{10}(\mathrm{SFR})$"
+
+
+def get_baseline_label(df=None):
+    return "Baseline (KS)"
+
+
 def find_latest_model(results_root: Path, exp_prefix: str) -> Path:
     if not results_root.exists():
         return None
@@ -183,43 +211,53 @@ class CachedPTDataset:
         items = list(loaded)
 
         self.coord = None
-        self.y_bondi = None
+        self.y_baseline = None
+        self.baseline = None
         self.groups = None
+        self.n_groups = None
         self.time = None
         self.type = "cached"
 
-        if len(items) >= 8:
-            self.x, self.coord, self.y, self.mbh, self.y_bondi, self.groups, _, self.time = items[:8]
+        # Current cache format from prepare_data.py:
+        # (x, coord, y, y_baseline, groups, n_groups, time)
+        if len(items) >= 7 and isinstance(items[1], (torch.Tensor, np.ndarray)) and np.asarray(items[1]).ndim >= 2:
+            self.x, self.coord, self.y, self.y_baseline, self.groups, self.n_groups, self.time = items[:7]
+            self.kind = "vit"
+        elif len(items) >= 5 and isinstance(items[1], (torch.Tensor, np.ndarray)) and np.asarray(items[1]).ndim >= 2:
+            self.x, self.coord, self.y, self.y_baseline, self.groups = items[:5]
             self.kind = "vit"
         elif len(items) >= 5:
-            if isinstance(items[1], (torch.Tensor, np.ndarray)) and items[1].ndim >= 2:
-                self.x, self.coord, self.y, self.mbh, self.y_bondi, self.groups = items[:6]
-                self.kind = "vit"
-            else:
-                self.x, self.y, self.mbh, self.y_bondi, self.groups = items[:5]
-                self.kind = "macnet"
+            self.x, self.y, self.y_baseline, self.groups, self.n_groups = items[:5]
+            self.kind = "macnet"
         else:
-            self.x, self.y, self.mbh = items[:3]
+            self.x, self.y, self.y_baseline = items[:3]
             self.kind = "macnet"
 
         self.x = ensure_tensor(self.x)
         self.coord = ensure_tensor(self.coord)
         self.y = ensure_tensor(self.y).view(-1, 1)
-        self.mbh = ensure_tensor(self.mbh).view(-1, 1)
-        self.y_bondi = ensure_tensor(self.y_bondi).view(-1, 1) if self.y_bondi is not None else None
+        self.y_baseline = ensure_tensor(self.y_baseline).view(-1, 1) if self.y_baseline is not None else None
+        self.baseline = self.y_baseline
         self.time = ensure_tensor(self.time) if self.time is not None else None
 
         if self.groups is not None:
             self.group_names = None
-            if isinstance(self.groups, np.ndarray) and self.groups.dtype.kind in ("S", "U"):
-                self.group_names = self.groups
-                _, indices = np.unique(self.groups, return_inverse=True)
+            groups_arr = np.asarray(self.groups)
+            if groups_arr.dtype.kind in ("S", "U"):
+                # 如果 group 本身就是字符串 numpy 数组
+                self.group_names = groups_arr
+                _, indices = np.unique(groups_arr, return_inverse=True)
+                self.groups = torch.as_tensor(indices, dtype=torch.long)
+            elif isinstance(self.groups, (list, tuple)) and len(self.groups) > 0 and isinstance(self.groups[0], str):
+                # 如果 group 是一组字符串列表
+                self.group_names = np.array(self.groups)
+                _, indices = np.unique(self.group_names, return_inverse=True)
                 self.groups = torch.as_tensor(indices, dtype=torch.long)
             else:
                 try:
                     self.groups = torch.as_tensor(self.groups)
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Warning: Could not automatically convert groups to tensor. {e}")
 
     def __len__(self):
         return len(self.y)
@@ -257,10 +295,11 @@ class HDF5Dataset:
             self.x, _, _ = loaded.standardize(log_transform=log_transform)
         self.coord = loaded.coordinate
         self.y = loaded.y
-        self.mbh = loaded.mbh
-        self.y_bondi = loaded.y_baseline if hasattr(loaded, "y_baseline") else None
+        self.y_baseline = loaded.y_baseline if hasattr(loaded, "y_baseline") else None
+        self.baseline = self.y_baseline
         self.time = loaded.time
         self.mdot_edd = np.array(loaded._raw_data["mdot_edd"]) if "mdot_edd" in loaded._raw_data else None
+        self.sfr_target = loaded.sfr_target if hasattr(loaded, "sfr_target") else None
 
         self.kind = "vit" if self.coord is not None else "macnet"
 
@@ -274,7 +313,7 @@ class HDF5Dataset:
 def load_analysis_model(model_path, device, datasets_dict=None):
     """Refactored model loading logic."""
     model_path = Path(model_path)
-    state = torch.load(model_path, map_location=device)
+    state = torch.load(model_path, map_location=device, weights_only=False)
     raw_state = state.get("model", state.get("state_dict", state))
     keys = list(raw_state.keys())
 
@@ -364,6 +403,7 @@ def load_analysis_model(model_path, device, datasets_dict=None):
         pos_max_freq = 64.0
         p_drop = 0.1
         se_reduction = 4
+        use_film = False
 
         if loaded_params:
             base_ch = loaded_params.get("base_ch", base_ch)
@@ -376,15 +416,17 @@ def load_analysis_model(model_path, device, datasets_dict=None):
             pos_max_freq = loaded_params.get("pos_max_freq", pos_max_freq)
             p_drop = loaded_params.get("p_drop", p_drop)
             se_reduction = loaded_params.get("se_reduction", se_reduction)
+            use_film = loaded_params.get("use_film", use_film)
 
-        model = AccretionConvNet(
+        model = SFRConvNet(
             c_in=in_ch,
             base_ch=base_ch,
             stage_depths=stage_depths,
             pos_num_bands=pos_num_bands,
             pos_max_freq=pos_max_freq,
             p_drop=p_drop,
-            se_reduction=se_reduction
+            se_reduction=se_reduction,
+            use_film=use_film,
         ).to(device)
 
     elif model_type == "resfilm":
@@ -407,18 +449,22 @@ def load_analysis_model(model_path, device, datasets_dict=None):
 @torch.no_grad()
 def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=False):
     if ds is None:
-        return None, None, None
+        return (None, None, None) if return_feats else None
 
     x_all = ensure_tensor(ds.x)
-    x_data = x_all.cpu().numpy()
-    mbh_all = ensure_tensor(ds.mbh)
+    if x_all is None or len(x_all) == 0:
+        empty_df = pd.DataFrame(columns=["y_true", "y_pred", "error", "type"])
+        return (empty_df, None, None) if return_feats else empty_df
+
+    x_data = ensure_numpy(x_all)
+    baseline_all = ensure_tensor(getattr(ds, "y_baseline", None))
     coord_all = ensure_tensor(ds.coord) if getattr(ds, "coord", None) is not None else None
 
     total = len(ds)
     preds = []
     feats_list = []
 
-    bs = 8 if (model_type == "vit" or model_type == "convnet") else batch_size
+    bs = 8 if model_type in ["vit", "convnet"] else batch_size
 
     # Hook for features if requested
     hook_handle = None
@@ -434,28 +480,25 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
         elif model_type == "convnet":
             def get_activation_convnet(storage):
                 def hook(model, input, output):
-                    # output from head is tensor. The layer is head[5] or head[3]?
-                    # Actually wait, let's just append the output of the hook
-                    storage.append(output.detach().cpu())
+                    storage.append(output.reshape(output.shape[0], -1).detach().cpu())
                 return hook
-            # Maybe attach to the flattened output or final feature
+
             if hasattr(model, "head") and len(model.head) >= 3:
-                # model.head is nn.Sequential(AdaptiveAvgPool2d, Flatten, LayerNorm(last_ch), Linear, GELU, Dropout, Linear)
-                # We can hook onto LayerNorm
                 hook_handle = model.head[2].register_forward_hook(get_activation_convnet(feats_list))
 
     try:
         for start in range(0, total, bs):
             end = min(start + bs, total)
             x_batch = x_all[start:end].to(device)
-            mbh_batch = mbh_all[start:end].to(device).view(-1)
+            baseline_batch = baseline_all[start:end].to(device).view(-1) if baseline_all is not None else None
 
             if model_type in ["vit", "convnet"]:
-                # if coord_all is None: raise ValueError("Requires coords")
+                if coord_all is None:
+                    raise ValueError(f"Model type '{model_type}' requires coordinate inputs, but dataset has no coords.")
                 c_batch = coord_all[start:end].to(device)
-                y_out = model(x_batch, c_batch[:, 0:1], c_batch[:, 1:2], mbh_batch)
+                y_out = model(x_batch, c_batch[:, 0:1], c_batch[:, 1:2], baseline_batch)
             else:
-                y_out = model(x_batch, mbh_batch)
+                y_out = model(x_batch, baseline_batch)
             preds.append(y_out.cpu().view(-1))
     finally:
         if hook_handle:
@@ -467,15 +510,16 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
 
     df = pd.DataFrame({"y_true": y_true, "y_pred": y_pred})
 
-    if ds.y_bondi is not None:
-        df["y_bondi"] = ensure_tensor(ds.y_bondi).view(-1).numpy()
-        df.loc[np.isclose(df["y_bondi"], -100), "y_bondi"] = np.nan
-        df["bondi_error"] = df["y_bondi"] - df["y_true"]
+    baseline_data = getattr(ds, "y_baseline", None)
+    if baseline_data is not None:
+        df["y_baseline"] = ensure_tensor(baseline_data).view(-1).numpy()
+        df.loc[np.isclose(df["y_baseline"], -100), "y_baseline"] = np.nan
+        df["baseline_error"] = df["y_baseline"] - df["y_true"]
 
     if hasattr(ds, "time") and ds.time is not None:
-        df["time"] = np.array(ds.time)
+        df["time"] = ensure_numpy(ds.time).reshape(-1)
     if hasattr(ds, "mdot_edd") and ds.mdot_edd is not None:
-        df["mdot_edd"] = np.array(ds.mdot_edd)
+        df["mdot_edd"] = ensure_numpy(ds.mdot_edd).reshape(-1)
 
     df["error"] = df["y_pred"] - df["y_true"]
 
@@ -488,7 +532,7 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
     else:
         df["type"] = "test_set"
 
-    del x_all, mbh_all, coord_all
+    del x_all, baseline_all, coord_all
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
@@ -509,8 +553,8 @@ def save_to_h5(path, df, feats, x_data, ds_type):
             f.create_dataset("label", data=df["type"].values.astype(object), dtype=dt)
         if feats is not None:
             f.create_dataset("latent", data=feats)
-        if "y_bondi" in df.columns:
-            f.create_dataset("y_bondi", data=df["y_bondi"].values)
+        if "y_baseline" in df.columns:
+            f.create_dataset("y_baseline", data=df["y_baseline"].values)
         if "time" in df.columns:
             f.create_dataset("time", data=df["time"].values)
         if "mdot_edd" in df.columns:
@@ -529,16 +573,16 @@ def save_plot(plt_obj, name, fig_dir, fmt="png"):
 
 
 def plot_scatter(df, title, fig_dir, limit_range=True):
-    # To correctly calculate bounds that include all data: sum up min and max of y_true, y_pred, and y_bondi (if it exists)
-    has_bondi = "y_bondi" in df.columns
+    baseline_col = get_baseline_column(df)
+    has_baseline = baseline_col is not None
     cols_to_check = ["y_true", "y_pred"]
-    if has_bondi:
-        cols_to_check.append("y_bondi")
-        
+    if has_baseline:
+        cols_to_check.append(baseline_col)
+
     vmin = df[cols_to_check].min().min() - 0.5
     vmax = df[cols_to_check].max().max() + 0.5
 
-    def _plot_base(ax, show_bondi=False):
+    def _plot_base(ax, show_baseline=False):
         ax.plot([vmin, vmax], [vmin, vmax], "r--", lw=1.5, label="Ideal", zorder=5)
         ax.plot([vmin, vmax], [vmin - 1, vmax - 1], "k--", lw=0.8, alpha=0.5, label=r"$\pm$1 dex")
         ax.plot([vmin, vmax], [vmin + 1, vmax + 1], "k--", lw=0.8, alpha=0.5)
@@ -556,34 +600,33 @@ def plot_scatter(df, title, fig_dir, limit_range=True):
                 edgecolors="none",
             )
 
-        if show_bondi and "y_bondi" in df.columns:
-            # We must drop NaN before scatter, otherwise warning or incorrect display
-            valid_bondi = df.dropna(subset=["y_bondi"])
+        # Only plot valid baseline values to avoid alignment issues after NaN filtering.
+        if show_baseline and baseline_col is not None:
+            valid_mask = df[baseline_col].notna()
             ax.scatter(
-                valid_bondi["y_true"],
-                valid_bondi["y_bondi"],
+                df.loc[valid_mask, "y_true"],
+                df.loc[valid_mask, baseline_col],
                 s=15,
                 marker="x",
                 alpha=0.4,
                 color="gray",
-                label="Bondi",
+                label=get_baseline_label(df),
                 zorder=1,
             )
 
-        ax.set_xlabel(r"True $\log_{10}(\dot{M}/\dot{M}_{Edd})$")
-        ax.set_ylabel(r"Predicted $\log_{10}(\dot{M}/\dot{M}_{Edd})$")
+        ax.set_xlabel(f"True {get_target_label(df)}")
+        ax.set_ylabel(f"Predicted {get_target_label(df)}")
         if limit_range:
             ax.set_xlim(vmin, vmax)
             ax.set_ylim(vmin, vmax)
         ax.grid(True, linestyle=":", alpha=0.3)
 
-    has_bondi = "y_bondi" in df.columns
-    if has_bondi:
+    if has_baseline:
         fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=120, sharex=True, sharey=True)
-        _plot_base(axes[0], show_bondi=False)
-        axes[0].set_title(f"{title} (No Bondi)")
-        _plot_base(axes[1], show_bondi=True)
-        axes[1].set_title(f"{title} (With Bondi)")
+        _plot_base(axes[0], show_baseline=False)
+        axes[0].set_title(f"{title} (Model Only)")
+        _plot_base(axes[1], show_baseline=True)
+        axes[1].set_title(f"{title} (With Baseline)")
         axes[0].legend(loc="upper left")
         axes[1].legend(loc="upper left")
         fig.tight_layout()
@@ -592,7 +635,7 @@ def plot_scatter(df, title, fig_dir, limit_range=True):
     else:
         plt.figure(figsize=(6, 6), dpi=120)
         ax = plt.gca()
-        _plot_base(ax, show_bondi=False)
+        _plot_base(ax, show_baseline=False)
         ax.set_title(title)
         ax.legend(loc="upper left")
         save_plot(plt, f"scatter_{title.replace(' ', '_').lower()}", fig_dir)
@@ -606,13 +649,15 @@ def plot_error_dist(df, title, fig_dir, model_label="Model"):
     tmp["Method"] = model_label
     tmp.rename(columns={"error": "Error"}, inplace=True)
     plot_data.append(tmp)
-    if "bondi_error" in df.columns:
-        tmp2 = df[["bondi_error", "type"]].dropna().copy()
-        tmp2["Method"] = "Bondi"
-        tmp2.rename(columns={"bondi_error": "Error"}, inplace=True)
+    baseline_error_col = get_baseline_error_column(df)
+    if baseline_error_col is not None:
+        tmp2 = df[[baseline_error_col, "type"]].dropna().copy()
+        tmp2["Method"] = get_baseline_label(df).replace("Baseline ", "")
+        tmp2.rename(columns={baseline_error_col: "Error"}, inplace=True)
         plot_data.append(tmp2)
     final_df = pd.concat(plot_data)
-    sns.violinplot(data=final_df, x="type", y="Error", hue="Method", split=True, inner="quartile", palette="muted")
+    split = final_df["Method"].nunique() == 2
+    sns.violinplot(data=final_df, x="type", y="Error", hue="Method", split=split, inner="quartile", palette="muted")
     plt.axhline(0, color="r", linestyle="--", alpha=0.5)
     plt.axhline(1, color="gray", linestyle=":", alpha=0.5)
     plt.axhline(-1, color="gray", linestyle=":", alpha=0.5)
@@ -642,30 +687,53 @@ def plot_kde_contour(df, title, fig_dir):
 
 
 def plot_mass_evolution(df, title, fig_dir, model_label="Model"):
-    if "time" not in df.columns or "mdot_edd" not in df.columns:
+    """
+    Backward-compatible wrapper.
+    Older notebooks call this function for BH growth analysis; in the SFR
+    pipeline we reinterpret it as cumulative stellar mass formed versus time.
+    """
+    return plot_cumulative_sfr(df, title, fig_dir, model_label=model_label)
+
+
+def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=1e9):
+    """
+    Plot cumulative stellar mass formed from the reconstructed SFR history.
+
+    Assumptions:
+    - `y_true`, `y_pred`, and optional baseline are log10(SFR).
+    - `time` is in Gyr.
+    - Multiplying SFR [Msun/yr] by dt [Gyr] requires a factor of 1e9 yr/Gyr.
+    """
+    if "time" not in df.columns:
         return
+
     df_plot = df.sort_values("time").copy()
     times = df_plot["time"].values
     dt = np.diff(times, prepend=times[0])
-    mdot_true = (10 ** df_plot["y_true"]) * df_plot["mdot_edd"]
-    mdot_pred = (10 ** df_plot["y_pred"]) * df_plot["mdot_edd"]
-    UNIT_MASS = 2.5e7
-    mass_inc_true = np.cumsum(mdot_true * dt) * UNIT_MASS
-    mass_inc_pred = np.cumsum(mdot_pred * dt) * UNIT_MASS
+    dt = np.where(dt < 0, 0, dt)
+
+    sfr_true = 10 ** df_plot["y_true"]
+    sfr_pred = 10 ** df_plot["y_pred"]
+    mass_true = np.cumsum(sfr_true * dt) * sfr_unit_scale
+    mass_pred = np.cumsum(sfr_pred * dt) * sfr_unit_scale
 
     plt.figure(figsize=(10, 5), dpi=120)
-    plt.plot(times, mass_inc_true, "k-", lw=2, label="True", alpha=0.8)
-    plt.plot(times, mass_inc_pred, "r--", lw=2, label=f"Predicted ({model_label})", alpha=0.8)
-    if "y_bondi" in df.columns:
-        mdot_bondi = (10 ** df_plot["y_bondi"]) * df_plot["mdot_edd"]
-        mass_inc_bondi = np.cumsum(mdot_bondi.fillna(0) * dt) * UNIT_MASS
-        plt.plot(times, mass_inc_bondi, "g:", lw=1.5, label="Bondi", alpha=0.6)
+    plt.plot(times, mass_true, "k-", lw=2, label="True", alpha=0.8)
+    plt.plot(times, mass_pred, "r--", lw=2, label=f"Predicted ({model_label})", alpha=0.8)
+
+    baseline_col = get_baseline_column(df_plot)
+    if baseline_col is not None:
+        sfr_baseline = 10 ** df_plot[baseline_col].fillna(-100).to_numpy()
+        mass_baseline = np.cumsum(sfr_baseline * dt) * sfr_unit_scale
+        plt.plot(times, mass_baseline, "g:", lw=1.5, label=get_baseline_label(df_plot), alpha=0.7)
+
     plt.yscale("log")
-    plt.title(f"BH Growth: {title}")
+
+    plt.title(f"Cumulative Stellar Mass Formed: {title}")
     plt.xlabel("Time (Gyr)")
-    plt.ylabel(r"$\Delta M_{BH}$ [$M_{\odot}$]")
+    plt.ylabel(r"$M_{\star,\mathrm{formed}}$ [$M_{\odot}$]")
     plt.legend()
-    save_plot(plt, f"mass_evo_{title.replace(' ', '_').lower()}", fig_dir)
+    save_plot(plt, f"cum_sfr_{title.replace(' ', '_').lower()}", fig_dir)
     plt.show()
 
 

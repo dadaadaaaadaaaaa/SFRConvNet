@@ -48,10 +48,14 @@ def objective(trial, data_exp):
     args.se_reduction = trial.suggest_categorical("se_reduction", [4, 8, 16])
 
     # --- Positional Encoding ---
-    args.pos_num_bands = trial.suggest_categorical("pos_runsnum_bands", [8, 16, 32, 64])
+    args.pos_num_bands = trial.suggest_categorical("pos_num_bands", [8, 16, 32, 64])
 
     # --- Dropout ---
     args.p_drop = trial.suggest_float("p_drop", 0.0, 0.5, step=0.1)
+    
+    # # --- SFR Specific / Data Augmentation --- 可以选择让optuna优化是否使用FiLM调制，或者数据增强的概率等
+    # args.use_film = trial.suggest_categorical("use_film", [True, False])
+    # args.sfr_aug_prob = trial.suggest_float("sfr_aug_prob", 0.0, 0.8, step=0.2)
 
     # --- Optimization ---
     args.lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True) # 学习率
@@ -88,8 +92,8 @@ def objective(trial, data_exp):
 
 if __name__ == "__main__":
     # Create storage for persistence (optional)
-    data_exp = "Exp5_"
-    study_name = f".cache/{data_exp}macnet_vit_hpo"
+    data_exp = "Exp1_"
+    study_name = f".cache/{data_exp}sfrconvnet_hpo"
     storage_name = "sqlite:///{}.db".format(study_name)
 
     study = optuna.create_study(study_name=study_name, storage=storage_name, direction="minimize", load_if_exists=True)

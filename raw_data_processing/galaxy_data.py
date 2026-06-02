@@ -178,9 +178,9 @@ class GalData:
     def gas_mass(self) -> float: # 网格密度*网格体积=网格质量
         return self.snapshot["density"] * self.grid_volume
 
-    @property
-    def mbh(self) -> float: # 提取该snapshot的黑洞质量
-        return self._data_log["mbh"]
+    # @property
+    # def mbh(self) -> float: # 提取该snapshot的黑洞质量
+    #     return self._data_log["mbh"]
 
     @property
     # def mdot_macer(self) -> float: # 提取吸积率
@@ -188,9 +188,9 @@ class GalData:
     def sfr_target(self) -> float: # 提取恒星形成率
         return self._data_log["sfr_target"]
 
-    @property
-    def mdot_edd(self) -> float: # 提取爱丁顿吸积率
-        return self._data_log["mdot_edd"]
+    # @property
+    # def mdot_edd(self) -> float: # 提取爱丁顿吸积率
+    #     return self._data_log["mdot_edd"]
 
     # -------- Calculation Methods --------
 
@@ -239,7 +239,7 @@ class GalData:
     #
     #     return 4 * np.pi * lambda_c * G**2 * M_bh**2 * rho_inf / cs_inf**3 # 计算邦迪吸积率
 
-    def sfr_ks(self, r_max: float = 10.0, A_ks: float = 2.5e-4, N_ks: float = 1.4) -> float:
+    def sfr_ks(self, r_max: float = 1.0, A_ks: float = 0.906, N_ks: float = 1.4) -> float:
         """
         根据全局 Kennicutt-Schmidt (KS) 定律计算参考的恒星形成率。
         SFR_KS = A_ks * (Sigma_gas)^N_ks * Area
@@ -252,6 +252,10 @@ class GalData:
         if not np.any(mask):
             return 0.0
 
+        # 对于极坐标或柱坐标，r 的形状可能是 (Nr, 1)，通过 np.broadcast_to 确保 mask 形状和 gas_mass 完全一致
+        # 以防出现 IndexError: boolean index did not match indexed array...
+        mask = np.broadcast_to(mask, self.gas_mass.shape)
+        
         # 取出所有给定半径部分的气体质量总和
         total_gas_mass = np.sum(self.gas_mass[mask])
         
@@ -535,10 +539,10 @@ class GalDataSet:
 
         return np.log10(sfr_target + 1e-9) # 添加微小数防止log(0)例外
 
-    @property
-    def mbh(self) -> np.ndarray: # 将黑洞质量转化为一维数组
-        self.__verify_data_loaded()
-        return np.array(self._raw_data["mbh"])
+    # @property
+    # def mbh(self) -> np.ndarray: # 将黑洞质量转化为一维数组
+    #     self.__verify_data_loaded()
+    #     return np.array(self._raw_data["mbh"])
 
     @property
     def coordinate(self) -> np.ndarray: # 提取 _coord_keys 对应的数据，同样使用了 np.moveaxis(..., 0, 1)，从而返回与特征张量 x 完全对齐的坐标网格张量
@@ -550,10 +554,10 @@ class GalDataSet:
         self.__verify_data_loaded()
         return np.array(self._raw_data["time"])
 
-    @property
-    def mdot_edd(self) -> np.ndarray: # 将爱丁顿吸积率转化为一维数组
-        self.__verify_data_loaded()
-        return np.array(self._raw_data["mdot_edd"])
+    # @property
+    # def mdot_edd(self) -> np.ndarray: # 将爱丁顿吸积率转化为一维数组
+    #     self.__verify_data_loaded()
+    #     return np.array(self._raw_data["mdot_edd"])
 
     @property
     def sfr_target(self) -> np.ndarray: # 将恒星形成率转化为一维数组
@@ -583,7 +587,7 @@ class GalDataSet:
     def y_baseline(self) -> np.ndarray: # 计算基于KS定律预测的恒星形成率SFR，作为物理基准。
         self.__verify_data_loaded()
         sfr_ks_val = np.array(self._raw_data["sfr_ks"])
-        return np.log10(sfr_ks_val + 1e-9)
+        return np.log10(sfr_ks_val + 1e-9) # y_baseline = log10(sfr_ks)，添加微小数防止log(0)例外
 
     # --------- Dunder Methods -------- 重载 Python 的内置操作符或函数，让自定义对象（比如这里的 GalDataSet）能够像 Python 原生的列表或数字一样去行动。
 
@@ -652,9 +656,9 @@ class GalDataSet:
             self._x_keys
             + self._coord_keys
             + [
-                "mbh",
+                # "mbh",
                 "sfr_target",
-                "mdot_edd",
+                # "mdot_edd",
                 "time",
                 "sfr_ks",
                 # "mdot_bondi",
@@ -679,9 +683,9 @@ class GalDataSet:
                     self._raw_data[f"coordinate_{i}"].append(coord)
                 self._raw_data["gas_mass"].append(data.gas_mass)
                 self._raw_data["grid_volume"].append(data.grid_volume)
-                self._raw_data["mbh"].append(data.mbh)
+                # self._raw_data["mbh"].append(data.mbh)
                 self._raw_data["sfr_target"].append(data.sfr_target)
-                self._raw_data["mdot_edd"].append(data.mdot_edd)
+                # self._raw_data["mdot_edd"].append(data.mdot_edd)
                 self._raw_data["time"].append(data.time)
                 # self._raw_data["mdot_bondi"].append(data.mdot_bondi()) # 计算邦迪吸积率
                 self._raw_data["sfr_ks"].append(data.sfr_ks()) # 计算KS定律SFR
@@ -693,7 +697,7 @@ class GalDataSet:
         self,
         *,
         require_positive_targets: bool = True, 
-        require_positive_mbh: bool = True, # 要求黑洞质量必须大于0
+        # require_positive_mbh: bool = True, # 要求黑洞质量必须大于0
         # require_positive_bondi: bool = True, # 要求吸积率必须大于0
         require_positive_ks: bool = True, # 要求KS恒星形成率必须大于0
     ) -> "GalDataSet":
@@ -705,17 +709,17 @@ class GalDataSet:
         """
         self.__verify_data_loaded()
         sfr_target = np.asarray(self._raw_data["sfr_target"], dtype=float) # 将rawdata中的数据转化为一维数组
-        mdot_edd = np.asarray(self._raw_data["mdot_edd"], dtype=float)
+        # mdot_edd = np.asarray(self._raw_data["mdot_edd"], dtype=float)
         # mdot_bondi = np.asarray(self._raw_data["mdot_bondi"], dtype=float)
         sfr_ks_val = np.asarray(self._raw_data["sfr_ks"], dtype=float)
-        mbh = np.asarray(self._raw_data["mbh"], dtype=float)
+        # mbh = np.asarray(self._raw_data["mbh"], dtype=float)
 
-        mask = np.isfinite(sfr_target) & np.isfinite(mdot_edd) & np.isfinite(sfr_ks_val) & np.isfinite(mbh)
+        mask = np.isfinite(sfr_target) & np.isfinite(sfr_ks_val)
         # mask = np.isfinite(sfr_target) & np.isfinite(mdot_edd) & np.isfinite(mdot_bondi) & np.isfinite(mbh)
         if require_positive_targets:
-            mask &= (sfr_target > 0.0) & (mdot_edd > 0.0)
-        if require_positive_mbh:
-            mask &= mbh > 0.0
+            mask &= (sfr_target > 0.0)
+        # if require_positive_mbh:
+        #     mask &= mbh > 0.0
         # if require_positive_bondi:
         #     mask &= mdot_bondi > 0.0
         if require_positive_ks:
