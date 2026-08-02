@@ -5,6 +5,7 @@
 '''
 import os
 import sys
+import argparse
 import torch
 import optuna
 import gc # 清理内存的库
@@ -29,7 +30,7 @@ def objective(trial, data_exp):
 
     # 2. Get base arguments
     #    Pass an empty list to avoid conflict with actual CLI args
-    args = train.parse_args()
+    args = train.parse_args([])
 
     # 3. Suggest Hyperparameters
     #    Define your search space here.
@@ -91,8 +92,18 @@ def objective(trial, data_exp):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run Optuna for an SFR cache variant.")
+    parser.add_argument(
+        "--data-exp",
+        default="Exp1_InstantSFR_NoInitialStellarDensity_",
+        help="Cache prefix, for example Exp1_InstantSFR_ or legacy Exp1_",
+    )
+    parser.add_argument("--n-trials", type=int, default=N_TRIALS)
+    parser.add_argument("--timeout", type=int, default=TIMEOUT, help="Timeout in seconds.")
+    cli_args = parser.parse_args()
+
     # Create storage for persistence (optional)
-    data_exp = "Exp1_"
+    data_exp = cli_args.data_exp
     study_name = f".cache/{data_exp}sfrconvnet_hpo"
     storage_name = "sqlite:///{}.db".format(study_name)
 
@@ -100,7 +111,11 @@ if __name__ == "__main__":
     # 一次完整的参数优化过程被称为一个study
 
     print("Starting optimization...")
-    study.optimize(lambda t: objective(t, data_exp), n_trials=N_TRIALS, timeout=TIMEOUT) #运行优化,最多跑600次或者8小时
+    study.optimize(
+        lambda t: objective(t, data_exp),
+        n_trials=cli_args.n_trials,
+        timeout=cli_args.timeout,
+    )
 
     print("\n" + "=" * 50)
     print("Optimization Finished!")

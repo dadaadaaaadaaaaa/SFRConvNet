@@ -1,4 +1,6 @@
 import os
+import argparse
+import copy
 import subprocess
 import sys
 import json
@@ -7,7 +9,30 @@ import json
 # Configuration Source
 # =============================================================================
 # Specify the experiment key from ExperimentSetting.json to run
-TARGET_EXPERIMENT = "Exp1_SFRConvNet"  # Change this to the desired experiment key 运行第几类实验，使用哪个模型
+TARGET_EXPERIMENT = "Exp1_InstantSFR_NoInitialStellarDensity_SFRConvNet"
+
+EXPERIMENT_ALIASES = {
+    # .config is ignored by git, so keep the ablation entry reproducible in
+    # tracked code while still allowing a local config entry to override it.
+    "Exp1_NoDnewstar_SFRConvNet": {
+        "base_experiment": "Exp1_SFRConvNet",
+        "overrides": {"BaseInformation": {"data_exp": "Exp1_NoDnewstar_"}},
+    },
+    "Exp1_InstantSFR_SFRConvNet": {
+        "base_experiment": "Exp1_SFRConvNet",
+        "overrides": {"BaseInformation": {"data_exp": "Exp1_InstantSFR_"}},
+    },
+    "Exp1_InstantSFR_NoDstar_SFRConvNet": {
+        "base_experiment": "Exp1_SFRConvNet",
+        "overrides": {"BaseInformation": {"data_exp": "Exp1_InstantSFR_NoDstar_"}},
+    },
+    "Exp1_InstantSFR_NoInitialStellarDensity_SFRConvNet": {
+        "base_experiment": "Exp1_SFRConvNet",
+        "overrides": {
+            "BaseInformation": {"data_exp": "Exp1_InstantSFR_NoInitialStellarDensity_"}
+        },
+    },
+}
 
 def load_config(exp_key):
     """
@@ -28,12 +53,22 @@ def load_config(exp_key):
         print(f"Error: Failed to parse JSON configuration file: {e}")
         sys.exit(1)
         
-    if exp_key not in full_config:
+    if exp_key not in full_config and exp_key in EXPERIMENT_ALIASES:
+        alias = EXPERIMENT_ALIASES[exp_key]
+        base_key = alias["base_experiment"]
+        if base_key not in full_config:
+            print(f"Error: Base experiment key '{base_key}' not found in {config_path}")
+            sys.exit(1)
+        exp_config = copy.deepcopy(full_config[base_key])
+        for section, values in alias["overrides"].items():
+            exp_config.setdefault(section, {}).update(values)
+    elif exp_key not in full_config:
         print(f"Error: Experiment key '{exp_key}' not found in {config_path}")
-        print(f"Available keys: {list(full_config.keys())}")
+        available = list(full_config.keys()) + list(EXPERIMENT_ALIASES.keys())
+        print(f"Available keys: {available}")
         sys.exit(1)
-        
-    exp_config = full_config[exp_key]
+    else:
+        exp_config = full_config[exp_key]
     
     # Flatten the configuration
     # 展平配置
@@ -61,10 +96,11 @@ def load_config(exp_key):
 # 执行脚本
 # =============================================================================
 
-def main():
+def main(exp_key=None):
     # Load Configuration
-    print(f"Loading configuration for: {TARGET_EXPERIMENT}")
-    config = load_config(TARGET_EXPERIMENT)
+    exp_key = exp_key or TARGET_EXPERIMENT
+    print(f"Loading configuration for: {exp_key}")
+    config = load_config(exp_key)
 
     # Locate the training script in the same directory
     # 定位同一目录下的训练脚本
@@ -112,4 +148,12 @@ def main():
         print("\n[Info] Interrupted by user.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run a configured MACNet experiment.")
+    parser.add_argument(
+        "experiment",
+        nargs="?",
+        default=TARGET_EXPERIMENT,
+        help="Experiment key from .config/ExperimentSetting.json",
+    )
+    cli_args = parser.parse_args()
+    main(cli_args.experiment)

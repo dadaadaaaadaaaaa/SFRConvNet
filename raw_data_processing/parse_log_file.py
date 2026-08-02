@@ -207,7 +207,10 @@ def ll_dg(path: str, time: float, scope: float) -> pd.Series:
     df = pd.read_parquet(path)
     avg = mean_around_time(df, time, scope)
     _require_columns(avg, ["NEWstar", "mbh"])
-    avg["sfr_target"] = avg["NEWstar"] 
+    # NEWstar is the cumulative newly formed stellar mass, not an
+    # instantaneous SFR. Keep it for diagnostics, while the training target is
+    # read independently from the snapshot target configured in HdfraConfig.
+    avg["cumulative_new_stellar_mass"] = avg["NEWstar"]
     return avg
 
 if __name__ == "__main__":

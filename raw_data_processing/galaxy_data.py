@@ -47,6 +47,7 @@ class GalData:
         self.time = None
         self._data_hdfra = None
         self._data_log = None
+        self._target_metadata = {}
         self._corr = None
         self._axes = None
         self._coord = None
@@ -68,6 +69,10 @@ class GalData:
     @property
     def snapshot_array(self) -> np.ndarray:     # 把snapshot字典里的所有值提取出来打包成numpy多维数组，方便后续矩阵运算
         return np.array(list(self.snapshot.values()))
+
+    @property
+    def target_metadata(self) -> dict:
+        return self._target_metadata.copy()
 
     @property
     def raw_axes(self) -> list: # 返回原始的坐标轴数组。
@@ -277,6 +282,7 @@ class GalData:
         log_path: str,
         func_parse_log: Callable,
         scope: float,
+        target_config: dict | None = None,
     ) -> "GalData":
         """
         Reads snapshot data and associated BH accretion rates from specified paths.
@@ -288,6 +294,54 @@ class GalData:
             scope (float): Time scope for filtering log data. If provided, only entries within [time - scope, time + scope] are retained.
         """
         self._load_snapshot_hdfra(hdfra_path, time)._load_log(log_path, func_parse_log, scope)
+        if target_config is not None:
+            self._set_target_from_snapshot(target_config)
+        return self
+
+    def _set_target_from_snapshot(self, target_config: dict) -> "GalData":
+        """Extract a scalar supervised target without exposing it as input."""
+        required = {"dataset", "name", "reduction"}
+        missing = required.difference(target_config)
+        if missing:
+            raise ValueError(f"Target configuration is missing required keys: {sorted(missing)}")
+
+        dataset_name = str(target_config["dataset"])
+        target_name = str(target_config["name"])
+        reduction = str(target_config["reduction"]).lower()
+        if self._corr is not None and dataset_name in self._corr:
+            raise ValueError(
+                f"Target dataset '{dataset_name}' is also present in correspondence; "
+                "this would leak the label into model inputs."
+            )
+
+        try:
+            target_field = np.asarray(self._data_hdfra.select(dataset_name)[:], dtype=np.float64)
+        except Exception as exc:
+            raise KeyError(f"Could not read target dataset '{dataset_name}' from the snapshot.") from exc
+        target_field = np.squeeze(target_field)
+        if not np.all(np.isfinite(target_field)):
+            raise ValueError(f"Target dataset '{dataset_name}' contains NaN or Inf values.")
+
+        if reduction == "sum":
+            target_value = float(np.sum(target_field, dtype=np.float64))
+        elif reduction == "mean":
+            target_value = float(np.mean(target_field, dtype=np.float64))
+        else:
+            raise ValueError(f"Unsupported target reduction '{reduction}'. Use 'sum' or 'mean'.")
+        if target_value < 0:
+            raise ValueError(f"Snapshot target '{target_name}' must be non-negative, got {target_value}.")
+
+        if self._data_log is None:
+            self._data_log = {}
+        self._data_log[target_name] = target_value
+        self._data_log["sfr_target"] = target_value
+        self._target_metadata = {
+            "dataset": dataset_name,
+            "name": target_name,
+            "reduction": reduction,
+            "quantity": "instantaneous_sfr",
+            "units": str(target_config.get("units", "Msun/yr")),
+        }
         return self
 
     def rescale(self, new_shape: Tuple[int, ...], weights: List[np.ndarray | None] = None) -> "GalData": # 将高分辨率模拟转为机器学习输入的关键，如果原始网格是256*256，模型需要8*8，它会进行下采样。
@@ -309,6 +363,7 @@ class GalData:
         new_instance.time = self.time
         new_instance._corr = self._corr.copy()
         new_instance._data_log = self._data_log.copy() if self._data_log is not None else None
+        new_instance._target_metadata = self._target_metadata.copy()
 
         new_snapshot = {}
         for i, (name, data) in enumerate(self.snapshot.items()):  # 遍历所有的物理场，将高分辨率的网格粗化为低分辨率的网格，用的是质量加权平均。
@@ -389,6 +444,8 @@ class GalData:
             log_grp = f.create_group("log_data")
             for key, value in self._data_log.items():
                 log_grp.create_dataset(key, data=value)
+            for key, value in self._target_metadata.items():
+                log_grp.attrs[f"target_{key}"] = value
 
             f.attrs["time"] = self.time
 
@@ -424,6 +481,11 @@ class GalData:
 
             if "log_data" in f:
                 self._data_log = {k: f["log_data"][k][()] for k in f["log_data"]}
+                self._target_metadata = {
+                    key[len("target_") :]: value.decode() if isinstance(value, bytes) else value
+                    for key, value in f["log_data"].attrs.items()
+                    if key.startswith("target_")
+                }
 
             corr_grp = f["correlation"]
             self._corr = [
@@ -516,6 +578,7 @@ class GalDataSet:
         self.folder_path = None
         self._x_keys = None
         self._coord_keys = None
+        self._target_metadata = {}
 
     # --------- Properties -------- 将零散的天体物理快照数据，无缝转化为 Python 机器学习框架可以直接摄入的标准张量格式
 
@@ -531,6 +594,17 @@ class GalDataSet:
         '''
         self.__verify_data_loaded() # 确保数据已经成功加载到内存中
         return np.moveaxis(np.array([self._raw_data[k] for k in self._x_keys]), 0, 1)
+
+    @property
+    def input_channels(self) -> tuple[str, ...]:
+        """Names of the physical-field channels, in the same order as ``x``."""
+        self.__verify_data_loaded()
+        return tuple(self._x_keys)
+
+    @property
+    def target_metadata(self) -> dict:
+        self.__verify_data_loaded()
+        return self._target_metadata.copy()
 
     @property
     def y(self) -> np.ndarray: # 提取恒星形成率并计算对数
@@ -563,6 +637,12 @@ class GalDataSet:
     def sfr_target(self) -> np.ndarray: # 将恒星形成率转化为一维数组
         self.__verify_data_loaded()
         return np.array(self._raw_data["sfr_target"])
+
+    @property
+    def sfr_ks(self) -> np.ndarray:
+        """Physical (untransformed) Kennicutt-Schmidt SFR baseline."""
+        self.__verify_data_loaded()
+        return np.array(self._raw_data["sfr_ks"])
 
     @property
     def groups(self) -> np.ndarray: # 将内部的 _group_labels 列表转化为字符串数组返回。这对应了原始数据属于哪个模拟子目录（如不同的星系初始条件或 AGN 反馈参数）。它是后续进行分层切分和样本均衡的核心依据。
@@ -599,9 +679,18 @@ class GalDataSet:
         self.__verify_data_loaded()
         other.__verify_data_loaded()
 
+        if self._target_metadata != other._target_metadata:
+            raise ValueError(
+                "Cannot combine datasets with different target semantics: "
+                f"{self._target_metadata} != {other._target_metadata}"
+            )
+        if self._x_keys != other._x_keys or self._coord_keys != other._coord_keys:
+            raise ValueError("Cannot combine datasets with different input channels or coordinates.")
+
         new_dataset = GalDataSet()
         new_dataset._x_keys = self._x_keys
         new_dataset._coord_keys = self._coord_keys
+        new_dataset._target_metadata = self._target_metadata.copy()
 
         new_dataset._raw_data = {}
         for key in self._raw_data:
@@ -611,6 +700,43 @@ class GalDataSet:
         return new_dataset
 
     # -------- Public Methods --------
+
+    def select_input_channels(
+        self,
+        *,
+        include=None,
+        exclude=None,
+    ) -> "GalDataSet":
+        """
+        Select channels exposed through ``x`` while retaining all raw fields.
+
+        Supplying neither argument preserves the historical all-channel
+        behavior. Coordinates, targets, baselines, and metadata are unchanged.
+        """
+        self.__verify_data_loaded()
+        if include is not None and exclude is not None:
+            raise ValueError("Specify either include or exclude, not both.")
+
+        available = list(self._x_keys)
+        if include is not None:
+            requested = list(dict.fromkeys(include))
+            unknown = [name for name in requested if name not in available]
+            if unknown:
+                raise KeyError(f"Unknown input channel(s): {unknown}. Available: {available}")
+            selected = requested
+        elif exclude is not None:
+            excluded = set(exclude)
+            unknown = sorted(excluded.difference(available))
+            if unknown:
+                raise KeyError(f"Unknown input channel(s): {unknown}. Available: {available}")
+            selected = [name for name in available if name not in excluded]
+        else:
+            selected = available
+
+        if not selected:
+            raise ValueError("At least one input channel must be retained.")
+        self._x_keys = selected
+        return self
 
     def load_data(self, folder_path) -> "GalDataSet":
         """
@@ -649,6 +775,7 @@ class GalDataSet:
         data_path = os.path.join(self.folder_path[0], first_file)
         
         data.load_h5(data_path)
+        self._target_metadata = data.target_metadata
         self._x_keys = list(data.snapshot.keys())
         self._coord_keys = [f"coordinate_{i}" for i in range(len(data.coordinate))]
         self._x_keys += ["gas_mass", "grid_volume"] 
@@ -677,6 +804,11 @@ class GalDataSet:
                     continue
                 file_path = os.path.join(fp, file_name)
                 data = GalData().load_h5(file_path)
+                if data.target_metadata != self._target_metadata:
+                    raise ValueError(
+                        f"Inconsistent target metadata in '{file_path}': "
+                        f"{data.target_metadata} != {self._target_metadata}"
+                    )
                 for key, value in data.snapshot.items():
                     self._raw_data[key].append(value)
                 for i, coord in enumerate(data.coordinate):
@@ -718,12 +850,16 @@ class GalDataSet:
         # mask = np.isfinite(sfr_target) & np.isfinite(mdot_edd) & np.isfinite(mdot_bondi) & np.isfinite(mbh)
         if require_positive_targets:
             mask &= (sfr_target > 0.0)
+        else:
+            mask &= (sfr_target >= 0.0)
         # if require_positive_mbh:
         #     mask &= mbh > 0.0
         # if require_positive_bondi:
         #     mask &= mdot_bondi > 0.0
         if require_positive_ks:
             mask &= sfr_ks_val > 0.0
+        else:
+            mask &= sfr_ks_val >= 0.0
 
         removed = np.count_nonzero(~mask)
         if removed:
@@ -990,6 +1126,7 @@ class GalDataSet:
         ds = GalDataSet()
         ds._x_keys = self._x_keys.copy()
         ds._coord_keys = self._coord_keys.copy()
+        ds._target_metadata = self._target_metadata.copy()
         ds._raw_data = {k: [self._raw_data[k][i] for i in idx] for k in self._raw_data}
         ds._group_labels = [self._group_labels[i] for i in idx]
         ds.folder_path = self.folder_path.copy() if self.folder_path is not None else None
@@ -997,6 +1134,7 @@ class GalDataSet:
 
 
 if __name__ == "__main__":
+    import argparse
     from tqdm.contrib import tenumerate
 
     try:
@@ -1005,6 +1143,16 @@ if __name__ == "__main__":
         from parse_log_file import load_config, ll_eg, ll_dg
 
     configs = load_config(".config") # 从外部加载.config文件
+    parser = argparse.ArgumentParser(description="Convert raw MACER snapshots to fine/coarse HDF5 files.")
+    parser.add_argument(
+        "--galaxy",
+        action="append",
+        default=[],
+        help="Process only this generated name (for example disk_galaxy_fiducial). May be repeated.",
+    )
+    cli_args = parser.parse_args()
+    selected_galaxies = set(cli_args.galaxy)
+
     raw_data_dir = configs["BaseConfig"]["raw_data_dir"]
     data_dir = configs["BaseConfig"]["data_dir"]
 
@@ -1016,6 +1164,9 @@ if __name__ == "__main__":
         #     continue  # Skip elliptical galaxies for 2D processing
         for gal_nickname, gal_config in gal_group.items():
             gal_name = f"{gal_type}_{gal_nickname}" # 星系是椭圆星系还是盘星系
+
+            if selected_galaxies and gal_name not in selected_galaxies:
+                continue
 
             hdfra_folder = os.path.join(raw_data_dir, gal_config["folder_name"], "data")
             if not os.path.exists(hdfra_folder):
@@ -1031,10 +1182,21 @@ if __name__ == "__main__":
                 print(f"  [Warning] No hdfra files found for {gal_name} in {hdfra_folder}. Skipping...")
                 continue
                 
-            hdfra_paths = sorted(hdfra_files)
+            def _snapshot_sort_key(name):
+                suffix = name.rsplit(".", 1)[-1]
+                return (0, int(suffix)) if suffix.isdigit() else (1, name)
+
+            hdfra_paths = sorted(hdfra_files, key=_snapshot_sort_key)
             log_path = os.path.join(data_dir, f"{gal_name}.parquet")
             func_parse_log = ll_eg if "elliptical" in gal_type else ll_dg # 按照星系类型（椭圆or盘）选择不同的日志解析函数
-            corr = configs["HdfraConfig"][gal_type]["correspondence"]
+            hdfra_config = configs["HdfraConfig"][gal_type]
+            corr = hdfra_config["correspondence"]
+            target_config = hdfra_config.get("target")
+            if target_config is not None and target_config["dataset"] in corr:
+                raise ValueError(
+                    f"Target dataset {target_config['dataset']!r} for {gal_type} is also listed "
+                    "in correspondence, which would create direct label leakage."
+                )
 
             # Initialize the time of snapshots
             snapshot_dt = gal_config["snapshot_dt"] # config中包含时间步长的输入
@@ -1057,14 +1219,15 @@ if __name__ == "__main__":
 
                 file_path = os.path.join(hdfra_folder, file_name)
                 file = GalData(ndim=ndim, coordinate_mode=coordinate_mode) # 创建GalData类
-                file.read_hdfra(
+                file.set_corr(corr).read_hdfra(
                     hdfra_path=file_path,
                     time=time_seq[index],
                     log_path=log_path,
                     func_parse_log=func_parse_log,
                     scope=scope,
+                    target_config=target_config,
                 )
-                file.set_corr(corr).set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射
+                file.set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射
                 file.save_h5(os.path.join(save_path_fine, f"{str(index).zfill(5)}.h5")) # 将原始分辨率数据的HDF5文件保存至fine文件夹
 
                 # Scale transform to coarse grid

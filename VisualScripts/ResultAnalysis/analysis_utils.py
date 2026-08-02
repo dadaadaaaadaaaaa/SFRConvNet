@@ -61,6 +61,7 @@ PROJECT_ROOT = setup_project_env()
 # Project Imports
 try:
     from raw_data_processing.galaxy_data import GalDataSet
+    from Experiment.target_transform import inverse_transform_sfr, transform_sfr
     from Experiment.models import (
         MACNetRes_mbh,
         AccretionTransformer,
@@ -178,8 +179,45 @@ def get_baseline_error_column(df):
     return None
 
 
+def _target_metadata_from(obj=None):
+    """Return normalized target metadata from a dataset or prediction DataFrame."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        metadata = obj
+    elif isinstance(obj, pd.DataFrame):
+        metadata = obj.attrs.get("target_metadata", {})
+    else:
+        metadata = getattr(obj, "target_metadata", {})
+    metadata = dict(metadata or {})
+    normalized = {}
+    for key, value in metadata.items():
+        normalized[key.removeprefix("target_")] = value
+    return normalized
+
+
+def _physical_sfr(values, metadata):
+    """Invert the configured training transform; legacy runs use log10(SFR+floor)."""
+    metadata = dict(metadata or {})
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(values)
+    physical = np.full(values.shape, np.nan, dtype=float)
+    physical[finite] = inverse_transform_sfr(
+        values[finite],
+        transform=metadata.get("transform", "log10_floor"),
+        scale=float(metadata.get("scale", 1.0)),
+        floor=float(metadata.get("floor", 1e-9)),
+    )
+    return physical
+
+
 def get_target_label(df=None):
-    return r"$\log_{10}(\mathrm{SFR})$"
+    metadata = _target_metadata_from(df)
+    transform = metadata.get("transform")
+    if transform == "log10_1p":
+        scale = float(metadata.get("scale", 1.0))
+        return rf"$\log_{{10}}[1+\mathrm{{SFR}}/({scale:g}\,M_\odot\,\mathrm{{yr}}^{{-1}})]$"
+    return r"$\log_{10}(\mathrm{SFR}/[M_\odot\,\mathrm{yr}^{-1}])$"
 
 
 def get_baseline_label(df=None):
@@ -191,8 +229,6 @@ def find_latest_model(results_root: Path, exp_prefix: str) -> Path:
         return None
     candidates = list(results_root.glob(f"{exp_prefix}*/*.pth"))
     if not candidates:
-        candidates = list(results_root.glob("**/*.pth"))
-    if not candidates:
         return None
     candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0]
@@ -201,6 +237,48 @@ def find_latest_model(results_root: Path, exp_prefix: str) -> Path:
 # ==========================================
 # 4. Datasets
 # ==========================================
+def _cache_prefix_from_split_path(path):
+    path = Path(path)
+    name = path.name
+    for suffix in ("train.pt", "val.pt", "test.pt", "out.pt"):
+        if name.endswith(suffix):
+            return path.with_name(name[: -len(suffix)])
+    return None
+
+
+def load_cache_metadata(path):
+    """Load channel metadata associated with a cache split or cache prefix."""
+    path = Path(path)
+    prefix = _cache_prefix_from_split_path(path)
+    if prefix is None:
+        prefix = path
+    metadata_path = Path(f"{prefix}metadata.json")
+    if not metadata_path.exists():
+        return {}
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_norm_stats(norm_path):
+    """Load normalization arrays plus optional channel metadata."""
+    with np.load(norm_path, allow_pickle=False) as data:
+        result = {
+            "mean": data["mean"],
+            "std": data["std"],
+            "input_channels": tuple(data["input_channels"].tolist()) if "input_channels" in data else (),
+            "excluded_channels": tuple(data["excluded_channels"].tolist()) if "excluded_channels" in data else (),
+        }
+        scalar_keys = (
+            "target_quantity", "target_name", "target_dataset", "target_reduction",
+            "target_units", "target_transform", "target_scale", "target_floor",
+            "includes_zero_targets",
+        )
+        for key in scalar_keys:
+            if key in data:
+                result[key] = data[key].item()
+        return result
+
+
 class CachedPTDataset:
     def __init__(self, pt_path: Path):
         self.path = pt_path
@@ -217,6 +295,16 @@ class CachedPTDataset:
         self.n_groups = None
         self.time = None
         self.type = "cached"
+        channel_metadata = load_cache_metadata(pt_path)
+        self.input_channels = tuple(channel_metadata.get("input_channels", ()))
+        self.excluded_channels = tuple(channel_metadata.get("excluded_channels", ()))
+        self.target_metadata = {
+            key.removeprefix("target_"): value
+            for key, value in channel_metadata.items()
+            if key.startswith("target_")
+        }
+        if "includes_zero_targets" in channel_metadata:
+            self.target_metadata["includes_zero_targets"] = bool(channel_metadata["includes_zero_targets"])
 
         # Current cache format from prepare_data.py:
         # (x, coord, y, y_baseline, groups, n_groups, time)
@@ -234,6 +322,11 @@ class CachedPTDataset:
             self.kind = "macnet"
 
         self.x = ensure_tensor(self.x)
+        if self.input_channels and len(self.input_channels) != self.x.shape[1]:
+            raise RuntimeError(
+                f"Cache '{pt_path}' has {self.x.shape[1]} tensor channels but metadata lists "
+                f"{len(self.input_channels)} channels: {self.input_channels}"
+            )
         self.coord = ensure_tensor(self.coord)
         self.y = ensure_tensor(self.y).view(-1, 1)
         self.y_baseline = ensure_tensor(self.y_baseline).view(-1, 1) if self.y_baseline is not None else None
@@ -271,8 +364,12 @@ class HDF5Dataset:
         mean=None,
         std=None,
         log_transform=True,
-        mirror=False,
+        mirror=True,
         balance=None,
+        input_channels=None,
+        exclude_channels=None,
+        reference_dataset=None,
+        target_metadata=None,
     ):
         if isinstance(hdf5_conf, (list, tuple)):
             self.folder_path = hdf5_conf[0]
@@ -282,7 +379,21 @@ class HDF5Dataset:
         self.type = os.path.basename(os.path.dirname(self.folder_path)).lower()
 
         loaded = GalDataSet().load_data((self.folder_path, 0))
-        loaded.drop_invalid().filter(-5)
+        loaded.drop_invalid(require_positive_targets=False, require_positive_ks=False)
+
+        if reference_dataset is not None:
+            if input_channels is None:
+                input_channels = getattr(reference_dataset, "input_channels", None) or None
+            if exclude_channels is None:
+                exclude_channels = getattr(reference_dataset, "excluded_channels", None) or None
+            if target_metadata is None:
+                target_metadata = _target_metadata_from(reference_dataset)
+        if input_channels is not None and exclude_channels is not None:
+            # An explicit include list is sufficient and avoids ambiguous rules.
+            exclude_channels = None
+        loaded.select_input_channels(include=input_channels, exclude=exclude_channels)
+        self.input_channels = loaded.input_channels
+        self.excluded_channels = tuple(exclude_channels or ())
 
         if mirror:
             loaded.mirror_data()
@@ -290,16 +401,46 @@ class HDF5Dataset:
             loaded.balance_groups(method=balance)
 
         if mean is not None and std is not None:
+            mean_shape = np.asarray(mean).shape
+            norm_channels = int(mean_shape[0] if len(mean_shape) == 1 else mean_shape[1])
+            if norm_channels != len(self.input_channels):
+                raise ValueError(
+                    f"Normalization has {norm_channels} channels but HDF5 input selection has "
+                    f"{len(self.input_channels)} ({self.input_channels}). Pass input_channels, "
+                    "exclude_channels, or reference_dataset from the matching cached experiment."
+                )
             self.x = loaded.standardize(mean, std, log_transform=log_transform)
         else:
             self.x, _, _ = loaded.standardize(log_transform=log_transform)
         self.coord = loaded.coordinate
-        self.y = loaded.y
-        self.y_baseline = loaded.y_baseline if hasattr(loaded, "y_baseline") else None
+        raw_target_metadata = loaded.target_metadata
+        if raw_target_metadata.get("quantity") != "instantaneous_sfr":
+            raise ValueError(
+                f"HDF5 target is {raw_target_metadata.get('quantity')!r}, expected 'instantaneous_sfr'. "
+                "Regenerate the processed HDF5 snapshots."
+            )
+        self.target_metadata = dict(target_metadata or raw_target_metadata)
+        self.target_metadata.setdefault("transform", "log10_1p")
+        self.target_metadata.setdefault("scale", 1.0)
+        self.target_metadata.setdefault("floor", 1e-9)
+        for key in ("quantity", "dataset", "reduction", "units"):
+            if key in raw_target_metadata and key in self.target_metadata:
+                if raw_target_metadata[key] != self.target_metadata[key]:
+                    raise ValueError(
+                        f"Raw HDF5 target {key}={raw_target_metadata[key]!r} does not match "
+                        f"reference target {self.target_metadata[key]!r}."
+                    )
+        transform_options = {
+            "transform": self.target_metadata["transform"],
+            "scale": float(self.target_metadata["scale"]),
+            "floor": float(self.target_metadata["floor"]),
+        }
+        self.y = transform_sfr(loaded.sfr_target, **transform_options)
+        self.y_baseline = transform_sfr(loaded.sfr_ks, **transform_options)
         self.baseline = self.y_baseline
         self.time = loaded.time
         self.mdot_edd = np.array(loaded._raw_data["mdot_edd"]) if "mdot_edd" in loaded._raw_data else None
-        self.sfr_target = loaded.sfr_target if hasattr(loaded, "sfr_target") else None
+        self.sfr_target = loaded.sfr_target
 
         self.kind = "vit" if self.coord is not None else "macnet"
 
@@ -342,12 +483,47 @@ def load_analysis_model(model_path, device, datasets_dict=None):
             else:
                 model_type = "vit"
 
-    # Infer Input Channels
-    in_ch = 14  # Default
+    # Infer Input Channels. New checkpoints/cache metadata are authoritative;
+    # legacy runs still fall back to the supplied analysis dataset.
+    checkpoint_channels = tuple(state.get("input_channels", ())) if isinstance(state, dict) else ()
+    checkpoint_n_channels = state.get("n_input_channels") if isinstance(state, dict) else None
+    configured_n_channels = loaded_params.get("n_input_channels") if loaded_params else None
+    in_ch = int(checkpoint_n_channels or configured_n_channels or 14)
+    dataset_channels = ()
+    checkpoint_target_metadata = _target_metadata_from(
+        state.get("target_metadata", {}) if isinstance(state, dict) else {}
+    )
+    if not checkpoint_target_metadata and loaded_params:
+        checkpoint_target_metadata = _target_metadata_from(loaded_params.get("target_metadata", {}))
     if datasets_dict:
         ref_ds = next((ds for ds in datasets_dict.values() if ds is not None), None)
         if ref_ds:
-            in_ch = int(ref_ds.x.shape[1])
+            dataset_n_channels = int(ref_ds.x.shape[1])
+            if (checkpoint_n_channels or configured_n_channels) and dataset_n_channels != in_ch:
+                raise ValueError(
+                    f"Model expects {in_ch} input channels but analysis dataset has "
+                    f"{dataset_n_channels}."
+                )
+            dataset_channels = tuple(getattr(ref_ds, "input_channels", ()))
+            if checkpoint_channels and dataset_channels and checkpoint_channels != dataset_channels:
+                raise ValueError(
+                    f"Model channels {checkpoint_channels} do not match dataset channels "
+                    f"{dataset_channels}."
+                )
+            in_ch = dataset_n_channels
+            dataset_target_metadata = _target_metadata_from(ref_ds)
+            if bool(checkpoint_target_metadata) != bool(dataset_target_metadata):
+                raise ValueError(
+                    "Model and analysis dataset do not both provide target metadata. "
+                    "Do not mix a legacy cumulative-SFR run with an instantaneous-SFR cache."
+                )
+            for key in ("quantity", "dataset", "reduction", "transform", "scale", "floor"):
+                if key in checkpoint_target_metadata or key in dataset_target_metadata:
+                    if checkpoint_target_metadata.get(key) != dataset_target_metadata.get(key):
+                        raise ValueError(
+                            f"Model target {key}={checkpoint_target_metadata.get(key)!r} does not match "
+                            f"dataset target {dataset_target_metadata.get(key)!r}."
+                        )
 
     # Initialize
     model = None
@@ -436,10 +612,14 @@ def load_analysis_model(model_path, device, datasets_dict=None):
 
     try:
         model.load_state_dict(raw_state, strict=True)
-    except Exception:
-        model.load_state_dict(raw_state, strict=False)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint '{model_path}' is not structurally compatible with the inferred {model_type} model."
+        ) from exc
 
     model.eval()
+    model.input_channels = checkpoint_channels or dataset_channels
+    model.target_metadata = checkpoint_target_metadata
     return model, model_type
 
 
@@ -506,15 +686,25 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
 
     y_pred = torch.cat(preds).numpy()
     y_true = ensure_tensor(ds.y).view(-1).numpy()
+    if not np.all(np.isfinite(y_pred)):
+        raise RuntimeError("Model predictions contain NaN or Inf.")
     feats = torch.cat(feats_list, dim=0).numpy() if feats_list else None
 
+    target_metadata = _target_metadata_from(ds)
+    model_target_metadata = _target_metadata_from(model)
+    if model_target_metadata and target_metadata and model_target_metadata != target_metadata:
+        raise ValueError("Model and dataset target metadata differ; refusing to mix target definitions.")
     df = pd.DataFrame({"y_true": y_true, "y_pred": y_pred})
+    df.attrs["target_metadata"] = target_metadata
+    df["sfr_true"] = _physical_sfr(y_true, target_metadata)
+    df["sfr_pred"] = _physical_sfr(y_pred, target_metadata)
 
     baseline_data = getattr(ds, "y_baseline", None)
     if baseline_data is not None:
         df["y_baseline"] = ensure_tensor(baseline_data).view(-1).numpy()
         df.loc[np.isclose(df["y_baseline"], -100), "y_baseline"] = np.nan
         df["baseline_error"] = df["y_baseline"] - df["y_true"]
+        df["sfr_baseline"] = _physical_sfr(df["y_baseline"].to_numpy(), target_metadata)
 
     if hasattr(ds, "time") and ds.time is not None:
         df["time"] = ensure_numpy(ds.time).reshape(-1)
@@ -545,9 +735,14 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
 def save_to_h5(path, df, feats, x_data, ds_type):
     with h5py.File(path, "w") as f:
         f.attrs["dataset_type"] = ds_type
+        for key, value in _target_metadata_from(df).items():
+            f.attrs[f"target_{key}"] = value
         f.create_dataset("x", data=x_data, compression="gzip")
         f.create_dataset("y_true", data=df["y_true"].values)
         f.create_dataset("y_pred", data=df["y_pred"].values)
+        for column in ("sfr_true", "sfr_pred", "sfr_baseline"):
+            if column in df.columns:
+                f.create_dataset(column, data=df[column].values)
         if "type" in df.columns:
             dt = h5py.special_dtype(vlen=str)
             f.create_dataset("label", data=df["type"].values.astype(object), dtype=dt)
@@ -584,7 +779,10 @@ def plot_scatter(df, title, fig_dir, limit_range=True):
 
     def _plot_base(ax, show_baseline=False):
         ax.plot([vmin, vmax], [vmin, vmax], "r--", lw=1.5, label="Ideal", zorder=5)
-        ax.plot([vmin, vmax], [vmin - 1, vmax - 1], "k--", lw=0.8, alpha=0.5, label=r"$\pm$1 dex")
+        ax.plot(
+            [vmin, vmax], [vmin - 1, vmax - 1], "k--", lw=0.8,
+            alpha=0.5, label=r"$\pm$1 target-transform unit"
+        )
         ax.plot([vmin, vmax], [vmin + 1, vmax + 1], "k--", lw=0.8, alpha=0.5)
 
         groups = df["type"].unique()
@@ -662,7 +860,7 @@ def plot_error_dist(df, title, fig_dir, model_label="Model"):
     plt.axhline(1, color="gray", linestyle=":", alpha=0.5)
     plt.axhline(-1, color="gray", linestyle=":", alpha=0.5)
     plt.title(f"Error Distribution: {title}")
-    plt.ylabel(r"Error (dex)")
+    plt.ylabel("Error (target-transform units)")
     plt.xticks(rotation=45, ha="right")
     save_plot(plt, f"violin_{title.replace(' ', '_').lower()}", fig_dir)
     plt.show()
@@ -690,32 +888,48 @@ def plot_mass_evolution(df, title, fig_dir, model_label="Model"):
     """
     Backward-compatible wrapper.
     Older notebooks call this function for BH growth analysis; in the SFR
-    pipeline we reinterpret it as cumulative stellar mass formed versus time.
+    pipeline we reinterpret it as SFR history versus time.
     """
-    return plot_cumulative_sfr(df, title, fig_dir, model_label=model_label)
+    return plot_sfr_history(df, title, fig_dir, model_label=model_label)
+
+
+def _sfr_series(df, physical_column, transformed_column):
+    if physical_column in df.columns:
+        return df[physical_column].to_numpy(dtype=float)
+    return _physical_sfr(df[transformed_column].to_numpy(dtype=float), _target_metadata_from(df))
+
+
+def _cumulative_trapezoid(values, times, time_unit_to_years):
+    values = np.asarray(values, dtype=float)
+    times = np.asarray(times, dtype=float)
+    if len(values) != len(times):
+        raise ValueError("SFR and time arrays must have the same length.")
+    if len(values) == 0:
+        return values
+    dt = np.diff(times)
+    if np.any(~np.isfinite(times)) or np.any(dt < 0):
+        raise ValueError("Times must be finite and sorted in non-decreasing order.")
+    increments = 0.5 * (values[:-1] + values[1:]) * dt * time_unit_to_years
+    return np.concatenate(([0.0], np.cumsum(increments)))
 
 
 def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=1e9):
     """
     Plot cumulative stellar mass formed from the reconstructed SFR history.
 
-    Assumptions:
-    - `y_true`, `y_pred`, and optional baseline are log10(SFR).
-    - `time` is in Gyr.
-    - Multiplying SFR [Msun/yr] by dt [Gyr] requires a factor of 1e9 yr/Gyr.
+    True/prediction/KS are instantaneous SFR. The plotted cumulative mass is
+    derived with trapezoidal time integration; it is not a separately trained target.
+    `time` is assumed to be in Gyr, hence the default 1e9 yr/Gyr factor.
     """
     if "time" not in df.columns:
         return
 
     df_plot = df.sort_values("time").copy()
     times = df_plot["time"].values
-    dt = np.diff(times, prepend=times[0])
-    dt = np.where(dt < 0, 0, dt)
-
-    sfr_true = 10 ** df_plot["y_true"]
-    sfr_pred = 10 ** df_plot["y_pred"]
-    mass_true = np.cumsum(sfr_true * dt) * sfr_unit_scale
-    mass_pred = np.cumsum(sfr_pred * dt) * sfr_unit_scale
+    sfr_true = _sfr_series(df_plot, "sfr_true", "y_true")
+    sfr_pred = _sfr_series(df_plot, "sfr_pred", "y_pred")
+    mass_true = _cumulative_trapezoid(sfr_true, times, sfr_unit_scale)
+    mass_pred = _cumulative_trapezoid(sfr_pred, times, sfr_unit_scale)
 
     plt.figure(figsize=(10, 5), dpi=120)
     plt.plot(times, mass_true, "k-", lw=2, label="True", alpha=0.8)
@@ -723,8 +937,8 @@ def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=
 
     baseline_col = get_baseline_column(df_plot)
     if baseline_col is not None:
-        sfr_baseline = 10 ** df_plot[baseline_col].fillna(-100).to_numpy()
-        mass_baseline = np.cumsum(sfr_baseline * dt) * sfr_unit_scale
+        sfr_baseline = _sfr_series(df_plot, "sfr_baseline", baseline_col)
+        mass_baseline = _cumulative_trapezoid(sfr_baseline, times, sfr_unit_scale)
         plt.plot(times, mass_baseline, "g:", lw=1.5, label=get_baseline_label(df_plot), alpha=0.7)
 
     plt.yscale("log")
@@ -734,6 +948,41 @@ def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=
     plt.ylabel(r"$M_{\star,\mathrm{formed}}$ [$M_{\odot}$]")
     plt.legend()
     save_plot(plt, f"cum_sfr_{title.replace(' ', '_').lower()}", fig_dir)
+    plt.show()
+
+
+def plot_sfr_history(df, title, fig_dir, model_label="Model"):
+    """
+    Plot the reconstructed SFR history versus time.
+
+    Values are inverted with the transform metadata saved beside the cache.
+    `symlog` is used so genuine zero-SFR snapshots remain visible.
+    """
+    if "time" not in df.columns:
+        return
+
+    df_plot = df.sort_values("time").copy()
+    times = df_plot["time"].values
+    sfr_true = _sfr_series(df_plot, "sfr_true", "y_true")
+    sfr_pred = _sfr_series(df_plot, "sfr_pred", "y_pred")
+
+    plt.figure(figsize=(10, 5), dpi=120)
+    plt.plot(times, sfr_true, "k-", lw=2, label="True", alpha=0.8)
+    plt.plot(times, sfr_pred, "r--", lw=2, label=f"Predicted ({model_label})", alpha=0.8)
+
+    baseline_col = get_baseline_column(df_plot)
+    if baseline_col is not None:
+        sfr_baseline = _sfr_series(df_plot, "sfr_baseline", baseline_col)
+        plt.plot(times, sfr_baseline, "g:", lw=1.5, label=get_baseline_label(df_plot), alpha=0.7)
+
+    positive = np.concatenate([sfr_true[sfr_true > 0], sfr_pred[sfr_pred > 0]])
+    linthresh = max(float(np.nanmin(positive)) if positive.size else 1e-9, 1e-12)
+    plt.yscale("symlog", linthresh=linthresh)
+    plt.title(f"SFR History: {title}")
+    plt.xlabel("Time (Gyr)")
+    plt.ylabel(r"$\mathrm{SFR}$ [$M_{\odot}\,\mathrm{yr}^{-1}$]")
+    plt.legend()
+    save_plot(plt, f"sfr_history_{title.replace(' ', '_').lower()}", fig_dir)
     plt.show()
 
 
@@ -751,5 +1000,5 @@ def get_metrics_summary(y_true, y_pred, name=""):
         "RMSE": np.sqrt(np.mean(d**2)),
         "MAE": np.mean(np.abs(d)),
         "R2": r2_score(y_true, y_pred),
-        "OutlierFrac (>1dex)": np.mean(np.abs(d) > 1.0) * 100,
+        "OutlierFrac (|target error|>1)": np.mean(np.abs(d) > 1.0) * 100,
     }

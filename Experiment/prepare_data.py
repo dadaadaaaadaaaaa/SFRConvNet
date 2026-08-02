@@ -3,6 +3,8 @@
 2. 设计了4个实验，盘状星系、剔除一个星系的盘状，剔除低分辨率的盘状、同时剔除低分辨率和一个星系的盘状，测试模型的泛化能力
 '''
 
+import argparse
+import json
 import os
 import sys
 import torch
@@ -13,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from raw_data_processing.galaxy_data import GalDataSet
 from raw_data_processing.parse_log_file import load_config
+from Experiment.target_transform import SUPPORTED_TARGET_TRANSFORMS, transform_sfr
 
 
 class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、计算均值和方差、归一化、保存为.pt文件
@@ -24,6 +27,10 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
     @property
     def dataset(self):
         return self._dataset
+
+    @property
+    def input_channels(self):
+        return self._dataset.input_channels
 
     # ------------ Dunder Methods ------------
 
@@ -38,9 +45,27 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
 
     # ------------ Methods ------------
 
-    def load(self, path: str):
-        self._dataset = GalDataSet().load_data(path) # 读取数据并创建GalDataSet对象
-        self._dataset.drop_invalid() # 去除无效数据（如0或负数或过大）
+    def load(
+        self,
+        path: str,
+        *,
+        include_channels=None,
+        exclude_channels=None,
+        include_zero_targets: bool = True,
+        require_target_quantity: str | None = "instantaneous_sfr",
+    ):
+        self._dataset = GalDataSet().load_data(path)
+        target_quantity = self._dataset.target_metadata.get("quantity")
+        if require_target_quantity and target_quantity != require_target_quantity:
+            raise ValueError(
+                f"Processed data target is {target_quantity!r}, expected {require_target_quantity!r}. "
+                "Regenerate fine/coarse HDF5 files from the raw hdfra snapshots before preparing caches."
+            )
+        self._dataset.select_input_channels(include=include_channels, exclude=exclude_channels)
+        self._dataset.drop_invalid(
+            require_positive_targets=not include_zero_targets,
+            require_positive_ks=not include_zero_targets,
+        )
         return self
 
     def split( # 用statify把数据划分为训练集、验证集和测试集
@@ -48,9 +73,13 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         train_size: float,
         validation_size: float,
         stratify: str | np.ndarray | None = None,
+        random_state: int | None = None,
     ):
         train_set, val_set, test_set = self._dataset.split(
-            train_size=train_size, validation_size=validation_size, stratify=stratify
+            train_size=train_size,
+            validation_size=validation_size,
+            stratify=stratify,
+            random_state=random_state,
         )
         return CachePt(train_set), CachePt(val_set), CachePt(test_set)
 
@@ -71,19 +100,35 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         save_path: str,
         mean: np.ndarray | None = None, # 均值
         std: np.ndarray | None = None, # 方差，用于归一化
+        *,
+        target_transform: str = "log10_1p",
+        target_scale: float = 1.0,
+        target_floor: float = 1e-9,
     ):
         data = self._dataset
         if mean is not None and std is not None: # 验证集&测试集
             x = data.standardize(mean, std)
         else: # 训练集
             x, mean, std = data.standardize()
+        y = transform_sfr(
+            data.sfr_target,
+            transform=target_transform,
+            scale=target_scale,
+            floor=target_floor,
+        )
+        y_baseline = transform_sfr(
+            data.sfr_ks,
+            transform=target_transform,
+            scale=target_scale,
+            floor=target_floor,
+        )
         torch.save(
             (
                 x,
                 data.coordinate,
-                data.y,
+                y,
                 # data.mbh,
-                data.y_baseline,
+                y_baseline,
                 data.groups,
                 data.n_groups,
                 data.time,
@@ -93,10 +138,120 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         return mean, std
 
 
-def _save_norm_stats(save_path: str, mean: np.ndarray, std: np.ndarray): # 接收CachePt处理训练集时算出来的mean和std，打包保存成npz文件
+def _save_norm_stats(
+    save_path: str,
+    mean: np.ndarray,
+    std: np.ndarray,
+    *,
+    input_channels=(),
+    excluded_channels=(),
+    target_metadata=None,
+    target_transform="log10_1p",
+    target_scale=1.0,
+    target_floor=1e-9,
+    includes_zero_targets=True,
+): # 接收CachePt处理训练集时算出来的mean和std，打包保存成npz文件
     norm_path = f"{save_path}norm.npz"
-    np.savez(norm_path, mean=mean, std=std)
+    channel_names = np.asarray(tuple(input_channels), dtype=str)
+    excluded_names = np.asarray(tuple(excluded_channels), dtype=str)
+    target_metadata = dict(target_metadata or {})
+    metadata = {
+        "format_version": 2,
+        "input_channels": channel_names.tolist(),
+        "excluded_channels": excluded_names.tolist(),
+        "n_input_channels": int(len(channel_names)),
+        "target_quantity": target_metadata.get("quantity", "instantaneous_sfr"),
+        "target_name": target_metadata.get("name", "sfr"),
+        "target_dataset": target_metadata.get("dataset", "Data-Set-11"),
+        "target_reduction": target_metadata.get("reduction", "sum"),
+        "target_units": target_metadata.get("units", "Msun/yr"),
+        "target_transform": target_transform,
+        "target_scale": float(target_scale),
+        "target_floor": float(target_floor),
+        "includes_zero_targets": bool(includes_zero_targets),
+    }
+    np.savez(
+        norm_path,
+        mean=mean,
+        std=std,
+        input_channels=channel_names,
+        excluded_channels=excluded_names,
+        target_quantity=np.asarray(metadata["target_quantity"]),
+        target_name=np.asarray(metadata["target_name"]),
+        target_dataset=np.asarray(metadata["target_dataset"]),
+        target_reduction=np.asarray(metadata["target_reduction"]),
+        target_units=np.asarray(metadata["target_units"]),
+        target_transform=np.asarray(metadata["target_transform"]),
+        target_scale=np.asarray(metadata["target_scale"]),
+        target_floor=np.asarray(metadata["target_floor"]),
+        includes_zero_targets=np.asarray(metadata["includes_zero_targets"]),
+    )
+    metadata_path = f"{save_path}metadata.json"
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
     print(f"[INFO] Saved normalization stats: {norm_path}")
+    print(f"[INFO] Saved channel metadata: {metadata_path}")
+
+
+def _parse_channel_list(value: str):
+    return tuple(name.strip() for name in value.split(",") if name.strip())
+
+
+def _cache_prefix(experiment_number: int, cache_tag: str) -> str:
+    tag = cache_tag.strip().strip("_")
+    return f"Exp{experiment_number}_{tag}_" if tag else f"Exp{experiment_number}_"
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Prepare SFR training caches.")
+    parser.add_argument(
+        "--exclude-channels",
+        default="initial_stellar_density",
+        help="Comma-separated input channels to exclude, for example: initial_stellar_density",
+    )
+    parser.add_argument(
+        "--cache-tag",
+        default="InstantSFR_NoInitialStellarDensity",
+        help="Tag inserted in cache prefixes. Use InstantSFR with an empty exclusion list for the retained-channel control.",
+    )
+    parser.add_argument(
+        "--target-transform",
+        choices=SUPPORTED_TARGET_TRANSFORMS,
+        default="log10_1p",
+        help="Invertible transform applied identically to true SFR and the KS baseline.",
+    )
+    parser.add_argument(
+        "--target-scale",
+        type=float,
+        default=1.0,
+        help="SFR scale in Msun/yr for log10_1p.",
+    )
+    parser.add_argument(
+        "--target-floor",
+        type=float,
+        default=1e-9,
+        help="Positive floor used only by log10_floor.",
+    )
+    parser.add_argument(
+        "--drop-zero-targets",
+        action="store_true",
+        help="Drop zero-SFR samples. By default zero-SFR snapshots are retained.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed used for dataset splitting.")
+    parser.add_argument(
+        "--only-exp1",
+        action="store_true",
+        help="Prepare only Exp1 caches; useful for feature-ablation runs.",
+    )
+    args = parser.parse_args()
+    args.exclude_channels = _parse_channel_list(args.exclude_channels)
+    if args.target_scale <= 0:
+        parser.error("--target-scale must be positive.")
+    if args.target_floor <= 0:
+        parser.error("--target-floor must be positive.")
+    if args.exclude_channels and not args.cache_tag:
+        parser.error("--cache-tag is required when --exclude-channels is used, to avoid overwriting old caches.")
+    return args
 
 
 def get_folder_paths(configs_path, gal_type, resolution): # 读取config文件，返回指定类型和分辨率的文件夹绝对路径列表。这样代码路径就直接从config文件中读取，不需要硬编码在代码里了。
@@ -125,6 +280,21 @@ except Exception as e:
 
 
 if __name__ == "__main__":
+    args = _parse_args()
+    excluded_channels = args.exclude_channels
+    include_zero_targets = not args.drop_zero_targets
+    load_options = {
+        "exclude_channels": excluded_channels,
+        "include_zero_targets": include_zero_targets,
+        "require_target_quantity": "instantaneous_sfr",
+    }
+    transform_options = {
+        "target_transform": args.target_transform,
+        "target_scale": args.target_scale,
+        "target_floor": args.target_floor,
+    }
+    np.random.seed(args.seed)
+    os.makedirs(".cache", exist_ok=True)
     resolution = "coarse"
     configs_dir = ".config"
 
@@ -142,9 +312,14 @@ if __name__ == "__main__":
 
     # 1. Main Default Experiment (Exp1_) - Disk Galaxies Only (Fiducial setup)
     print("Processing Experiment 1 (Disk Galaxies)...")
-    save_path = os.path.join(".cache", "Exp1_")
-    cache = CachePt().load(exp_dg_folder_paths)
-    train_cache, val_cache, test_cache = cache.split(train_size=0.6, validation_size=0.2, stratify="groups")
+    save_path = os.path.join(".cache", _cache_prefix(1, args.cache_tag))
+    cache = CachePt().load(exp_dg_folder_paths, **load_options)
+    train_cache, val_cache, test_cache = cache.split(
+        train_size=0.6,
+        validation_size=0.2,
+        stratify="groups",
+        random_state=args.seed,
+    )
     
     train_cache = train_cache.process(balance="oversample")
     val_cache = val_cache.process()
@@ -154,10 +329,23 @@ if __name__ == "__main__":
     print(f"  Validation set size: {len(val_cache)}")
     print(f"  Testing set size:    {len(test_cache)}")
 
-    mean, std = train_cache.to_pt(save_path + "train.pt")
-    _save_norm_stats(save_path, mean, std)
-    val_cache.to_pt(save_path + "val.pt", mean, std)
-    test_cache.to_pt(save_path + "test.pt", mean, std)
+    mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+    _save_norm_stats(
+        save_path,
+        mean,
+        std,
+        input_channels=train_cache.input_channels,
+        excluded_channels=excluded_channels,
+        target_metadata=train_cache.dataset.target_metadata,
+        includes_zero_targets=include_zero_targets,
+        **transform_options,
+    )
+    val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
+    test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
+
+    if args.only_exp1:
+        print("[INFO] --only-exp1 requested; skipping Experiments 2-4.")
+        sys.exit(0)
 
     import random
 
@@ -174,11 +362,16 @@ if __name__ == "__main__":
         
         print(f"Processing Experiment 2 (Disk Galaxies Generalization: Hold-out test)...")
         print(f"  Hold-out Galaxy: {held_out_dg[1]}")
-        save_path = os.path.join(".cache", "Exp2_")
+        save_path = os.path.join(".cache", _cache_prefix(2, args.cache_tag))
         
         try:
-            cache_in = CachePt().load(exp_dg_folder_paths_in)
-            train_cache, val_cache, test_cache = cache_in.split(train_size=0.6, validation_size=0.2, stratify="groups")
+            cache_in = CachePt().load(exp_dg_folder_paths_in, **load_options)
+            train_cache, val_cache, test_cache = cache_in.split(
+                train_size=0.6,
+                validation_size=0.2,
+                stratify="groups",
+                random_state=args.seed,
+            )
 
             train_cache = train_cache.process(balance="oversample")
             val_cache = val_cache.process()
@@ -188,16 +381,25 @@ if __name__ == "__main__":
             print(f"  Validation set size: {len(val_cache)}")
             print(f"  Testing set size:    {len(test_cache)}")
 
-            mean, std = train_cache.to_pt(save_path + "train.pt")
-            _save_norm_stats(save_path, mean, std)
-            val_cache.to_pt(save_path + "val.pt", mean, std)
-            test_cache.to_pt(save_path + "test.pt", mean, std)
+            mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+            _save_norm_stats(
+                save_path,
+                mean,
+                std,
+                input_channels=train_cache.input_channels,
+                excluded_channels=excluded_channels,
+                target_metadata=train_cache.dataset.target_metadata,
+                includes_zero_targets=include_zero_targets,
+                **transform_options,
+            )
+            val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
+            test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
 
             # Process out-of-distribution (held out) test set
-            cache_out = CachePt().load(exp_dg_folder_paths_out)
+            cache_out = CachePt().load(exp_dg_folder_paths_out, **load_options)
             cache_out = cache_out.process()
             print(f"  Out-set size (Generalization): {len(cache_out)}")
-            cache_out.to_pt(save_path + "out.pt", mean, std)
+            cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
         except ValueError as e:
             print(f"  [Skip] Skipped Experiment 2: {e}")
     else:
@@ -209,47 +411,75 @@ if __name__ == "__main__":
         if len(exp_dg_folder_paths_nolow) > 5:
             exp_dg_folder_paths_nolow.pop(5)
         print(f"Processing Experiment 3...")
-        save_path = os.path.join(".cache", f"Exp3_")
-        cache = CachePt().load(exp_dg_folder_paths_nolow)
-        train_cache, val_cache, test_cache = cache.split(train_size=0.6, validation_size=0.2, stratify="groups")
+        save_path = os.path.join(".cache", _cache_prefix(3, args.cache_tag))
+        cache = CachePt().load(exp_dg_folder_paths_nolow, **load_options)
+        train_cache, val_cache, test_cache = cache.split(
+            train_size=0.6,
+            validation_size=0.2,
+            stratify="groups",
+            random_state=args.seed,
+        )
         train_cache = train_cache.process(balance="oversample")
         val_cache = val_cache.process()
         test_cache = test_cache.process()
         print(f"  Training set size:   {len(train_cache)}")
         print(f"  Validation set size: {len(val_cache)}")
         print(f"  Testing set size:    {len(test_cache)}")
-        mean, std = train_cache.to_pt(save_path + "train.pt")
-        _save_norm_stats(save_path, mean, std)
-        val_cache.to_pt(save_path + "val.pt", mean, std)
-        test_cache.to_pt(save_path + "test.pt", mean, std)
+        mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+        _save_norm_stats(
+            save_path,
+            mean,
+            std,
+            input_channels=train_cache.input_channels,
+            excluded_channels=excluded_channels,
+            target_metadata=train_cache.dataset.target_metadata,
+            includes_zero_targets=include_zero_targets,
+            **transform_options,
+        )
+        val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
+        test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
     except Exception as e:
         print(f"  [Skip] Skipped Experiment 3: {e}")
 
     # Create in- and out-datasets for disk galaxies without low-res data
     print(f"Processing Experiment 4...") # 实验4：在实验2的基础上，测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
-    save_path = os.path.join(".cache", f"Exp4_")
+    save_path = os.path.join(".cache", _cache_prefix(4, args.cache_tag))
     exp_dg_folder_paths_nolow_in = exp_dg_folder_paths_nolow.copy()
     
     try:
         exp_dg_folder_paths_nolow_in.pop(2)
         exp_dg_folder_paths_nolow_out = [exp_dg_folder_paths_nolow[2]]
         
-        cache_in = CachePt().load(exp_dg_folder_paths_nolow_in)
-        train_cache, val_cache, test_cache = cache_in.split(train_size=0.6, validation_size=0.2, stratify="groups")
+        cache_in = CachePt().load(exp_dg_folder_paths_nolow_in, **load_options)
+        train_cache, val_cache, test_cache = cache_in.split(
+            train_size=0.6,
+            validation_size=0.2,
+            stratify="groups",
+            random_state=args.seed,
+        )
         train_cache = train_cache.process(balance="oversample")
         val_cache = val_cache.process()
         test_cache = test_cache.process()
         print(f"  Training set size:   {len(train_cache)}")
         print(f"  Validation set size: {len(val_cache)}")
         print(f"  Testing set size:    {len(test_cache)}")
-        mean, std = train_cache.to_pt(save_path + "train.pt")
-        _save_norm_stats(save_path, mean, std)
-        val_cache.to_pt(save_path + "val.pt", mean, std)
-        test_cache.to_pt(save_path + "test.pt", mean, std)
+        mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+        _save_norm_stats(
+            save_path,
+            mean,
+            std,
+            input_channels=train_cache.input_channels,
+            excluded_channels=excluded_channels,
+            target_metadata=train_cache.dataset.target_metadata,
+            includes_zero_targets=include_zero_targets,
+            **transform_options,
+        )
+        val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
+        test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
 
-        cache_out = CachePt().load(exp_dg_folder_paths_nolow_out)
+        cache_out = CachePt().load(exp_dg_folder_paths_nolow_out, **load_options)
         cache_out = cache_out.process()
         print(f"  Out-set size: {len(cache_out)}")
-        cache_out.to_pt(save_path + "out.pt", mean, std)
+        cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
     except Exception as e:
         print(f"  [Skip] Skipped Experiment 4: {e}")

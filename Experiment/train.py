@@ -129,6 +129,26 @@ class SFRSpatialAugmentor:
 # =============================================
 # 1) Dataset: load .pt [x, coord, y, mbh, (Optional: y_bondi)]
 # =============================================
+def _load_cache_channel_metadata(pt_path):
+    pt_path = os.fspath(pt_path)
+    prefix = None
+    for suffix in ("train.pt", "val.pt", "test.pt", "out.pt"):
+        if pt_path.endswith(suffix):
+            prefix = pt_path[: -len(suffix)]
+            break
+    if prefix is None:
+        return {}
+
+    metadata_path = prefix + "metadata.json"
+    if not os.path.exists(metadata_path):
+        return {}
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to read cache metadata '{metadata_path}'.") from exc
+
+
 class GalPTDataset(Dataset):
     def __init__(self, pt_path, *, augmentor: Optional[SFRSpatialAugmentor] = None):
         super().__init__()
@@ -140,10 +160,11 @@ class GalPTDataset(Dataset):
         if isinstance(loaded, (list, tuple)):
             if len(loaded) >= 6: # 新版本，针对SFR：[x, coord, y, y_baseline, groups, n_groups, ...]
                 self.x, self.coord, self.y, self.y_baseline, self.groups, self.n_groups = loaded[:6]
-                if len(loaded) > 6:
+                self.time = loaded[6] if len(loaded) > 6 else None
+                if len(loaded) > 7:
                     print(
                         f"[Warning] Dataset '{pt_path}' has {len(loaded)} items; "
-                        "extra fields (like time) are ignored."
+                        "fields after time are ignored."
                     )
             else:
                 raise RuntimeError(f"Unexpected number of items in cached dataset '{pt_path}': {len(loaded)}")
@@ -172,6 +193,30 @@ class GalPTDataset(Dataset):
         self.coord = _ensure_tensor(self.coord, name="coord").contiguous()
         self.y = _ensure_tensor(self.y, name="y").view(-1, 1) # 将目标标量强行变形为[样本数，1]的二维张量，为了和神经网络的输出形状对齐
         self.y_baseline = _ensure_tensor(self.y_baseline, name="y_baseline").view(-1, 1) # SFR基准值
+
+        channel_metadata = _load_cache_channel_metadata(pt_path)
+        self.input_channels = tuple(channel_metadata.get("input_channels", ()))
+        self.excluded_channels = tuple(channel_metadata.get("excluded_channels", ()))
+        self.target_metadata = {
+            key: channel_metadata[key]
+            for key in (
+                "target_quantity",
+                "target_name",
+                "target_dataset",
+                "target_reduction",
+                "target_units",
+                "target_transform",
+                "target_scale",
+                "target_floor",
+                "includes_zero_targets",
+            )
+            if key in channel_metadata
+        }
+        if self.input_channels and len(self.input_channels) != self.x.shape[1]:
+            raise RuntimeError(
+                f"Cache '{pt_path}' has {self.x.shape[1]} tensor channels but metadata lists "
+                f"{len(self.input_channels)} channels: {self.input_channels}"
+            )
 
         groups_raw = _ensure_tensor(self.groups, name="groups")
         if isinstance(groups_raw, np.ndarray) and groups_raw.dtype.kind in "SU": # 如果groups是字符串类型（如星系类型），则保持为numpy字符串数组，稍后在内存中转换为整数标签；否则直接转换为float32张量
@@ -210,7 +255,7 @@ class GalPTDataset(Dataset):
 # =============================================
 # 2) Args
 # =============================================
-def parse_args() -> argparse.Namespace: # 能够输入哪些训练参数
+def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参数
     parser = argparse.ArgumentParser(description="Train MACNetRes with MBH input")
     parser.add_argument("--cache_dir", type=str, default=".cache", help="Directory containing cached .pt datasets") # 去哪拿.pt数据
     parser.add_argument("--exp_name", type=str, default="Exp5_", help="Experiment name prefix used for saving results") # 这次做哪个实验
@@ -325,7 +370,7 @@ def parse_args() -> argparse.Namespace: # 能够输入哪些训练参数
     parser.add_argument("--log_dir", type=str, default="runs", help="Directory to write TensorBoard logs")
     parser.add_argument("--no_save", action="store_true", help="Disable saving results to disk (useful for HPO)")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _parse_stage_depths(value: str) -> Tuple[int, ...]: # 字符串转化为pytorch能够识别的元组的解析器
@@ -415,6 +460,8 @@ def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace: # 在�
 
 
 def set_seed(seed: int): # 固定随机数种子，保证实验的可复现性
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # For full determinism users can also set CUDNN flags; keep perf by default.
@@ -789,6 +836,39 @@ def main(args=None):
     val_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "val.pt")) # 验证集
     test_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "test.pt")) # 测试集
 
+    channel_counts = {int(ds.x.shape[1]) for ds in (train_ds, val_ds, test_ds)}
+    if len(channel_counts) != 1:
+        raise RuntimeError(f"Train/validation/test caches have inconsistent channel counts: {channel_counts}")
+    known_channel_sets = {
+        ds.input_channels for ds in (train_ds, val_ds, test_ds) if ds.input_channels
+    }
+    if len(known_channel_sets) > 1:
+        raise RuntimeError(f"Train/validation/test caches have inconsistent channel metadata: {known_channel_sets}")
+    target_metadata_present = [ds.target_metadata for ds in (train_ds, val_ds, test_ds) if ds.target_metadata]
+    known_target_metadata = {
+        json.dumps(ds.target_metadata, sort_keys=True)
+        for ds in (train_ds, val_ds, test_ds)
+        if ds.target_metadata
+    }
+    if target_metadata_present and (len(target_metadata_present) != 3 or len(known_target_metadata) != 1):
+        raise RuntimeError(
+            "Train/validation/test caches are missing target metadata or use inconsistent target semantics. "
+            f"Found: {known_target_metadata}"
+        )
+    if train_ds.target_metadata and train_ds.target_metadata.get("target_quantity") != "instantaneous_sfr":
+        raise RuntimeError(
+            "This SFR training path requires target_quantity='instantaneous_sfr'; "
+            f"got {train_ds.target_metadata.get('target_quantity')!r}."
+        )
+    if train_ds.input_channels:
+        print(f"Input channels ({len(train_ds.input_channels)}): {', '.join(train_ds.input_channels)}")
+    else:
+        print(f"Input channels: {train_ds.x.shape[1]} (legacy cache without channel-name metadata)")
+    if train_ds.target_metadata:
+        print(f"Target metadata: {train_ds.target_metadata}")
+    else:
+        print("[Warning] Legacy cache has no target metadata; physical target semantics cannot be verified.")
+
     group_stats = _compute_group_stats( # 调用_compute_group_stats函数，计算训练集中每个组的吸积率分布统计信息（均值、标准差、10%分位数和90%分位数），这些统计信息将用于动态权重计算
         train_ds.y,
         train_ds.groups,
@@ -928,6 +1008,11 @@ def main(args=None):
                 "log_dir": log_dir,
                 "save_dir": save_dir,
                 "run_stamp": run_stamp,
+                "n_input_channels": int(train_ds.x.shape[1]),
+                "input_channels": list(train_ds.input_channels),
+                "excluded_channels": list(train_ds.excluded_channels),
+                "target_metadata": train_ds.target_metadata,
+                **train_ds.target_metadata,
             }
         )
         with open(hyperparams_path, "w", encoding="utf-8") as f:
@@ -976,7 +1061,17 @@ def main(args=None):
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             else:
                 torch.save(
-                    {"model": model.state_dict(), "val_loss": best_val, "mean_val": mean_val, "epoch": epoch}, best_path
+                    {
+                        "model": model.state_dict(),
+                        "val_loss": best_val,
+                        "mean_val": mean_val,
+                        "epoch": epoch,
+                        "n_input_channels": int(train_ds.x.shape[1]),
+                        "input_channels": list(train_ds.input_channels),
+                        "excluded_channels": list(train_ds.excluded_channels),
+                        "target_metadata": train_ds.target_metadata,
+                    },
+                    best_path,
                 )
         else:
             no_improve += 1
