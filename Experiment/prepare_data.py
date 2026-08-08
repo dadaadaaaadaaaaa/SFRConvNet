@@ -150,6 +150,7 @@ def _save_norm_stats(
     target_scale=1.0,
     target_floor=1e-9,
     includes_zero_targets=True,
+    oversample_groups=True,
 ): # 接收CachePt处理训练集时算出来的mean和std，打包保存成npz文件
     norm_path = f"{save_path}norm.npz"
     channel_names = np.asarray(tuple(input_channels), dtype=str)
@@ -169,6 +170,8 @@ def _save_norm_stats(
         "target_scale": float(target_scale),
         "target_floor": float(target_floor),
         "includes_zero_targets": bool(includes_zero_targets),
+        "oversample_groups": bool(oversample_groups),
+        "group_balance": "oversample" if oversample_groups else "none",
     }
     np.savez(
         norm_path,
@@ -185,6 +188,8 @@ def _save_norm_stats(
         target_scale=np.asarray(metadata["target_scale"]),
         target_floor=np.asarray(metadata["target_floor"]),
         includes_zero_targets=np.asarray(metadata["includes_zero_targets"]),
+        oversample_groups=np.asarray(metadata["oversample_groups"]),
+        group_balance=np.asarray(metadata["group_balance"]),
     )
     metadata_path = f"{save_path}metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -195,6 +200,20 @@ def _save_norm_stats(
 
 def _parse_channel_list(value: str):
     return tuple(name.strip() for name in value.split(",") if name.strip())
+
+
+def _parse_bool(value):
+    """Parse explicit command-line booleans such as --oversample=false."""
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes", "y", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected a boolean value (true/false), got {value!r}."
+    )
 
 
 def _cache_prefix(experiment_number: int, cache_tag: str) -> str:
@@ -242,6 +261,18 @@ def _parse_args():
         "--only-exp1",
         action="store_true",
         help="Prepare only Exp1 caches; useful for feature-ablation runs.",
+    )
+    parser.add_argument(
+        "--oversample",
+        type=_parse_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="BOOL",
+        help=(
+            "Balance training groups by oversampling (default: true). "
+            "Accepts --oversample=true or --oversample=false."
+        ),
     )
     args = parser.parse_args()
     args.exclude_channels = _parse_channel_list(args.exclude_channels)
@@ -293,6 +324,7 @@ if __name__ == "__main__":
         "target_scale": args.target_scale,
         "target_floor": args.target_floor,
     }
+    train_balance = "oversample" if args.oversample else None
     np.random.seed(args.seed)
     os.makedirs(".cache", exist_ok=True)
     resolution = "coarse"
@@ -321,7 +353,7 @@ if __name__ == "__main__":
         random_state=args.seed,
     )
     
-    train_cache = train_cache.process(balance="oversample")
+    train_cache = train_cache.process(balance=train_balance)
     val_cache = val_cache.process()
     test_cache = test_cache.process()
     
@@ -338,6 +370,7 @@ if __name__ == "__main__":
         excluded_channels=excluded_channels,
         target_metadata=train_cache.dataset.target_metadata,
         includes_zero_targets=include_zero_targets,
+        oversample_groups=args.oversample,
         **transform_options,
     )
     val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
@@ -373,7 +406,7 @@ if __name__ == "__main__":
                 random_state=args.seed,
             )
 
-            train_cache = train_cache.process(balance="oversample")
+            train_cache = train_cache.process(balance=train_balance)
             val_cache = val_cache.process()
             test_cache = test_cache.process()
             
@@ -390,6 +423,7 @@ if __name__ == "__main__":
                 excluded_channels=excluded_channels,
                 target_metadata=train_cache.dataset.target_metadata,
                 includes_zero_targets=include_zero_targets,
+                oversample_groups=args.oversample,
                 **transform_options,
             )
             val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
@@ -419,7 +453,7 @@ if __name__ == "__main__":
             stratify="groups",
             random_state=args.seed,
         )
-        train_cache = train_cache.process(balance="oversample")
+        train_cache = train_cache.process(balance=train_balance)
         val_cache = val_cache.process()
         test_cache = test_cache.process()
         print(f"  Training set size:   {len(train_cache)}")
@@ -434,6 +468,7 @@ if __name__ == "__main__":
             excluded_channels=excluded_channels,
             target_metadata=train_cache.dataset.target_metadata,
             includes_zero_targets=include_zero_targets,
+            oversample_groups=args.oversample,
             **transform_options,
         )
         val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
@@ -457,7 +492,7 @@ if __name__ == "__main__":
             stratify="groups",
             random_state=args.seed,
         )
-        train_cache = train_cache.process(balance="oversample")
+        train_cache = train_cache.process(balance=train_balance)
         val_cache = val_cache.process()
         test_cache = test_cache.process()
         print(f"  Training set size:   {len(train_cache)}")
@@ -472,6 +507,7 @@ if __name__ == "__main__":
             excluded_channels=excluded_channels,
             target_metadata=train_cache.dataset.target_metadata,
             includes_zero_targets=include_zero_targets,
+            oversample_groups=args.oversample,
             **transform_options,
         )
         val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)

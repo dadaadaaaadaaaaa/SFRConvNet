@@ -20,6 +20,143 @@ def _validate_file_path(file_path: str):
     return file_path
 
 
+def _validate_half_open_range(value, config_key: str) -> tuple[int, int]:
+    """Validate a JSON-style ``[start, end]`` half-open integer range."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f"'{config_key}' must be a two-item [start, end] range.")
+    start, end = value
+    if (
+        isinstance(start, bool)
+        or isinstance(end, bool)
+        or not isinstance(start, (int, np.integer))
+        or not isinstance(end, (int, np.integer))
+    ):
+        raise ValueError(f"'{config_key}' boundaries must be integers, got {value!r}.")
+    start, end = int(start), int(end)
+    if start < 0 or start >= end:
+        raise ValueError(f"'{config_key}' must satisfy 0 <= start < end, got {value!r}.")
+    return start, end
+
+
+def _snapshot_index_from_filename(file_name: str) -> int:
+    """Extract the non-negative integer suffix from an ``hdfra.<index>`` name."""
+    if not file_name.startswith("hdfra."):
+        raise ValueError(f"Snapshot filename must start with 'hdfra.': {file_name!r}.")
+    suffix = file_name.rsplit(".", 1)[-1]
+    if not suffix.isdigit():
+        raise ValueError(f"Snapshot filename has a non-numeric index: {file_name!r}.")
+    return int(suffix)
+
+
+def _build_snapshot_schedule(hdfra_paths: List[str], gal_config: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical times and output indices aligned with sorted snapshot paths.
+
+    Supported modes:
+    - ``sequence`` (the default): use every integer in ``range`` in order.
+    - ``concatenate``: concatenate the integer intervals in ``ranges``.
+    - ``filename_index``: recover the global index from each flattened filename.
+
+    ``filename_index`` deliberately preserves gaps caused by missing snapshots;
+    a file named ``hdfra.05065`` is always assigned index 5065 regardless of its
+    position in the list.
+    """
+    if not hdfra_paths:
+        raise ValueError("Cannot build a snapshot schedule for an empty file list.")
+
+    try:
+        snapshot_dt = float(gal_config["snapshot_dt"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("'snapshot_dt' must be provided as a positive finite number.") from exc
+    try:
+        offset = float(gal_config.get("offset", 0.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("'offset' must be a finite number.") from exc
+    if not np.isfinite(snapshot_dt) or snapshot_dt <= 0:
+        raise ValueError(f"'snapshot_dt' must be positive and finite, got {snapshot_dt!r}.")
+    if not np.isfinite(offset):
+        raise ValueError(f"'offset' must be finite, got {offset!r}.")
+
+    mode = gal_config.get("mode", "sequence")
+    if mode in (None, "sequence", "sequential"):
+        if "range" not in gal_config:
+            raise ValueError("Sequential snapshot mode requires a 'range' entry.")
+        start, end = _validate_half_open_range(gal_config["range"], "range")
+        physical_indices = np.arange(start, end, dtype=np.int64)
+        # Preserve the legacy output naming convention for non-flattened data.
+        output_indices = np.arange(len(hdfra_paths), dtype=np.int64)
+    elif mode == "concatenate":
+        ranges = gal_config.get("ranges")
+        if not isinstance(ranges, (list, tuple)) or not ranges:
+            raise ValueError("Concatenate snapshot mode requires a non-empty 'ranges' list.")
+        validated_ranges = [
+            _validate_half_open_range(value, f"ranges[{i}]") for i, value in enumerate(ranges)
+        ]
+        physical_indices = np.concatenate(
+            [np.arange(start, end, dtype=np.int64) for start, end in validated_ranges]
+        )
+        if len(np.unique(physical_indices)) != len(physical_indices):
+            raise ValueError("Concatenate snapshot ranges overlap and produce duplicate physical indices.")
+        output_indices = np.arange(len(hdfra_paths), dtype=np.int64)
+    elif mode == "filename_index":
+        if "ranges" in gal_config:
+            raise ValueError("filename_index mode uses singular 'range', not 'ranges'.")
+        if "range" not in gal_config:
+            raise ValueError("filename_index snapshot mode requires a nominal 'range' entry.")
+        start, end = _validate_half_open_range(gal_config["range"], "range")
+        physical_indices = np.asarray(
+            [_snapshot_index_from_filename(file_name) for file_name in hdfra_paths],
+            dtype=np.int64,
+        )
+        if len(np.unique(physical_indices)) != len(physical_indices):
+            raise ValueError("Flattened snapshot filenames contain duplicate global indices.")
+        if np.any(np.diff(physical_indices) <= 0):
+            raise ValueError("Flattened snapshot filenames must be sorted by increasing global index.")
+        invalid = physical_indices[(physical_indices < start) | (physical_indices >= end)]
+        if invalid.size:
+            preview = ", ".join(str(value) for value in invalid[:5])
+            raise ValueError(
+                f"Snapshot indices lie outside the configured range [{start}, {end}): {preview}."
+            )
+        output_indices = physical_indices.copy()
+    else:
+        raise ValueError(
+            f"Unsupported snapshot mode {mode!r}; use 'sequence', 'concatenate', or 'filename_index'."
+        )
+
+    if len(physical_indices) != len(hdfra_paths):
+        raise ValueError(
+            "Snapshot count does not match its configured time indices: "
+            f"found {len(hdfra_paths)} files but generated {len(physical_indices)} indices. "
+            "Use filename_index mode for flattened data with missing snapshots."
+        )
+    time_seq = physical_indices.astype(np.float64) * snapshot_dt + offset
+    if not np.all(np.isfinite(time_seq)):
+        raise ValueError("Computed snapshot times contain NaN or infinity.")
+    return time_seq, output_indices
+
+
+def _snapshot_output_name(snapshot_index: int) -> str:
+    """Return the processed HDF5 filename for a logical/global snapshot index."""
+    snapshot_index = int(snapshot_index)
+    if snapshot_index < 0:
+        raise ValueError(f"Snapshot output index must be non-negative, got {snapshot_index}.")
+    return f"{snapshot_index:05d}.h5"
+
+
+def _reject_stale_filename_index_outputs(folder_path: str, expected_names: set[str]) -> None:
+    """Prevent a rerun from silently mixing old enumerated and global-index outputs."""
+    existing_names = {
+        name for name in os.listdir(folder_path) if name.lower().endswith(".h5")
+    }
+    unexpected = sorted(existing_names.difference(expected_names))
+    if unexpected:
+        preview = ", ".join(unexpected[:5])
+        raise RuntimeError(
+            f"Output folder '{folder_path}' contains {len(unexpected)} stale/unexpected HDF5 files "
+            f"({preview}). Move or remove that processed output before running filename_index mode."
+        )
+
+
 # =============== Galaxy Data Class ===============
 
 
@@ -1026,12 +1163,32 @@ class GalDataSet:
         groups = list(indices_by_group.keys())
         group_sizes = np.array([len(indices_by_group[g]) for g in groups], dtype=int)
 
-        # Determine target size per group
+        # Determine target size per group. Oversampling must retain every
+        # original sample once and draw only the missing remainder with
+        # replacement. Re-drawing the entire group with replacement would
+        # discard about 37% of the largest group's unique samples on average.
         target_size = group_sizes.max() if method == "oversample" else group_sizes.min()
-        replace = method == "oversample"
-
-        # Resample each group to target size
-        sampled_indices = [np.random.choice(indices_by_group[g], target_size, replace=replace) for g in groups]
+        sampled_indices = []
+        for group in groups:
+            group_indices = np.asarray(indices_by_group[group], dtype=int)
+            if method == "oversample":
+                n_extra = target_size - len(group_indices)
+                if n_extra > 0:
+                    extra_indices = np.random.choice(
+                        group_indices,
+                        size=n_extra,
+                        replace=True,
+                    )
+                    selected = np.concatenate([group_indices, extra_indices])
+                else:
+                    selected = group_indices.copy()
+            else:
+                selected = np.random.choice(
+                    group_indices,
+                    size=target_size,
+                    replace=False,
+                )
+            sampled_indices.append(selected)
 
         all_indices = np.concatenate(sampled_indices)
         np.random.shuffle(all_indices)
@@ -1198,26 +1355,39 @@ if __name__ == "__main__":
                     "in correspondence, which would create direct label leakage."
                 )
 
-            # Initialize the time of snapshots
-            snapshot_dt = gal_config["snapshot_dt"] # config中包含时间步长的输入
-            scope = snapshot_dt * 0.5
-            if gal_config.get("mode") != "concatenate":
-                time_range = gal_config["range"] # config中包含时间范围的呼入
-                time_seq = np.arange(time_range[0], time_range[1]) * snapshot_dt + gal_config.get("offset", 0) # 生成时间序列
-            else:
-                indices = np.concatenate([np.arange(start, end) for start, end in gal_config["ranges"]]) # 如果mode是concatenate，则将所有时间范围的索引合并
-                time_seq = indices * snapshot_dt + gal_config.get("offset", 0)
+            # Build a one-to-one mapping from each sorted input file to its
+            # physical time and processed output index. filename_index mode
+            # reads the global index from hdfra.<index>, so missing snapshots
+            # remain real time gaps instead of shifting all later times.
+            time_seq, output_indices = _build_snapshot_schedule(hdfra_paths, gal_config)
+            scope = float(gal_config["snapshot_dt"]) * 0.5
 
             save_path_fine = os.path.join(data_dir, gal_name, "fine")
             os.makedirs(save_path_fine, exist_ok=True)
             save_path_coarse = os.path.join(data_dir, gal_name, "coarse")
             os.makedirs(save_path_coarse, exist_ok=True)
 
+            stable_from_start = gal_name in [
+                "disk_galaxy_fiducial",
+                "disk_galaxy_supplement",
+                "disk_galaxy_fiducial_4",
+                "disk_galaxy_fiducial_7",
+            ]
+            if gal_config.get("mode") == "filename_index":
+                expected_output_names = {
+                    _snapshot_output_name(snapshot_index)
+                    for index, snapshot_index in enumerate(output_indices)
+                    if stable_from_start or index > 45
+                }
+                _reject_stale_filename_index_outputs(save_path_fine, expected_output_names)
+                _reject_stale_filename_index_outputs(save_path_coarse, expected_output_names)
+
             for index, file_name in tenumerate(hdfra_paths, desc=f"Processing {gal_name}"):
-                if gal_name not in ["disk_galaxy_fiducial", "disk_galaxy_supplement", "disk_galaxy_fiducial_4", "disk_galaxy_fiducial_7"] and index <= 45: # 跳过最初的45个不稳定的快照
+                if not stable_from_start and index <= 45: # 跳过最初的45个不稳定的快照
                     continue  # Skip first unstable snapshots
 
                 file_path = os.path.join(hdfra_folder, file_name)
+                output_name = _snapshot_output_name(output_indices[index])
                 file = GalData(ndim=ndim, coordinate_mode=coordinate_mode) # 创建GalData类
                 file.set_corr(corr).read_hdfra(
                     hdfra_path=file_path,
@@ -1228,8 +1398,8 @@ if __name__ == "__main__":
                     target_config=target_config,
                 )
                 file.set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射
-                file.save_h5(os.path.join(save_path_fine, f"{str(index).zfill(5)}.h5")) # 将原始分辨率数据的HDF5文件保存至fine文件夹
+                file.save_h5(os.path.join(save_path_fine, output_name)) # 将原始分辨率数据的HDF5文件保存至fine文件夹
 
                 # Scale transform to coarse grid
                 file_coarse = file.rescale(new_shape=(8, 8), weights={"density": file.grid_volume}) # 调用rescale方法，将原始分辨率数据下采样到8*8
-                file_coarse.save_h5(os.path.join(save_path_coarse, f"{str(index).zfill(5)}.h5")) # 将下采样后的数据保存至coarse文件夹
+                file_coarse.save_h5(os.path.join(save_path_coarse, output_name)) # 将下采样后的数据保存至coarse文件夹
