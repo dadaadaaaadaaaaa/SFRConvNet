@@ -12,10 +12,11 @@ from typing import List, Tuple, Optional
 # Module Definition
 # =============================================
 '''
-Residual, resnet_block, MACNetRes_mbh
-粗暴的卷积神经网络，输入15张2D物理场（特征图），经过卷积层、池化、线性层后，合并mbh，输出黑洞吸积率
-局限性：在最后一部才将mbh加入，在对特征图的处理过程中没有考虑中心黑洞的存在。
-所以下一步就是需要FilM来将mbh融入到特征图的每一层中。
+Legacy accretion models:
+``MACNetRes_mbh`` concatenates explicit BH mass after spatial pooling, while
+``MACNetFiLM`` uses explicit BH mass to modulate its residual blocks. These
+semantics are separate from ``SFRConvNet``, whose optional FiLM scalar is the
+transformed Kennicutt-Schmidt SFR baseline.
 '''
 class Residual(nn.Module): # 残差块
 
@@ -52,6 +53,7 @@ def resnet_block(num_residuals, in_channels, out_channels, half=False): # 将多
 
 
 class MACNetRes_mbh(nn.Module):
+    """Legacy accretion model conditioned explicitly on black-hole mass."""
 
     def __init__(self, in_channels=15): # 输入通道数=15，即输入15种2D物理场   # 输入二维物理网格，输出256通道的高维特征图，构建一个res_block
         super().__init__()
@@ -81,13 +83,13 @@ class MACNetRes_mbh(nn.Module):
             nn.Linear(in_channels // 2, 1), # 线性层，输入维度=128，输出维度=1
         )
 
-    def forward(self, x, y_baseline):
-        y_baseline = torch.tensor(y_baseline, dtype=torch.float32, device=x.device) if not isinstance(y_baseline, torch.Tensor) else y_baseline # 输入y_baseline，并转化为tensor
-        y_baseline = y_baseline.float().to(x.device).view(-1, 1) # 将y_baseline展平维1*1
+    def forward(self, x, mbh):
+        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh
+        mbh = mbh.float().to(x.device).view(-1, 1)
 
         x = self.res_blocks(x)
         x = self.flatten_block(x)
-        x = torch.cat((x, y_baseline), dim=1) # 合并flatten后的输出和y_baseline，形成256*1的特征图
+        x = torch.cat((x, mbh), dim=1) # Legacy model: concatenate the explicit BH-mass scalar after pooling.
         x = self.liner_block(x)
         return x.view(-1) # 输出最终预测值
 
@@ -121,6 +123,7 @@ class FiLMResidual(nn.Module):
 
 
 class MACNetFiLM(nn.Module):
+    """Legacy accretion model whose FiLM conditioner is black-hole mass."""
     def __init__(self, in_channels=15):
         super().__init__()
         in_c = in_channels
@@ -148,7 +151,7 @@ class MACNetFiLM(nn.Module):
 
         self.total_features = sum(self.channel_counts) # 统计多少个通道需要被控制
         # FiLM Generator
-        self.film_generator = nn.Sequential(nn.Linear(1, 64), nn.LeakyReLU(), nn.Linear(64, self.total_features * 2)) # 一个全连接神经网络，输入标量黑洞质量，输出两组参数gamma和beta
+        self.film_generator = nn.Sequential(nn.Linear(1, 64), nn.LeakyReLU(), nn.Linear(64, self.total_features * 2)) # Input scalar is explicit BH mass; output is per-block gamma/beta.
 
         self.flatten_block = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten()) # 池化操作，与前文一致
 
@@ -160,11 +163,11 @@ class MACNetFiLM(nn.Module):
             nn.Linear(last_out_channels // 2, 1), # 输入维度=256（而非257），输出一个预测值
         )
 
-    def forward(self, x, y_baseline):
-        y_baseline = torch.tensor(y_baseline, dtype=torch.float32, device=x.device) if not isinstance(y_baseline, torch.Tensor) else y_baseline # 输入y_baseline，转化为tensor
-        y_baseline = y_baseline.float().to(x.device).view(-1, 1)
+    def forward(self, x, mbh):
+        mbh = torch.tensor(mbh, dtype=torch.float32, device=x.device) if not isinstance(mbh, torch.Tensor) else mbh
+        mbh = mbh.float().to(x.device).view(-1, 1)
 
-        film_params = self.film_generator(y_baseline)
+        film_params = self.film_generator(mbh)
         gammas_betas = torch.split(film_params, [c * 2 for c in self.channel_counts], dim=1) # 按照每个阶段的通道数对gamma和beta进行切分，切分成8组
 
         for block, params in zip(self.blocks, gammas_betas):
@@ -294,7 +297,8 @@ class FourierPositionalEncoding2D(nn.Module):
         return pos
 
 
-# FiLM conditioner for y_baseline
+# Generic scalar FiLM conditioner. In the current SFR pipeline the scalar is
+# transformed KS-law SFR; legacy accretion models use separate BH-mass code.
 class FiLMConditioner(nn.Module):  # Transformer架构，独立于前面的cnn架构
     """
     Map scalar baseline (e.g. KS SFR) to (gamma, beta) for feature modulation.
@@ -612,7 +616,7 @@ class SFRConvNet(nn.Module):
     Architecture:
       1. Fourier PE of (r, θ) → fused with content channels via concatenation
       2. Stem conv to lift to base_ch
-      3. 4 residual stages with FiLM conditioning from BH mass
+      3. Optional FiLM conditioning from transformed KS-law SFR
          Each stage: ConvFiLMBlock × depth, stride-2 downsampling at stage boundaries
       4. Global average pooling → regression head → scalar output
 
@@ -634,7 +638,7 @@ class SFRConvNet(nn.Module):
         pos_max_freq: float = 64.0, # 傅里叶变换最大频率
         p_drop: float = 0.1, # dropout机制的概率
         se_reduction: int = 4, # SEBlock的通道数缩减率，控制SEBlock中隐藏层的大小，较小的reduction会增加模型容量，但也可能导致过拟合
-        use_film: bool = False, # 是否使用 FiLM 将物理定律基准(baseline)注给模型进行残差预测
+        use_film: bool = False, # If true, condition feature maps on transformed KS-law SFR. The head still predicts SFR directly, not a residual.
     ):
         """
         Args:
@@ -712,7 +716,7 @@ class SFRConvNet(nn.Module):
         x: torch.Tensor,        # (B, C_in, H, W)
         r: torch.Tensor,        # (B, 1,    H, W)
         theta: torch.Tensor,    # (B, 1,    H, W)
-        y_baseline: Optional[torch.Tensor] = None, # (B,) 可以传入基准值
+        sfr_ks_transformed: Optional[torch.Tensor] = None, # (B,) log-transformed KS-law SFR from the current snapshot
     ) -> torch.Tensor:
         # Positional features
         pos = self.posenc(r, theta, normalize=True)  # (B, D_pos, H, W)
@@ -722,8 +726,8 @@ class SFRConvNet(nn.Module):
         feat = self.stem(feat)
 
         # 生成 FiLM 参数
-        if self.use_film and y_baseline is not None:
-            gammas, betas = self.film(y_baseline)
+        if self.use_film and sfr_ks_transformed is not None:
+            gammas, betas = self.film(sfr_ks_transformed)
         else:
             gammas, betas = [None] * len(self.stages), [None] * len(self.stages)
 

@@ -801,10 +801,16 @@ class GalDataSet:
     #     return np.log10(mdot_bondi / mdot_edd)
 
     @property
-    def y_baseline(self) -> np.ndarray: # 计算基于KS定律预测的恒星形成率SFR，作为物理基准。
+    def y_baseline(self) -> np.ndarray:
+        """Deprecated legacy log view of the KS baseline.
+
+        Current SFR caches do not use this property. ``prepare_data.py`` reads
+        physical ``sfr_ks`` and applies the same configured ``transform_sfr``
+        function used for the target. Prefer ``sfr_ks`` in new code.
+        """
         self.__verify_data_loaded()
         sfr_ks_val = np.array(self._raw_data["sfr_ks"])
-        return np.log10(sfr_ks_val + 1e-9) # y_baseline = log10(sfr_ks)，添加微小数防止log(0)例外
+        return np.log10(sfr_ks_val + 1e-9)
 
     # --------- Dunder Methods -------- 重载 Python 的内置操作符或函数，让自定义对象（比如这里的 GalDataSet）能够像 Python 原生的列表或数字一样去行动。
 

@@ -26,16 +26,28 @@ from torch.utils.tensorboard import SummaryWriter
 from Experiment.models import AccretionTransformer, SFRConvNet, MACNetRes_mbh, MACNetFiLM
 
 
-MBH_ONLY_MODELS = (MACNetRes_mbh, MACNetFiLM)
+MBH_CONDITIONED_MODELS = (MACNetRes_mbh, MACNetFiLM)
 
 
-def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, y_baseline: torch.Tensor) -> torch.Tensor: # 利用model输出预测值
-    if isinstance(model, MBH_ONLY_MODELS):
-        return model(x, y_baseline)
+def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, conditioning_scalar: torch.Tensor) -> torch.Tensor:
+    """Run one batch with the conditioning scalar required by the model family.
+
+    Current SFR caches store transformed KS-law SFR. Legacy ``*_mbh`` models
+    require an explicit BH-mass cache and must not silently consume KS SFR.
+    """
+    if isinstance(model, MBH_CONDITIONED_MODELS):
+        conditioning_variable = getattr(model, "conditioning_variable", "unknown")
+        if conditioning_variable != "mbh":
+            raise RuntimeError(
+                f"{type(model).__name__} requires conditioning_variable='mbh', "
+                f"but the loaded cache provides {conditioning_variable!r}."
+            )
+        return model(x, conditioning_scalar)
     r = coord[:, 0:1]
     theta = coord[:, 1:2]
-    # 所有模型（包括SFRConvNet）都接收y_baseline，是否使用由它内部的use_film决定
-    return model(x, r, theta, y_baseline)
+    # For the current SFR pipeline this scalar is transformed KS-law SFR.
+    # SFRConvNet ignores it when use_film=False.
+    return model(x, r, theta, conditioning_scalar)
 
 
 # =============================================
@@ -127,7 +139,8 @@ class SFRSpatialAugmentor:
         return x_aug, coord_aug
     
 # =============================================
-# 1) Dataset: load .pt [x, coord, y, mbh, (Optional: y_bondi)]
+# 1) Dataset: current SFR PT format
+#    [x, coord, target_sfr, transformed_ks_sfr, groups, n_groups, time]
 # =============================================
 def _load_cache_channel_metadata(pt_path):
     pt_path = os.fspath(pt_path)
@@ -158,8 +171,8 @@ class GalPTDataset(Dataset):
             raise RuntimeError(f"Failed to load dataset cache '{pt_path}'. ") from exc
 
         if isinstance(loaded, (list, tuple)):
-            if len(loaded) >= 6: # 新版本，针对SFR：[x, coord, y, y_baseline, groups, n_groups, ...]
-                self.x, self.coord, self.y, self.y_baseline, self.groups, self.n_groups = loaded[:6]
+            if len(loaded) >= 6:
+                self.x, self.coord, self.y, self.conditioning_scalar, self.groups, self.n_groups = loaded[:6]
                 self.time = loaded[6] if len(loaded) > 6 else None
                 if len(loaded) > 7:
                     print(
@@ -192,9 +205,25 @@ class GalPTDataset(Dataset):
         self.x = _ensure_tensor(self.x, name="x").contiguous() # 强制把特征图（x，y）和坐标coord在内存中连续排列，可以大幅提升GPU读取数据的速度
         self.coord = _ensure_tensor(self.coord, name="coord").contiguous()
         self.y = _ensure_tensor(self.y, name="y").view(-1, 1) # 将目标标量强行变形为[样本数，1]的二维张量，为了和神经网络的输出形状对齐
-        self.y_baseline = _ensure_tensor(self.y_baseline, name="y_baseline").view(-1, 1) # SFR基准值
+        self.conditioning_scalar = _ensure_tensor(
+            self.conditioning_scalar, name="conditioning_scalar"
+        ).view(-1, 1)
 
         channel_metadata = _load_cache_channel_metadata(pt_path)
+        self.cache_metadata = channel_metadata
+        self.pt_path = os.fspath(pt_path)
+        self.conditioning_variable = channel_metadata.get("conditioning_variable")
+        if self.conditioning_variable is None:
+            # Compatibility with instantaneous-SFR caches created before the
+            # conditioning_variable metadata field was introduced.
+            if channel_metadata.get("target_quantity") == "instantaneous_sfr":
+                self.conditioning_variable = "sfr_ks"
+            else:
+                self.conditioning_variable = "unknown"
+        if self.conditioning_variable == "sfr_ks":
+            self.sfr_ks_transformed = self.conditioning_scalar
+        # Read-only compatibility alias for older analysis/training helpers.
+        self.y_baseline = self.conditioning_scalar
         self.input_channels = tuple(channel_metadata.get("input_channels", ()))
         self.excluded_channels = tuple(channel_metadata.get("excluded_channels", ()))
         self.target_metadata = {
@@ -222,6 +251,7 @@ class GalPTDataset(Dataset):
         if isinstance(groups_raw, np.ndarray) and groups_raw.dtype.kind in "SU": # 如果groups是字符串类型（如星系类型），则保持为numpy字符串数组，稍后在内存中转换为整数标签；否则直接转换为float32张量
             # Handle string groups
             raw_groups = groups_raw.reshape(-1, 1)
+            self.group_names = tuple(sorted(np.unique(raw_groups.astype(str)).tolist()))
             unique_groups, inv = np.unique(raw_groups, return_inverse=True)
             self.n_groups = len(unique_groups)
             self.groups = torch.from_numpy(inv).long().view(-1, 1)
@@ -238,6 +268,7 @@ class GalPTDataset(Dataset):
             unique_groups, inv = torch.unique(raw_groups, return_inverse=True)
             self.n_groups = len(unique_groups)
             self.groups = inv.long().view(-1, 1)
+            self.group_names = tuple(str(value.item()) for value in unique_groups.reshape(-1))
 
         self.augmentor = augmentor
 
@@ -249,7 +280,58 @@ class GalPTDataset(Dataset):
         coord = self.coord[idx]
         if self.augmentor is not None:
             x, coord = self.augmentor(x, coord) # 调用augmentor对特征图和坐标进行数据增强
-        return x, coord, self.y_baseline[idx], self.y[idx], self.groups[idx], self.n_groups
+        return x, coord, self.conditioning_scalar[idx], self.y[idx], self.groups[idx], self.n_groups
+
+
+def _validate_leave_one_out_cache_contract(cache_dir, data_exp, datasets):
+    """Validate new Exp2 caches against both metadata and actual PT group labels."""
+    metadata = _load_cache_channel_metadata(os.path.join(cache_dir, data_exp + "train.pt"))
+    if metadata.get("split_strategy") != "leave_one_galaxy_out":
+        return metadata
+
+    train_groups = set(metadata.get("train_groups", ()))
+    held_out_groups = set(metadata.get("held_out_groups", ()))
+    if not train_groups or len(held_out_groups) != 1:
+        raise RuntimeError(
+            "Invalid leave-one-galaxy-out metadata: expected non-empty train_groups "
+            f"and exactly one held_out_group, got {metadata}."
+        )
+    overlap = train_groups.intersection(held_out_groups)
+    if overlap:
+        raise RuntimeError(
+            f"Data leakage detected in cache metadata: train/out groups overlap: {sorted(overlap)}"
+        )
+
+    for split, dataset in datasets.items():
+        actual = set(dataset.group_names)
+        if actual != train_groups:
+            raise RuntimeError(
+                f"{split}.pt contains groups {sorted(actual)}, expected in-domain groups "
+                f"{sorted(train_groups)} from metadata."
+            )
+
+    out_path = os.path.join(cache_dir, data_exp + "out.pt")
+    if not os.path.exists(out_path):
+        raise RuntimeError(
+            f"Leave-one-galaxy-out cache is incomplete: required held-out cache not found: {out_path}"
+        )
+    out_dataset = GalPTDataset(out_path)
+    actual_out = set(out_dataset.group_names)
+    if actual_out != held_out_groups:
+        raise RuntimeError(
+            f"out.pt contains groups {sorted(actual_out)}, expected held-out groups "
+            f"{sorted(held_out_groups)} from metadata."
+        )
+    if actual_out.intersection(train_groups):
+        raise RuntimeError(
+            "Data leakage detected in actual PT data: out.pt contains a training group."
+        )
+    print(
+        "[PASS] Leave-one-galaxy-out cache contract verified: "
+        f"train/val/test={sorted(train_groups)}, out={sorted(actual_out)}"
+    )
+    del out_dataset
+    return metadata
 
 
 # =============================================
@@ -354,7 +436,11 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
         help="ConvNet stage depths as comma list (e.g., 2,2,2,2)",
     )
     parser.add_argument("--se_reduction", type=int, default=4, help="ConvNet SE reduction ratio (convnet only)") #
-    parser.add_argument("--use_film", action="store_true", help="Enable FiLM modulation with y_baseline for ConvNet") # 是否使用 sft_ks 作为基准注入模型
+    parser.add_argument(
+        "--use_film",
+        action="store_true",
+        help="Condition SFRConvNet feature maps on transformed KS-law SFR via FiLM.",
+    )
     parser.add_argument(
         "--hpo_params",
         type=str,
@@ -650,17 +736,17 @@ class WarmupCosineScheduler:
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, grad_clip=None, scheduler=None):
     model.train()
     total, n = 0.0, 0 
-    for batch in loader: # 从data里面依次提取数据(x,coord,y_baseline,y,groups)，送入模型进行训练 
+    for batch in loader: # Batch field 3 is the cache-declared conditioning scalar (KS SFR for current SFR caches).
         x = batch[0].to(device, non_blocking=True)  # (B, C_in, H, W)
         coord = batch[1].to(device, non_blocking=True)  # (B, 2, H, W)
-        y_baseline = batch[2].to(device, non_blocking=True).view(-1)  # (B,) 基准预测值
+        conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
         y = batch[3].to(device, non_blocking=True).view(-1)  # (B,) 真实SFR值
         groups = batch[4].to(device, non_blocking=True).view(-1)  # (B,)
 
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                pred = predict_batch(model, x, coord, y_baseline) # 前向传播，输出预测值
+                pred = predict_batch(model, x, coord, conditioning_scalar)
                 loss = criterion(pred, y, groups) # 根据权重函数计算加权损失值
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
@@ -671,7 +757,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, gr
             if scheduler is not None:
                 scheduler.step()
         else:
-            pred = predict_batch(model, x, coord, y_baseline)
+            pred = predict_batch(model, x, coord, conditioning_scalar)
             loss = criterion(pred, y, groups)
             loss.backward()
             if grad_clip and grad_clip > 0:
@@ -735,9 +821,9 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         for batch in loader:
             x = batch[0].to(device, non_blocking=True)
             coord = batch[1].to(device, non_blocking=True)
-            y_baseline = batch[2].to(device, non_blocking=True).view(-1)
+            conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
             y = batch[3].to(device, non_blocking=True).view(-1)
-            pred = predict_batch(model, x, coord, y_baseline)
+            pred = predict_batch(model, x, coord, conditioning_scalar)
             loss = criterion(pred, y).mean().item()
             total_loss += loss * y.size(0)
             n_samples += y.size(0)
@@ -750,11 +836,11 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
     for batch in loader:
         x = batch[0].to(device, non_blocking=True)
         coord = batch[1].to(device, non_blocking=True)
-        y_baseline = batch[2].to(device, non_blocking=True).view(-1)
+        conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
         y = batch[3].to(device, non_blocking=True).view(-1)
         groups = batch[4].view(-1).to(device=y.device, dtype=torch.long)
 
-        pred = predict_batch(model, x, coord, y_baseline)
+        pred = predict_batch(model, x, coord, conditioning_scalar)
 
         if isinstance(criterion, WeightedLoss):
             base_loss = criterion.base_criterion(pred, y)  # shape: (B, ...) or (B,)
@@ -821,13 +907,14 @@ def main(args=None):
     print(f"Using device: {device}")
     # Initialize TensorBoard writer
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S") # 根据当前时间生成一个独一无二的 TensorBoard 文件夹，准备记录即将产生的海量数据。
-    log_dir = os.path.join(args.log_dir, f"{args.exp_name}_{run_stamp}")
+    clean_exp_name = args.exp_name.rstrip("_")
+    log_dir = os.path.join(args.log_dir, f"{clean_exp_name}_{run_stamp}")
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
 
     # Datasets / Loaders
     cache_dir = args.cache_dir
-    exp = args.exp_name
+    exp = clean_exp_name
     data_exp = args.data_exp if args.data_exp else exp
 
     train_augmentor = SFRSpatialAugmentor(p_flip=args.sfr_aug_prob, p_rot=args.sfr_aug_prob) # 加入数据增强Augmentor
@@ -835,6 +922,11 @@ def main(args=None):
     train_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "train.pt"), augmentor=train_augmentor) # 训练集
     val_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "val.pt")) # 验证集
     test_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "test.pt")) # 测试集
+    cache_split_metadata = _validate_leave_one_out_cache_contract(
+        cache_dir,
+        data_exp,
+        {"train": train_ds, "val": val_ds, "test": test_ds},
+    )
 
     channel_counts = {int(ds.x.shape[1]) for ds in (train_ds, val_ds, test_ds)}
     if len(channel_counts) != 1:
@@ -860,6 +952,30 @@ def main(args=None):
             "This SFR training path requires target_quantity='instantaneous_sfr'; "
             f"got {train_ds.target_metadata.get('target_quantity')!r}."
         )
+    conditioning_variables = {
+        ds.conditioning_variable for ds in (train_ds, val_ds, test_ds)
+    }
+    if len(conditioning_variables) != 1:
+        raise RuntimeError(
+            "Train/validation/test caches use inconsistent conditioning variables: "
+            f"{sorted(conditioning_variables)}"
+        )
+    conditioning_variable = next(iter(conditioning_variables))
+    if args.model_type in {"resnet", "resfilm"} and conditioning_variable != "mbh":
+        raise RuntimeError(
+            f"Model type {args.model_type!r} is a legacy BH-mass-conditioned model, "
+            f"but cache {data_exp!r} provides {conditioning_variable!r}."
+        )
+    if args.model_type == "convnet" and args.use_film and conditioning_variable != "sfr_ks":
+        raise RuntimeError(
+            "SFRConvNet FiLM requires conditioning_variable='sfr_ks'; "
+            f"got {conditioning_variable!r}."
+        )
+    print(
+        "Conditioning: "
+        f"variable={conditioning_variable}, "
+        f"FiLM={'enabled' if args.use_film else 'disabled'}"
+    )
     if train_ds.input_channels:
         print(f"Input channels ({len(train_ds.input_channels)}): {', '.join(train_ds.input_channels)}")
     else:
@@ -928,6 +1044,7 @@ def main(args=None):
             se_reduction=args.se_reduction,
             use_film=args.use_film, # 传入命令行控制的 FiLM 参数
         ).to(device)
+    model.conditioning_variable = conditioning_variable
 
     try:
         model.eval()
@@ -935,9 +1052,9 @@ def main(args=None):
         with torch.no_grad():
             # Use a tiny temp loader with 0 workers to fetch a sample for the graph
             temp_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0)
-            sample_x, sample_coord, sample_y_baseline, _, _, _ = next(iter(temp_loader))
-            if isinstance(model, MBH_ONLY_MODELS):
-                writer.add_graph(model, (sample_x.to(device), sample_y_baseline.view(-1).to(device)))
+            sample_x, sample_coord, sample_conditioning_scalar, _, _, _ = next(iter(temp_loader))
+            if isinstance(model, MBH_CONDITIONED_MODELS):
+                writer.add_graph(model, (sample_x.to(device), sample_conditioning_scalar.view(-1).to(device)))
             elif isinstance(model, SFRConvNet):
                 writer.add_graph(
                     model,
@@ -945,7 +1062,7 @@ def main(args=None):
                         sample_x.to(device),
                         sample_coord[:, 0:1].to(device),
                         sample_coord[:, 1:2].to(device),
-                        sample_y_baseline.view(-1).to(device),
+                        sample_conditioning_scalar.view(-1).to(device),
                     ),
                 )
             else:
@@ -955,7 +1072,7 @@ def main(args=None):
                         sample_x.to(device),
                         sample_coord[:, 0:1].to(device),
                         sample_coord[:, 1:2].to(device),
-                        sample_y_baseline.view(-1).to(device),
+                        sample_conditioning_scalar.view(-1).to(device),
                     ),
                 )
     except Exception as exc:
@@ -998,7 +1115,7 @@ def main(args=None):
 
     # Save dirs
     if not args.no_save:
-        save_dir = os.path.join("Results", f"{exp}{run_stamp}")
+        save_dir = os.path.join("Results", f"{exp}_{run_stamp}")
         os.makedirs(save_dir, exist_ok=True)
         hyperparams_path = os.path.join(save_dir, "hyperparameters.json")
         hyperparams = vars(args).copy()
@@ -1012,12 +1129,14 @@ def main(args=None):
                 "input_channels": list(train_ds.input_channels),
                 "excluded_channels": list(train_ds.excluded_channels),
                 "target_metadata": train_ds.target_metadata,
+                "conditioning_variable": conditioning_variable,
+                "data_split_metadata": cache_split_metadata,
                 **train_ds.target_metadata,
             }
         )
         with open(hyperparams_path, "w", encoding="utf-8") as f:
             json.dump(hyperparams, f, indent=2, sort_keys=True)
-        best_path = os.path.join(save_dir, f"{exp}best_model.pth")
+        best_path = os.path.join(save_dir, f"{exp}_best_model.pth")
     else:
         save_dir = None
         best_path = None
@@ -1070,6 +1189,8 @@ def main(args=None):
                         "input_channels": list(train_ds.input_channels),
                         "excluded_channels": list(train_ds.excluded_channels),
                         "target_metadata": train_ds.target_metadata,
+                        "conditioning_variable": conditioning_variable,
+                        "data_split_metadata": cache_split_metadata,
                     },
                     best_path,
                 )

@@ -306,8 +306,8 @@ class CachedPTDataset:
         if "includes_zero_targets" in channel_metadata:
             self.target_metadata["includes_zero_targets"] = bool(channel_metadata["includes_zero_targets"])
 
-        # Current cache format from prepare_data.py:
-        # (x, coord, y, y_baseline, groups, n_groups, time)
+        # Current SFR cache format from prepare_data.py:
+        # (x, coord, target_sfr, transformed_ks_sfr, groups, n_groups, time)
         if len(items) >= 7 and isinstance(items[1], (torch.Tensor, np.ndarray)) and np.asarray(items[1]).ndim >= 2:
             self.x, self.coord, self.y, self.y_baseline, self.groups, self.n_groups, self.time = items[:7]
             self.kind = "vit"
@@ -331,6 +331,17 @@ class CachedPTDataset:
         self.y = ensure_tensor(self.y).view(-1, 1)
         self.y_baseline = ensure_tensor(self.y_baseline).view(-1, 1) if self.y_baseline is not None else None
         self.baseline = self.y_baseline
+        self.conditioning_scalar = self.y_baseline
+        self.conditioning_variable = channel_metadata.get("conditioning_variable")
+        if self.conditioning_variable is None:
+            # Compatibility with instantaneous-SFR caches created before this
+            # field was recorded explicitly.
+            if channel_metadata.get("target_quantity") == "instantaneous_sfr":
+                self.conditioning_variable = "sfr_ks"
+            else:
+                self.conditioning_variable = "unknown"
+        if self.conditioning_variable == "sfr_ks":
+            self.sfr_ks_transformed = self.conditioning_scalar
         self.time = ensure_tensor(self.time) if self.time is not None else None
 
         if self.groups is not None:
@@ -436,8 +447,13 @@ class HDF5Dataset:
             "floor": float(self.target_metadata["floor"]),
         }
         self.y = transform_sfr(loaded.sfr_target, **transform_options)
+        # This is the transformed KS-law SFR conditioner used by SFRConvNet
+        # when use_film=True; it is not black-hole mass.
         self.y_baseline = transform_sfr(loaded.sfr_ks, **transform_options)
         self.baseline = self.y_baseline
+        self.conditioning_scalar = self.y_baseline
+        self.conditioning_variable = "sfr_ks"
+        self.sfr_ks_transformed = self.y_baseline
         self.time = loaded.time
         self.mdot_edd = np.array(loaded._raw_data["mdot_edd"]) if "mdot_edd" in loaded._raw_data else None
         self.sfr_target = loaded.sfr_target
@@ -467,6 +483,13 @@ def load_analysis_model(model_path, device, datasets_dict=None):
                 loaded_params = json.load(f)
         except:
             pass
+    conditioning_variable = (
+        state.get("conditioning_variable") if isinstance(state, dict) else None
+    ) or loaded_params.get("conditioning_variable")
+    if conditioning_variable is None and loaded_params.get("target_quantity") == "instantaneous_sfr":
+        # Compatibility with SFR checkpoints created before this metadata was
+        # saved explicitly. Their PT fourth field is transformed KS-law SFR.
+        conditioning_variable = "sfr_ks"
 
     # Infer Type
     model_type = "macnet"
@@ -594,6 +617,12 @@ def load_analysis_model(model_path, device, datasets_dict=None):
             se_reduction = loaded_params.get("se_reduction", se_reduction)
             use_film = loaded_params.get("use_film", use_film)
 
+        if use_film and conditioning_variable != "sfr_ks":
+            raise RuntimeError(
+                "SFRConvNet checkpoint enables FiLM but does not declare the expected "
+                f"conditioning_variable='sfr_ks' (got {conditioning_variable!r})."
+            )
+
         model = SFRConvNet(
             c_in=in_ch,
             base_ch=base_ch,
@@ -606,8 +635,18 @@ def load_analysis_model(model_path, device, datasets_dict=None):
         ).to(device)
 
     elif model_type == "resfilm":
+        if conditioning_variable == "sfr_ks":
+            raise RuntimeError(
+                "MACNetFiLM is a legacy BH-mass-conditioned model and cannot be "
+                "loaded with an SFR cache whose conditioning variable is 'sfr_ks'."
+            )
         model = MACNetFiLM(in_channels=in_ch).to(device)
     else:
+        if conditioning_variable == "sfr_ks":
+            raise RuntimeError(
+                "MACNetRes_mbh is a legacy BH-mass-conditioned model and cannot be "
+                "loaded with an SFR cache whose conditioning variable is 'sfr_ks'."
+            )
         model = MACNetRes_mbh(in_channels=in_ch).to(device)
 
     try:
@@ -618,6 +657,7 @@ def load_analysis_model(model_path, device, datasets_dict=None):
         ) from exc
 
     model.eval()
+    model.conditioning_variable = conditioning_variable or "unknown"
     model.input_channels = checkpoint_channels or dataset_channels
     model.target_metadata = checkpoint_target_metadata
     return model, model_type
@@ -637,7 +677,20 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
         return (empty_df, None, None) if return_feats else empty_df
 
     x_data = ensure_numpy(x_all)
-    baseline_all = ensure_tensor(getattr(ds, "y_baseline", None))
+    conditioning_all = ensure_tensor(
+        getattr(ds, "conditioning_scalar", getattr(ds, "y_baseline", None))
+    )
+    dataset_conditioning = getattr(ds, "conditioning_variable", "unknown")
+    model_conditioning = getattr(model, "conditioning_variable", "unknown")
+    if (
+        dataset_conditioning != "unknown"
+        and model_conditioning != "unknown"
+        and dataset_conditioning != model_conditioning
+    ):
+        raise RuntimeError(
+            "Model and dataset conditioning semantics differ: "
+            f"model={model_conditioning!r}, dataset={dataset_conditioning!r}."
+        )
     coord_all = ensure_tensor(ds.coord) if getattr(ds, "coord", None) is not None else None
 
     total = len(ds)
@@ -670,15 +723,19 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
         for start in range(0, total, bs):
             end = min(start + bs, total)
             x_batch = x_all[start:end].to(device)
-            baseline_batch = baseline_all[start:end].to(device).view(-1) if baseline_all is not None else None
+            conditioning_batch = (
+                conditioning_all[start:end].to(device).view(-1)
+                if conditioning_all is not None
+                else None
+            )
 
             if model_type in ["vit", "convnet"]:
                 if coord_all is None:
                     raise ValueError(f"Model type '{model_type}' requires coordinate inputs, but dataset has no coords.")
                 c_batch = coord_all[start:end].to(device)
-                y_out = model(x_batch, c_batch[:, 0:1], c_batch[:, 1:2], baseline_batch)
+                y_out = model(x_batch, c_batch[:, 0:1], c_batch[:, 1:2], conditioning_batch)
             else:
-                y_out = model(x_batch, baseline_batch)
+                y_out = model(x_batch, conditioning_batch)
             preds.append(y_out.cpu().view(-1))
     finally:
         if hook_handle:
@@ -862,7 +919,7 @@ def plot_error_dist(df, title, fig_dir, model_label="Model"):
     plt.title(f"Error Distribution: {title}")
     plt.ylabel("Error (target-transform units)")
     plt.xticks(rotation=45, ha="right")
-    save_plot(plt, f"violin_{title.replace(' ', '_').lower()}", fig_dir)
+    save_plot(plt, f"error_dist_{title.replace(' ', '_').lower()}", fig_dir)
     plt.show()
 
 
@@ -992,7 +1049,11 @@ def get_metrics_summary(y_true, y_pred, name=""):
     except:
 
         def r2_score(t, p):
-            return 1 - np.sum((t - p) ** 2) / np.sum((t - np.mean(t)) ** 2)
+            residual = np.sum((t - p) ** 2)
+            total = np.sum((t - np.mean(t)) ** 2)
+            if total == 0:
+                return 1.0 if residual == 0 else 0.0
+            return 1 - residual / total
 
     d = y_true - y_pred
     return {
@@ -1000,5 +1061,5 @@ def get_metrics_summary(y_true, y_pred, name=""):
         "RMSE": np.sqrt(np.mean(d**2)),
         "MAE": np.mean(np.abs(d)),
         "R2": r2_score(y_true, y_pred),
-        "OutlierFrac (|target error|>1)": np.mean(np.abs(d) > 1.0) * 100,
+        "OutlierFrac (|target error|>1)": np.mean(np.abs(d) > 1.0),
     }

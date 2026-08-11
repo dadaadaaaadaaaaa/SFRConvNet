@@ -6,6 +6,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import torch
 import numpy as np
@@ -116,7 +117,9 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
             scale=target_scale,
             floor=target_floor,
         )
-        y_baseline = transform_sfr(
+        # The fourth PT field is the transformed KS-law SFR. It is not mbh.
+        # SFRConvNet may use this scalar as a FiLM conditioner when use_film=True.
+        sfr_ks_transformed = transform_sfr(
             data.sfr_ks,
             transform=target_transform,
             scale=target_scale,
@@ -127,8 +130,7 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                 x,
                 data.coordinate,
                 y,
-                # data.mbh,
-                y_baseline,
+                sfr_ks_transformed,
                 data.groups,
                 data.n_groups,
                 data.time,
@@ -151,6 +153,7 @@ def _save_norm_stats(
     target_floor=1e-9,
     includes_zero_targets=True,
     oversample_groups=True,
+    split_metadata=None,
 ): # 接收CachePt处理训练集时算出来的mean和std，打包保存成npz文件
     norm_path = f"{save_path}norm.npz"
     channel_names = np.asarray(tuple(input_channels), dtype=str)
@@ -172,7 +175,20 @@ def _save_norm_stats(
         "includes_zero_targets": bool(includes_zero_targets),
         "oversample_groups": bool(oversample_groups),
         "group_balance": "oversample" if oversample_groups else "none",
+        # Describes the fourth tensor stored in every current SFR PT cache.
+        "conditioning_variable": "sfr_ks",
+        "conditioning_transform": target_transform,
     }
+    if split_metadata:
+        overlap = set(split_metadata.get("train_groups", ())).intersection(
+            split_metadata.get("held_out_groups", ())
+        )
+        if overlap:
+            raise ValueError(
+                "Refusing to save invalid split metadata: train_groups and "
+                f"held_out_groups overlap: {sorted(overlap)}"
+            )
+        metadata.update(split_metadata)
     np.savez(
         norm_path,
         mean=mean,
@@ -190,6 +206,8 @@ def _save_norm_stats(
         includes_zero_targets=np.asarray(metadata["includes_zero_targets"]),
         oversample_groups=np.asarray(metadata["oversample_groups"]),
         group_balance=np.asarray(metadata["group_balance"]),
+        conditioning_variable=np.asarray(metadata["conditioning_variable"]),
+        conditioning_transform=np.asarray(metadata["conditioning_transform"]),
     )
     metadata_path = f"{save_path}metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -214,6 +232,103 @@ def _parse_bool(value):
     raise argparse.ArgumentTypeError(
         f"Expected a boolean value (true/false), got {value!r}."
     )
+
+
+def _parse_experiment_tokens(values):
+    """Normalize CLI values such as ``exp1 exp2`` or ``exp1,exp2``."""
+    normalized = []
+    for value in values or ():
+        for token in str(value).split(","):
+            token = token.strip().lower()
+            if not token:
+                continue
+            match = re.fullmatch(r"(?:exp)?([1-4])", token)
+            if not match:
+                raise argparse.ArgumentTypeError(
+                    f"Unsupported experiment {token!r}; choose exp1, exp2, exp3, or exp4."
+                )
+            name = f"exp{match.group(1)}"
+            if name not in normalized:
+                normalized.append(name)
+    return tuple(normalized)
+
+
+def _slugify_group_name(group_name: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", str(group_name)).strip("_")
+    if not slug:
+        raise ValueError(f"Cannot construct a cache name from group {group_name!r}.")
+    return slug
+
+
+def _valid_group_paths(folder_paths):
+    """Return configured groups that currently contain at least one HDF5 cache."""
+    valid = []
+    skipped = []
+    for entry in folder_paths:
+        path, group_name = entry
+        has_h5 = os.path.isdir(path) and any(
+            name.lower().endswith(".h5") for name in os.listdir(path)
+        )
+        if has_h5:
+            valid.append([os.path.abspath(path), str(group_name)])
+        else:
+            skipped.append([os.path.abspath(path), str(group_name)])
+    return valid, skipped
+
+
+def _normalize_held_out_names(requested_names, valid_group_names):
+    """Resolve nicknames (``fiducial_4``) or full group names unambiguously."""
+    valid_group_names = tuple(valid_group_names)
+    resolved = []
+    for requested in requested_names or ():
+        requested = str(requested).strip()
+        if not requested:
+            continue
+        candidates = [requested]
+        if not requested.startswith("disk_galaxy_"):
+            candidates.append(f"disk_galaxy_{requested}")
+        match = next((name for name in candidates if name in valid_group_names), None)
+        if match is None:
+            raise ValueError(
+                f"Requested held-out galaxy {requested!r} is not available. "
+                f"Valid groups: {list(valid_group_names)}"
+            )
+        if match not in resolved:
+            resolved.append(match)
+    return tuple(resolved)
+
+
+def _cache_groups(cache: CachePt) -> tuple[str, ...]:
+    return tuple(sorted({str(group) for group in cache.dataset.groups.tolist()}))
+
+
+def _assert_logo_partition(train_cache, val_cache, test_cache, out_cache, *, train_groups, held_out_group):
+    """Adversarial split check using the actual samples, not only requested paths."""
+    expected_train = set(train_groups)
+    expected_out = {held_out_group}
+    actual = {
+        "train": set(_cache_groups(train_cache)),
+        "val": set(_cache_groups(val_cache)),
+        "test": set(_cache_groups(test_cache)),
+        "out": set(_cache_groups(out_cache)),
+    }
+    for split in ("train", "val", "test"):
+        if actual[split] != expected_train:
+            raise RuntimeError(
+                f"Invalid leave-one-galaxy-out fold: {split} groups {sorted(actual[split])} "
+                f"do not equal expected in-domain groups {sorted(expected_train)}."
+            )
+    if actual["out"] != expected_out:
+        raise RuntimeError(
+            f"Invalid leave-one-galaxy-out fold: out groups {sorted(actual['out'])} "
+            f"do not equal held-out group {held_out_group!r}."
+        )
+    overlap = expected_train.intersection(actual["out"])
+    if overlap:
+        raise RuntimeError(
+            f"Data leakage detected: held-out groups overlap training groups: {sorted(overlap)}"
+        )
+    return actual
 
 
 def _cache_prefix(experiment_number: int, cache_tag: str) -> str:
@@ -260,7 +375,35 @@ def _parse_args():
     parser.add_argument(
         "--only-exp1",
         action="store_true",
-        help="Prepare only Exp1 caches; useful for feature-ablation runs.",
+        help="Deprecated compatibility alias for --experiments exp1.",
+    )
+    parser.add_argument(
+        "--experiments",
+        nargs="+",
+        default=None,
+        metavar="EXP",
+        help=(
+            "Experiments to prepare, for example --experiments exp2 or "
+            "--experiments exp1 exp2. Defaults to exp1-exp4 for backward compatibility."
+        ),
+    )
+    parser.add_argument(
+        "--experiment",
+        action="append",
+        default=None,
+        metavar="EXP",
+        help="Repeatable singular alias, for example --experiment exp3 --experiment exp4.",
+    )
+    parser.add_argument(
+        "--held-out-galaxy",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Limit Exp2 folds to one or more galaxies. Accepts a nickname such as "
+            "fiducial_4 or a full name such as disk_galaxy_fiducial_4. "
+            "Omit to generate one fold for every available disk galaxy."
+        ),
     )
     parser.add_argument(
         "--oversample",
@@ -282,6 +425,15 @@ def _parse_args():
         parser.error("--target-floor must be positive.")
     if args.exclude_channels and not args.cache_tag:
         parser.error("--cache-tag is required when --exclude-channels is used, to avoid overwriting old caches.")
+    try:
+        requested = _parse_experiment_tokens((args.experiments or []) + (args.experiment or []))
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+    if args.only_exp1:
+        if requested and requested != ("exp1",):
+            parser.error("--only-exp1 cannot be combined with experiments other than exp1.")
+        requested = ("exp1",)
+    args.experiments = requested or ("exp1", "exp2", "exp3", "exp4")
     return args
 
 
@@ -298,7 +450,220 @@ def get_folder_paths(configs_path, gal_type, resolution): # 读取config文件�
     return folder_abs_paths
 
 
-# Define global paths for external imports (e.g. by notebooks) 
+def _prepare_random_snapshot_experiment(
+    experiment_number,
+    folder_paths,
+    *,
+    args,
+    load_options,
+    transform_options,
+    train_balance,
+    split_label="random_snapshot_within_group",
+):
+    """Prepare the legacy in-domain 60/20/20 reference split."""
+    valid_paths, skipped_paths = _valid_group_paths(folder_paths)
+    if not valid_paths:
+        raise ValueError(f"Experiment {experiment_number} has no valid HDF5 groups.")
+    if skipped_paths:
+        print(f"  [INFO] Ignoring {len(skipped_paths)} configured groups without processed HDF5 data.")
+
+    cache = CachePt().load(valid_paths, **load_options)
+    train_cache, val_cache, test_cache = cache.split(
+        train_size=0.6,
+        validation_size=0.2,
+        stratify="groups",
+        random_state=args.seed,
+    )
+    np.random.seed(args.seed + int(experiment_number) * 1000)
+    train_cache = train_cache.process(balance=train_balance)
+    val_cache = val_cache.process()
+    test_cache = test_cache.process()
+
+    group_names = [entry[1] for entry in valid_paths]
+    split_groups = {
+        "train": list(_cache_groups(train_cache)),
+        "val": list(_cache_groups(val_cache)),
+        "test": list(_cache_groups(test_cache)),
+    }
+    print(f"  Training set size:   {len(train_cache)}")
+    print(f"  Validation set size: {len(val_cache)}")
+    print(f"  Testing set size:    {len(test_cache)}")
+
+    save_path = os.path.join(".cache", _cache_prefix(experiment_number, args.cache_tag))
+    mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+    _save_norm_stats(
+        save_path,
+        mean,
+        std,
+        input_channels=train_cache.input_channels,
+        excluded_channels=args.exclude_channels,
+        target_metadata=train_cache.dataset.target_metadata,
+        includes_zero_targets=not args.drop_zero_targets,
+        oversample_groups=args.oversample,
+        split_metadata={
+            "experiment": f"exp{experiment_number}",
+            "split_strategy": split_label,
+            "split_seed": int(args.seed),
+            "oversample_seed": int(args.seed + int(experiment_number) * 1000),
+            "available_groups": group_names,
+            "train_groups": group_names,
+            "held_out_groups": [],
+            "split_groups": split_groups,
+            "group_paths": {entry[1]: entry[0] for entry in valid_paths},
+            "sample_counts": {
+                "train": len(train_cache),
+                "val": len(val_cache),
+                "test": len(test_cache),
+                "out": 0,
+            },
+            "cache_prefix": os.path.basename(save_path),
+        },
+        **transform_options,
+    )
+    val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
+    test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
+    return save_path
+
+
+def _prepare_exp2_logo_folds(
+    folder_paths,
+    *,
+    args,
+    load_options,
+    transform_options,
+    train_balance,
+):
+    """Generate one cache quartet per held-out disk galaxy."""
+    valid_paths, skipped_paths = _valid_group_paths(folder_paths)
+    valid_groups = tuple(entry[1] for entry in valid_paths)
+    if skipped_paths:
+        print("  Ignoring configured groups without processed HDF5 data:")
+        for path, group in skipped_paths:
+            print(f"    - {group}: {path}")
+    if len(valid_paths) < 2:
+        raise ValueError(
+            "Exp2 leave-one-galaxy-out requires at least two available processed galaxies; "
+            f"found {list(valid_groups)}."
+        )
+
+    requested = _normalize_held_out_names(args.held_out_galaxy, valid_groups)
+    held_out_groups = requested or valid_groups
+    base_prefix = _cache_prefix(2, args.cache_tag)
+    folds = []
+
+    for held_out_group in held_out_groups:
+        held_out_entry = next(entry for entry in valid_paths if entry[1] == held_out_group)
+        in_entries = [entry for entry in valid_paths if entry[1] != held_out_group]
+        in_groups = tuple(entry[1] for entry in in_entries)
+        fold_index = valid_groups.index(held_out_group)
+        fold_name = f"LOO_{_slugify_group_name(held_out_group)}"
+        save_path = os.path.join(".cache", f"{base_prefix}{fold_name}_")
+
+        print("\n" + "=" * 72)
+        print(f"Processing Exp2 fold: {fold_name}")
+        print(f"  In-domain groups: {list(in_groups)}")
+        print(f"  Held-out group:   {held_out_group}")
+
+        cache_in = CachePt().load(in_entries, **load_options)
+        train_cache, val_cache, test_cache = cache_in.split(
+            train_size=0.6,
+            validation_size=0.2,
+            stratify="groups",
+            random_state=args.seed,
+        )
+        # A fold-specific seed makes manual single-fold preparation identical
+        # to the same fold produced as part of an exhaustive run.
+        oversample_seed = int(args.seed + fold_index)
+        np.random.seed(oversample_seed)
+        train_cache = train_cache.process(balance=train_balance)
+        val_cache = val_cache.process()
+        test_cache = test_cache.process()
+        cache_out = CachePt().load([held_out_entry], **load_options).process()
+
+        actual_groups = _assert_logo_partition(
+            train_cache,
+            val_cache,
+            test_cache,
+            cache_out,
+            train_groups=in_groups,
+            held_out_group=held_out_group,
+        )
+        print("  [PASS] Actual train/val/test groups are disjoint from the held-out group.")
+        print(f"  Training set size:                 {len(train_cache)}")
+        print(f"  Validation set size:               {len(val_cache)}")
+        print(f"  In-distribution test set size:      {len(test_cache)}")
+        print(f"  Held-out galaxy test set size:      {len(cache_out)}")
+
+        mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+        split_metadata = {
+            "experiment": "exp2",
+            "split_strategy": "leave_one_galaxy_out",
+            "split_seed": int(args.seed),
+            "fold_name": fold_name,
+            "fold_index": fold_index,
+            "n_folds": len(valid_groups),
+            "oversample_seed": oversample_seed,
+            "available_groups": list(valid_groups),
+            "train_groups": list(in_groups),
+            "in_domain_groups": list(in_groups),
+            "in_distribution_test_groups": list(in_groups),
+            "held_out_group": held_out_group,
+            "held_out_groups": [held_out_group],
+            "out_groups": [held_out_group],
+            "split_groups": {key: sorted(value) for key, value in actual_groups.items()},
+            "group_paths": {entry[1]: entry[0] for entry in valid_paths},
+            "raw_in_domain_groups": list(in_groups),
+            "raw_held_out_groups": [held_out_group],
+            "sample_counts": {
+                "train": len(train_cache),
+                "val": len(val_cache),
+                "test": len(test_cache),
+                "out": len(cache_out),
+            },
+            "cache_prefix": os.path.basename(save_path),
+        }
+        _save_norm_stats(
+            save_path,
+            mean,
+            std,
+            input_channels=train_cache.input_channels,
+            excluded_channels=args.exclude_channels,
+            target_metadata=train_cache.dataset.target_metadata,
+            includes_zero_targets=not args.drop_zero_targets,
+            oversample_groups=args.oversample,
+            split_metadata=split_metadata,
+            **transform_options,
+        )
+        val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
+        test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
+        cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
+        folds.append(split_metadata)
+
+    manifest_path = os.path.join(".cache", f"{base_prefix}folds.json")
+    manifest = {
+        "format_version": 1,
+        "experiment": "exp2",
+        "split_strategy": "leave_one_galaxy_out",
+        "available_groups": list(valid_groups),
+        "requested_held_out_groups": list(requested),
+        "fold_count": len(folds),
+        "folds": [
+            {
+                "fold_name": fold["fold_name"],
+                "cache_prefix": fold["cache_prefix"],
+                "train_groups": fold["train_groups"],
+                "held_out_groups": fold["held_out_groups"],
+            }
+            for fold in folds
+        ],
+    }
+    with open(manifest_path, "w", encoding="utf-8") as file:
+        json.dump(manifest, file, indent=2)
+    print(f"\n[INFO] Saved Exp2 fold manifest: {manifest_path}")
+    return manifest_path
+
+
+# Define global paths for external imports (e.g. by notebooks)
 try:
     _resolution = "coarse"
     _configs_dir = ".config"
@@ -334,158 +699,66 @@ if __name__ == "__main__":
     exp_eg_folder_paths = Exp_eg_folder_paths # 特定分辨率的椭圆星系的路径
     exp_dg_folder_paths = Exp_dg_folder_paths # 特定分辨率的盘状星系的路径
 
-    exp_all_folder_paths = exp_eg_folder_paths + exp_dg_folder_paths # 所有星系的路径
+    print(f"Requested experiments: {', '.join(args.experiments)}")
 
-    # ==========================================
-    # Modifications for SFR Architecture
-    # ==========================================
-    # As SFR (Star Formation Rate) physics model is highly relevant and tailored to Disk Galaxies with gas disks.
-    # We will exclude Elliptical Galaxies from standard training pools to prevent physical domain confusion.
-
-    # 1. Main Default Experiment (Exp1_) - Disk Galaxies Only (Fiducial setup)
-    print("Processing Experiment 1 (Disk Galaxies)...")
-    save_path = os.path.join(".cache", _cache_prefix(1, args.cache_tag))
-    cache = CachePt().load(exp_dg_folder_paths, **load_options)
-    train_cache, val_cache, test_cache = cache.split(
-        train_size=0.6,
-        validation_size=0.2,
-        stratify="groups",
-        random_state=args.seed,
-    )
-    
-    train_cache = train_cache.process(balance=train_balance)
-    val_cache = val_cache.process()
-    test_cache = test_cache.process()
-    
-    print(f"  Training set size:   {len(train_cache)}")
-    print(f"  Validation set size: {len(val_cache)}")
-    print(f"  Testing set size:    {len(test_cache)}")
-
-    mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
-    _save_norm_stats(
-        save_path,
-        mean,
-        std,
-        input_channels=train_cache.input_channels,
-        excluded_channels=excluded_channels,
-        target_metadata=train_cache.dataset.target_metadata,
-        includes_zero_targets=include_zero_targets,
-        oversample_groups=args.oversample,
-        **transform_options,
-    )
-    val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
-    test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
-
-    if args.only_exp1:
-        print("[INFO] --only-exp1 requested; skipping Experiments 2-4.")
-        sys.exit(0)
-
-    import random
-
-    # 2. Generalization Experiment (Exp2_) - In/Out Sample on Disk Galaxies
-    # (Hold out one disk galaxy to test generalization)
-    exp_dg_folder_paths_in = exp_dg_folder_paths.copy()
-    
-    if len(exp_dg_folder_paths_in) > 1:
-        # 随机剔除一个盘星系作为留出集（设定固定随机种子以保证复现性与缓存一致）
-        random.seed(42)
-        held_out_idx = random.randint(0, len(exp_dg_folder_paths_in) - 1)
-        held_out_dg = exp_dg_folder_paths_in.pop(held_out_idx)
-        exp_dg_folder_paths_out = [held_out_dg]
-        
-        print(f"Processing Experiment 2 (Disk Galaxies Generalization: Hold-out test)...")
-        print(f"  Hold-out Galaxy: {held_out_dg[1]}")
-        save_path = os.path.join(".cache", _cache_prefix(2, args.cache_tag))
-        
-        try:
-            cache_in = CachePt().load(exp_dg_folder_paths_in, **load_options)
-            train_cache, val_cache, test_cache = cache_in.split(
-                train_size=0.6,
-                validation_size=0.2,
-                stratify="groups",
-                random_state=args.seed,
-            )
-
-            train_cache = train_cache.process(balance=train_balance)
-            val_cache = val_cache.process()
-            test_cache = test_cache.process()
-            
-            print(f"  Training set size:   {len(train_cache)}")
-            print(f"  Validation set size: {len(val_cache)}")
-            print(f"  Testing set size:    {len(test_cache)}")
-
-            mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
-            _save_norm_stats(
-                save_path,
-                mean,
-                std,
-                input_channels=train_cache.input_channels,
-                excluded_channels=excluded_channels,
-                target_metadata=train_cache.dataset.target_metadata,
-                includes_zero_targets=include_zero_targets,
-                oversample_groups=args.oversample,
-                **transform_options,
-            )
-            val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
-            test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
-
-            # Process out-of-distribution (held out) test set
-            cache_out = CachePt().load(exp_dg_folder_paths_out, **load_options)
-            cache_out = cache_out.process()
-            print(f"  Out-set size (Generalization): {len(cache_out)}")
-            cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
-        except ValueError as e:
-            print(f"  [Skip] Skipped Experiment 2: {e}")
-    else:
-        print("[Skip] Not enough Disk Galaxies to do hold-out Exp2_")
-
-    # Create disk galaxies without low-res data
-    exp_dg_folder_paths_nolow = exp_dg_folder_paths.copy() # 实验3：测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
-    try:
-        if len(exp_dg_folder_paths_nolow) > 5:
-            exp_dg_folder_paths_nolow.pop(5)
-        print(f"Processing Experiment 3...")
-        save_path = os.path.join(".cache", _cache_prefix(3, args.cache_tag))
-        cache = CachePt().load(exp_dg_folder_paths_nolow, **load_options)
-        train_cache, val_cache, test_cache = cache.split(
-            train_size=0.6,
-            validation_size=0.2,
-            stratify="groups",
-            random_state=args.seed,
+    # Exp1 remains the in-domain random-snapshot reference experiment.
+    if "exp1" in args.experiments:
+        print("\nProcessing Experiment 1 (in-domain random snapshot split)...")
+        _prepare_random_snapshot_experiment(
+            1,
+            exp_dg_folder_paths,
+            args=args,
+            load_options=load_options,
+            transform_options=transform_options,
+            train_balance=train_balance,
         )
-        train_cache = train_cache.process(balance=train_balance)
-        val_cache = val_cache.process()
-        test_cache = test_cache.process()
-        print(f"  Training set size:   {len(train_cache)}")
-        print(f"  Validation set size: {len(val_cache)}")
-        print(f"  Testing set size:    {len(test_cache)}")
-        mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
-        _save_norm_stats(
-            save_path,
-            mean,
-            std,
-            input_channels=train_cache.input_channels,
-            excluded_channels=excluded_channels,
-            target_metadata=train_cache.dataset.target_metadata,
-            includes_zero_targets=include_zero_targets,
-            oversample_groups=args.oversample,
-            **transform_options,
-        )
-        val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
-        test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
-    except Exception as e:
-        print(f"  [Skip] Skipped Experiment 3: {e}")
 
-    # Create in- and out-datasets for disk galaxies without low-res data
-    print(f"Processing Experiment 4...") # 实验4：在实验2的基础上，测试强行剔除低分辨率数据后，模型预测的精度会不会有提升
-    save_path = os.path.join(".cache", _cache_prefix(4, args.cache_tag))
-    exp_dg_folder_paths_nolow_in = exp_dg_folder_paths_nolow.copy()
-    
-    try:
-        exp_dg_folder_paths_nolow_in.pop(2)
-        exp_dg_folder_paths_nolow_out = [exp_dg_folder_paths_nolow[2]]
-        
-        cache_in = CachePt().load(exp_dg_folder_paths_nolow_in, **load_options)
+    # Exp2 is now exhaustive leave-one-galaxy-out over available HDF5 groups.
+    if "exp2" in args.experiments:
+        print("\nProcessing Experiment 2 (leave-one-galaxy-out)...")
+        _prepare_exp2_logo_folds(
+            exp_dg_folder_paths,
+            args=args,
+            load_options=load_options,
+            transform_options=transform_options,
+            train_balance=train_balance,
+        )
+
+    # Preserve legacy Exp3 semantics while making selection explicit.
+    if "exp3" in args.experiments:
+        print("\nProcessing Experiment 3...")
+        exp3_paths = [entry for entry in exp_dg_folder_paths if entry[1] != "disk_galaxy_low"]
+        _prepare_random_snapshot_experiment(
+            3,
+            exp3_paths,
+            args=args,
+            load_options=load_options,
+            transform_options=transform_options,
+            train_balance=train_balance,
+            split_label="random_snapshot_without_low_resolution_group",
+        )
+
+    # Preserve legacy Exp4's configured third-group holdout. Exp2 should be
+    # preferred for new multi-fold generalization studies.
+    if "exp4" in args.experiments:
+        print("\nProcessing Experiment 4 (legacy single holdout)...")
+        valid_nolow, _ = _valid_group_paths(
+            [entry for entry in exp_dg_folder_paths if entry[1] != "disk_galaxy_low"]
+        )
+        if len(valid_nolow) < 3:
+            raise ValueError(
+                "Legacy Exp4 requires at least three available non-low-resolution groups."
+            )
+        legacy_args = argparse.Namespace(**vars(args))
+        legacy_args.held_out_galaxy = [valid_nolow[2][1]]
+        print(
+            "  [INFO] Exp4 retains its historical third-available-group holdout. "
+            "Use Exp2 for exhaustive leave-one-galaxy-out."
+        )
+        # Exp4 keeps its historical prefix, so prepare its one fold explicitly.
+        held = valid_nolow[2]
+        in_entries = [entry for entry in valid_nolow if entry[1] != held[1]]
+        cache_in = CachePt().load(in_entries, **load_options)
         train_cache, val_cache, test_cache = cache_in.split(
             train_size=0.6,
             validation_size=0.2,
@@ -495,9 +768,16 @@ if __name__ == "__main__":
         train_cache = train_cache.process(balance=train_balance)
         val_cache = val_cache.process()
         test_cache = test_cache.process()
-        print(f"  Training set size:   {len(train_cache)}")
-        print(f"  Validation set size: {len(val_cache)}")
-        print(f"  Testing set size:    {len(test_cache)}")
+        cache_out = CachePt().load([held], **load_options).process()
+        actual_groups = _assert_logo_partition(
+            train_cache,
+            val_cache,
+            test_cache,
+            cache_out,
+            train_groups=[entry[1] for entry in in_entries],
+            held_out_group=held[1],
+        )
+        save_path = os.path.join(".cache", _cache_prefix(4, args.cache_tag))
         mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
         _save_norm_stats(
             save_path,
@@ -508,14 +788,25 @@ if __name__ == "__main__":
             target_metadata=train_cache.dataset.target_metadata,
             includes_zero_targets=include_zero_targets,
             oversample_groups=args.oversample,
+            split_metadata={
+                "experiment": "exp4",
+                "split_strategy": "legacy_single_group_holdout",
+                "split_seed": int(args.seed),
+                "available_groups": [entry[1] for entry in valid_nolow],
+                "train_groups": [entry[1] for entry in in_entries],
+                "held_out_group": held[1],
+                "held_out_groups": [held[1]],
+                "out_groups": [held[1]],
+                "split_groups": {key: sorted(value) for key, value in actual_groups.items()},
+                "group_paths": {entry[1]: entry[0] for entry in valid_nolow},
+                "sample_counts": {
+                    "train": len(train_cache), "val": len(val_cache),
+                    "test": len(test_cache), "out": len(cache_out),
+                },
+                "cache_prefix": os.path.basename(save_path),
+            },
             **transform_options,
         )
         val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
         test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
-
-        cache_out = CachePt().load(exp_dg_folder_paths_nolow_out, **load_options)
-        cache_out = cache_out.process()
-        print(f"  Out-set size: {len(cache_out)}")
         cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
-    except Exception as e:
-        print(f"  [Skip] Skipped Experiment 4: {e}")
