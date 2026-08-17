@@ -12,4 +12,6 @@ __pycache__/
 ResultByCheng/
 *.docx
 *.pdf
+.pdf_*/
 tmp/
+*.txt

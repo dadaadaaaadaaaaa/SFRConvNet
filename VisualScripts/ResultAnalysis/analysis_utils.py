@@ -697,7 +697,13 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
     preds = []
     feats_list = []
 
-    bs = 8 if model_type in ["vit", "convnet"] else batch_size
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
+    # ViT remains conservative because attention memory grows quickly. ConvNet
+    # inference uses the caller-provided value; gradients are disabled here, so
+    # it can normally use at least the training batch size.
+    bs = 8 if model_type == "vit" else batch_size
 
     # Hook for features if requested
     hook_handle = None
@@ -779,7 +785,7 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
     else:
         df["type"] = "test_set"
 
-    del x_all, baseline_all, coord_all
+    del x_all, conditioning_all, coord_all
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()

@@ -11,7 +11,11 @@ import h5py
 import numpy as np
 
 from typing import Callable, List, Tuple
-from pyhdf.SD import SD
+
+try:
+    from pyhdf.SD import SD
+except ImportError:  # Processed HDF5 files and unit tests do not require HDF4.
+    SD = None
 
 
 def _validate_file_path(file_path: str):
@@ -187,7 +191,12 @@ class GalData:
         self._target_metadata = {}
         self._corr = None
         self._axes = None
+        self._axis_edges = None
         self._coord = None
+        self._grid_volume = None
+        self._volume_source = None
+        self._coarsening_metadata = {}
+        self._coarsening_diagnostics = {}
 
     # -------- Properties --------
 
@@ -210,6 +219,19 @@ class GalData:
     @property
     def target_metadata(self) -> dict:
         return self._target_metadata.copy()
+
+    @property
+    def coarsening_metadata(self) -> dict:
+        """Serializable description of the coarse-graining operator."""
+        return self._coarsening_metadata.copy()
+
+    @property
+    def coarsening_diagnostics(self) -> dict:
+        """Diagnostic arrays kept separate from the model input channels."""
+        return {
+            name: np.asarray(values).copy()
+            for name, values in self._coarsening_diagnostics.items()
+        }
 
     @property
     def raw_axes(self) -> list: # 返回原始的坐标轴数组。
@@ -291,30 +313,18 @@ class GalData:
 
     @property
     def grid_volume(self) -> np.ndarray: # 计算单位网格的体积元dV
-        self.__validate_coords()
+        """Authoritative per-cell volume supplied by MACER Data-Set-15.
 
-        spacings = []
-        for ax in self._axes:
-            edges = 0.5 * (ax[1:] + ax[:-1])
-            first_edge = ax[0] - (edges[0] - ax[0])
-            last_edge = ax[-1] + (ax[-1] - edges[-1])
-            edges = np.concatenate(([first_edge], edges, [last_edge]))
-            d = np.diff(edges)
-            spacings.append(d)
-
-        spacings_mesh = np.meshgrid(*spacings)
-
-        dV = np.prod(spacings_mesh, axis=0)
-        if self._coordinate_mode == "cartesian":
-            return dV
-        else:  # polar/spherical
-            r = spacings_mesh[0]
-            dV *= r ** (self.ndim - 1)
-
-            if self.ndim == 3:
-                theta = spacings_mesh[1]
-                dV *= np.sin(theta)
-            return dV
+        Cell volume must never be reconstructed from cell centres.  That is
+        not conservative on MACER's logarithmic spherical-polar mesh and was
+        the source of the legacy ``dr**2 * dtheta`` volume error.
+        """
+        if self._grid_volume is None:
+            raise ValueError(
+                "Authoritative grid volume is unavailable. Regenerate this processed HDF5 "
+                "file from the raw HDFRA snapshot so Data-Set-15 is preserved."
+            )
+        return self._grid_volume
 
     @property
     def gas_mass(self) -> float: # 网格密度*网格体积=网格质量
@@ -481,53 +491,149 @@ class GalData:
         }
         return self
 
-    def rescale(self, new_shape: Tuple[int, ...], weights: List[np.ndarray | None] = None) -> "GalData": # 将高分辨率模拟转为机器学习输入的关键，如果原始网格是256*256，模型需要8*8，它会进行下采样。
-        """
-        Returns a new GalData instance with snapshot data rescaled to new_shape.
-
-        Args:
-            new_shape (Tuple[int, ...]): Desired shape for each snapshot variable.
-            weights (List[np.ndarray | None], optional): List of weight arrays for each variable. If None, sum will be used for that variable. If not provided, defaults to None for all variables. If existing keys in snapshot are not in weights, they will default to mass-weighted averaging.Length of weights must match the number of variables in the snapshot.
-
-        Returns:
-            GalyData: A new instance with rescaled snapshot data and corresponding axes.
-        """
+    def _as_coarsening_input(self):
+        """Build the pure-array input contract used by all coarsening modules."""
         self.__validate_coords()
-        if len(new_shape) != self.ndim:
-            raise ValueError(f"New shape must have {self.ndim} dimensions, got {len(new_shape)}.")
+        try:
+            from raw_data_processing.coarsening_types import CoarseningInput
+        except ModuleNotFoundError:
+            from coarsening_types import CoarseningInput
+        return CoarseningInput(
+            snapshot=self.snapshot,
+            grid_volume=np.asarray(self.grid_volume, dtype=np.float64),
+            axes=tuple(np.asarray(axis) for axis in self._axes),
+            axis_edges=tuple(np.asarray(edges) for edges in self._axis_edges),
+            coordinate_mode=self._coordinate_mode,
+            ndim=self.ndim,
+        )
 
-        new_instance = GalData(ndim=self.ndim, coordinate_mode=self._coordinate_mode)
-        new_instance.time = self.time
-        new_instance._corr = self._corr.copy()
-        new_instance._data_log = self._data_log.copy() if self._data_log is not None else None
-        new_instance._target_metadata = self._target_metadata.copy()
+    def _from_coarsening_result(
+        self,
+        result,
+        *,
+        conservation_rtol: float,
+        conservation_atol: float,
+    ) -> "GalData":
+        """Assemble a GalData object and validate an array-only result."""
+        source = self._as_coarsening_input()
+        try:
+            from raw_data_processing.coarsening_common import validate_coarsening_conservation
+        except ModuleNotFoundError:
+            from coarsening_common import validate_coarsening_conservation
+        validate_coarsening_conservation(
+            source, result, rtol=conservation_rtol, atol=conservation_atol
+        )
+        coarse = GalData(ndim=self.ndim, coordinate_mode=self._coordinate_mode)
+        coarse.time = self.time
+        coarse._corr = self._corr.copy() if self._corr is not None else {}
+        coarse._data_log = self._data_log.copy() if self._data_log is not None else None
+        coarse._target_metadata = self._target_metadata.copy()
+        coarse._data_hdfra = {
+            name: np.asarray(values) for name, values in result.snapshot.items()
+        }
+        coarse._grid_volume = np.asarray(result.grid_volume, dtype=np.float64)
+        coarse._volume_source = str(result.volume_source)
+        coarse._axes = [np.asarray(axis) for axis in result.axes]
+        coarse._axis_edges = [np.asarray(edges) for edges in result.axis_edges]
+        coarse._coord = tuple(np.meshgrid(*coarse._axes))
+        coarse._coarsening_metadata = dict(result.metadata)
+        coarse._coarsening_diagnostics = {
+            name: np.asarray(values) for name, values in result.diagnostics.items()
+        }
+        return coarse
 
-        new_snapshot = {}
-        for i, (name, data) in enumerate(self.snapshot.items()):  # 遍历所有的物理场，将高分辨率的网格粗化为低分辨率的网格，用的是质量加权平均。
-            weight = weights[name] if name in weights else self.gas_mass
-            new_snapshot[name] = self._scale_transform(data, new_shape, weight)
-        new_snapshot["temperature"] = 93 * new_snapshot["gas_energy"] / new_snapshot["density"] # 温度不适合求平均，重新用大网格的平均内能和平均密度计算
-        new_instance._data_hdfra = new_snapshot
+    def coarsen(
+        self,
+        operator: str,
+        new_shape: Tuple[int, ...],
+        *,
+        conservation_rtol: float = 1e-6,
+        conservation_atol: float = 1e-10,
+        **operator_kwargs,
+    ) -> "GalData":
+        """Dispatch a named coarse-graining operator through one stable interface."""
+        normalized = str(operator).lower().replace("-", "_")
+        source = self._as_coarsening_input()
+        if normalized in {"spatial", "spatial_block", "rh", "r_h"}:
+            try:
+                from raw_data_processing.coarsening_spatial import coarsen_spatial_block
+            except ModuleNotFoundError:
+                from coarsening_spatial import coarsen_spatial_block
+            result = coarsen_spatial_block(
+                source,
+                tuple(new_shape),
+                conservation_rtol=conservation_rtol,
+                conservation_atol=conservation_atol,
+                **operator_kwargs,
+            )
+        elif normalized in {
+            "rm_v0", "r_m_v0", "axisymmetric_rm_v0",
+            "adaptive_mass_axisymmetric_v0",
+        }:
+            try:
+                from raw_data_processing.coarsening_rm_v0 import coarsen_mass_v0
+            except ModuleNotFoundError:
+                from coarsening_rm_v0 import coarsen_mass_v0
+            result = coarsen_mass_v0(source, tuple(new_shape), **operator_kwargs)
+        elif normalized in {
+            "rm_v1", "r_m_v1", "axisymmetric_rm_v1",
+            "adaptive_mass_axisymmetric_v1",
+        }:
+            try:
+                from raw_data_processing.coarsening_rm_v1 import coarsen_mass_v1
+            except ModuleNotFoundError:
+                from coarsening_rm_v1 import coarsen_mass_v1
+            result = coarsen_mass_v1(source, tuple(new_shape), **operator_kwargs)
+        else:
+            raise ValueError(
+                f"Unknown coarsening operator {operator!r}; choose spatial_block, "
+                "axisymmetric_rm_v0, or axisymmetric_rm_v1."
+            )
+        return self._from_coarsening_result(
+            result,
+            conservation_rtol=conservation_rtol,
+            conservation_atol=conservation_atol,
+        )
 
-        new_axes = []
-        for old_axis, n in zip(self._axes, new_shape): # 重新构建粗的坐标轴网格
-            edges = 0.5 * (old_axis[1:] + old_axis[:-1])
-            first_edge = old_axis[0] - (edges[0] - old_axis[0])
-            last_edge = old_axis[-1] + (old_axis[-1] - edges[-1])
-            edges = np.concatenate(([first_edge], edges, [last_edge]))
+    def rescale(
+        self,
+        new_shape: Tuple[int, ...],
+        *,
+        conservation_rtol: float = 1e-6,
+        conservation_atol: float = 1e-10,
+    ) -> "GalData":
+        """Backward-compatible interface for regular spatial-block R_h."""
+        return self.coarsen(
+            "spatial_block",
+            new_shape,
+            conservation_rtol=conservation_rtol,
+            conservation_atol=conservation_atol,
+        )
 
-            factor = len(old_axis) // n # 降采样比例
-            new_edges = edges[::factor]
-            if len(new_edges) < n + 1:
-                new_edges = np.append(new_edges, edges[-1])
-
-            new_axis = 0.5 * (new_edges[1:] + new_edges[:-1])
-            new_axes.append(new_axis)
-
-        new_instance._axes = new_axes
-        new_instance._coord = np.ix_(*new_axes)
-
-        return new_instance
+    def rescale_mass_adaptive(
+        self,
+        new_shape: Tuple[int, ...],
+        *,
+        mass_filter: float,
+        kernel: str = "top_hat",
+        initial_neighbors: int = 32,
+        balance_tolerance: float = 1e-6,
+        balance_max_iterations: int = 5000,
+        conservation_rtol: float = 1e-6,
+        conservation_atol: float = 1e-10,
+    ) -> "GalData":
+        """Backward-compatible interface for axisymmetric R_m-v0."""
+        return self.coarsen(
+            "axisymmetric_rm_v0",
+            new_shape,
+            mass_filter=mass_filter,
+            kernel=kernel,
+            initial_neighbors=initial_neighbors,
+            balance_tolerance=balance_tolerance,
+            balance_max_iterations=balance_max_iterations,
+            conservation_rtol=conservation_rtol,
+            conservation_atol=conservation_atol,
+        )
 
     def set_corr(self, corr: List[Tuple[str, str]] | Tuple[str, str]) -> "GalData": # 坐标轴重映射，允许手动指定轴的对应关系，如设定第一个轴是theta
         """
@@ -537,7 +643,12 @@ class GalData:
             corr (List[Tuple[str, str]] | Tuple[str, str]): List of tuples or a single tuple where each tuple contains
                 the original dataset name and the new variable name.
         """
-        self._corr = [corr] if isinstance(corr, tuple) else corr
+        if isinstance(corr, dict):
+            self._corr = dict(corr)
+        elif isinstance(corr, tuple) and len(corr) == 2 and all(isinstance(x, str) for x in corr):
+            self._corr = dict([corr])
+        else:
+            self._corr = dict(corr)
         return self
 
     def set_coord(self, coords: List[str] | str) -> "GalData":
@@ -558,7 +669,28 @@ class GalData:
         if len(coords) != self.ndim:
             raise ValueError(f"Coordinate count mismatch: expected {self.ndim}, got {len(coords)}.")
         self._axes = [self._data_hdfra.select(c)[:] for c in coords]
-        self._coord = np.ix_(*self._axes)
+        self._axis_edges = [
+            self._infer_axis_edges(axis, is_radial=(self._coordinate_mode == "polar" and i == 0))
+            for i, axis in enumerate(self._axes)
+        ]
+        # np.meshgrid(r, theta) returns arrays in snapshot order (theta, r).
+        self._coord = tuple(np.meshgrid(*self._axes))
+        try:
+            volume = np.asarray(self._data_hdfra.select("Data-Set-15")[:], dtype=np.float64)
+        except Exception as exc:
+            raise KeyError(
+                "Raw HDFRA snapshot is missing authoritative cell volume Data-Set-15."
+            ) from exc
+        volume = np.squeeze(volume)
+        expected_shape = self.snapshot["density"].shape
+        if volume.shape != expected_shape:
+            raise ValueError(
+                f"Data-Set-15 shape {volume.shape} does not match snapshot shape {expected_shape}."
+            )
+        if not np.all(np.isfinite(volume)) or np.any(volume <= 0):
+            raise ValueError("Data-Set-15 must contain only finite, strictly positive volumes.")
+        self._grid_volume = volume
+        self._volume_source = "Data-Set-15"
         return self
 
     def save_h5(self, file_path: str) -> None: # 将Galdata保存为HDF5格式
@@ -568,6 +700,7 @@ class GalData:
             file_path (str): Path to the output HDF5 file.
         """
         with h5py.File(file_path, "w") as f:
+            f.attrs["processed_format_version"] = 4
             snap_grp = f.create_group("snapshot")
             for name, data in self.snapshot.items():
                 snap_grp.create_dataset(name, data=data)
@@ -575,8 +708,13 @@ class GalData:
             coord_grp = f.create_group("coordinates")
             for i, ax in enumerate(self._axes):
                 coord_grp.create_dataset(f"axis_{i}", data=ax)
+                coord_grp.create_dataset(f"axis_{i}_edges", data=self._axis_edges[i])
             coord_grp.attrs["coordinate_mode"] = self._coordinate_mode
             coord_grp.attrs["ndim"] = self.ndim
+
+            geometry_grp = f.create_group("geometry")
+            geometry_grp.create_dataset("cell_volume", data=self.grid_volume)
+            geometry_grp.attrs["volume_source"] = self._volume_source
 
             log_grp = f.create_group("log_data")
             for key, value in self._data_log.items():
@@ -592,6 +730,13 @@ class GalData:
                 corr_grp.attrs[f"{i}_orig"] = orig
                 corr_grp.attrs[f"{i}_new"] = new
 
+            if self._coarsening_metadata or self._coarsening_diagnostics:
+                coarse_grp = f.create_group("coarsening")
+                for key, value in self._coarsening_metadata.items():
+                    coarse_grp.attrs[key] = value
+                for name, values in self._coarsening_diagnostics.items():
+                    coarse_grp.create_dataset(name, data=np.asarray(values))
+
             # print(f"GalData saved to HDF5: {file_path}")
 
     def load_h5(self, file_path: str) -> "GalData": # 打开已经保存数据的HDF5文件
@@ -604,8 +749,12 @@ class GalData:
         with h5py.File(file_path, "r") as f:
             ndim = f["coordinates"].attrs["ndim"]
             coordinate_mode = f["coordinates"].attrs["coordinate_mode"]
-            self.ndim = ndim
-            self.coordinate_mode = coordinate_mode
+            if isinstance(coordinate_mode, bytes):
+                coordinate_mode = coordinate_mode.decode()
+            self.ndim = int(ndim)
+            if coordinate_mode not in {"polar", "cartesian"}:
+                raise ValueError(f"Invalid stored coordinate mode {coordinate_mode!r}.")
+            self._coordinate_mode = coordinate_mode
 
             self.time = f.attrs["time"]
 
@@ -613,8 +762,42 @@ class GalData:
             for name in f["snapshot"]:
                 self._data_hdfra[name] = f["snapshot"][name][()]
 
-            self._axes = [f["coordinates"][ax][()] for ax in f["coordinates"] if ax.startswith("axis_")]
-            self._coord = np.ix_(*self._axes)
+            axis_names = sorted(
+                (name for name in f["coordinates"] if name.startswith("axis_") and not name.endswith("_edges")),
+                key=lambda name: int(name.split("_")[1]),
+            )
+            self._axes = [f["coordinates"][name][()] for name in axis_names]
+            edge_names = [f"axis_{i}_edges" for i in range(len(self._axes))]
+            if not all(name in f["coordinates"] for name in edge_names):
+                raise ValueError(
+                    f"Processed file '{file_path}' lacks stored cell edges. Regenerate it from raw HDFRA."
+                )
+            self._axis_edges = [f["coordinates"][name][()] for name in edge_names]
+            for i, (axis, edges) in enumerate(zip(self._axes, self._axis_edges)):
+                if edges.shape != (len(axis) + 1,) or not np.all(np.isfinite(edges)):
+                    raise ValueError(
+                        f"Stored axis_{i}_edges must be finite and have length len(axis_{i}) + 1."
+                    )
+                if np.any(np.diff(edges) <= 0):
+                    raise ValueError(f"Stored axis_{i}_edges must be strictly increasing.")
+            self._coord = tuple(np.meshgrid(*self._axes))
+
+            if "geometry" not in f or "cell_volume" not in f["geometry"]:
+                raise ValueError(
+                    f"Processed file '{file_path}' lacks authoritative cell_volume. "
+                    "Regenerate it from raw HDFRA Data-Set-15."
+                )
+            self._grid_volume = np.asarray(f["geometry"]["cell_volume"][()], dtype=np.float64)
+            self._volume_source = f["geometry"].attrs.get("volume_source", "unknown")
+            if isinstance(self._volume_source, bytes):
+                self._volume_source = self._volume_source.decode()
+            expected_shape = next(iter(self._data_hdfra.values())).shape
+            if self._grid_volume.shape != expected_shape:
+                raise ValueError(
+                    f"Stored cell_volume shape {self._grid_volume.shape} does not match snapshot shape {expected_shape}."
+                )
+            if not np.all(np.isfinite(self._grid_volume)) or np.any(self._grid_volume <= 0):
+                raise ValueError("Stored cell_volume must be finite and strictly positive.")
 
             if "log_data" in f:
                 self._data_log = {k: f["log_data"][k][()] for k in f["log_data"]}
@@ -625,9 +808,21 @@ class GalData:
                 }
 
             corr_grp = f["correlation"]
-            self._corr = [
+            self._corr = dict(
                 (corr_grp.attrs[f"{i}_orig"], corr_grp.attrs[f"{i}_new"]) for i in range(corr_grp.attrs["length"])
-            ]
+            )
+
+            self._coarsening_metadata = {}
+            self._coarsening_diagnostics = {}
+            if "coarsening" in f:
+                coarse_grp = f["coarsening"]
+                self._coarsening_metadata = {
+                    key: value.decode() if isinstance(value, bytes) else value
+                    for key, value in coarse_grp.attrs.items()
+                }
+                self._coarsening_diagnostics = {
+                    name: coarse_grp[name][()] for name in coarse_grp
+                }
 
         # print(f"GalData loaded from HDF5: {file_path}")
         return self
@@ -643,6 +838,11 @@ class GalData:
         """
         # Validate file path
         path = _validate_file_path(path)
+        if SD is None:
+            raise ImportError(
+                "Reading raw MACER HDF4 snapshots requires the optional 'pyhdf' package. "
+                "Loading processed HDF5 files does not."
+            )
         self.time = time
         # Convert path to relative path to avoid pyhdf C-library issues with Chinese chars on Windows
         rel_path = os.path.relpath(path)
@@ -665,36 +865,42 @@ class GalData:
         self._data_log = f(path, time=self.time, scope=scope)
         return self
 
-    def _scale_transform(self, data: np.ndarray, new_shape: Tuple[int, ...], weights: np.ndarray = None) -> np.ndarray: # 用numpy的张量操作实现无循环的快速降采样（物理场粗化）
+    @staticmethod
+    def _block_reduce_sum(data: np.ndarray, new_shape: Tuple[int, ...]) -> np.ndarray:
+        """Compatibility wrapper; numerical implementation lives in coarsening_common."""
+        try:
+            from raw_data_processing.coarsening_common import block_reduce_sum
+        except ModuleNotFoundError:
+            from coarsening_common import block_reduce_sum
+        return block_reduce_sum(data, new_shape)
+
+    @staticmethod
+    def _infer_axis_edges(axis: np.ndarray, *, is_radial: bool) -> np.ndarray:
+        """Infer fine-grid edges once; stored edges are used thereafter.
+
+        MACER provides cell centres and authoritative volumes. Radial centres
+        are logarithmic, so geometric midpoints preserve their native topology;
+        angular/Cartesian axes use arithmetic midpoints.
         """
-        Rescales the input data array to a new shape using specified method.
-        Args:
-            data (np.ndarray): Input data array to be rescaled.
-            new_shape (Tuple[int, ...]): Desired shape of the output array.
-            weights (np.ndarray, optional): Weights for weighted averaging. If None, sum will be used.
-        """
-        old_shape = np.array(data.shape)
-        new_shape = np.array(new_shape)
-
-        if len(old_shape) != len(new_shape):
-            raise ValueError("Old and new shapes must have the same number of dimensions.")
-
-        if not np.all(old_shape % new_shape == 0):
-            raise ValueError("Current function only supports rescaling where new shape must divide old shape exactly.")
-
-        factors = (old_shape // new_shape).astype(int)
-
-        reshaped = data.reshape(*[n for pair in zip(new_shape, factors) for n in pair]) # 把原来的2D矩阵（256，256）变成了一个4D张量（8，32，8，32）
-
-        axes = tuple(range(1, 2 * len(new_shape), 2))
-        if weights is None:
-            reshaped = reshaped.sum(axis=axes) # 直接平均
+        axis = np.asarray(axis, dtype=np.float64)
+        if axis.ndim != 1 or axis.size < 2 or not np.all(np.isfinite(axis)):
+            raise ValueError("Coordinate axes must be finite one-dimensional arrays of length >= 2.")
+        if np.any(np.diff(axis) <= 0):
+            raise ValueError("Coordinate axes must be strictly increasing.")
+        if is_radial:
+            if np.any(axis <= 0):
+                raise ValueError("Logarithmic radial centres must be strictly positive.")
+            interior = np.sqrt(axis[:-1] * axis[1:])
+            first = axis[0] ** 2 / interior[0]
+            last = axis[-1] ** 2 / interior[-1]
         else:
-            w_reshaped = weights.reshape(*[n for pair in zip(new_shape, factors) for n in pair]) # 质量加权平均
-            reshaped = (reshaped * w_reshaped).sum(axis=axes) / w_reshaped.sum(axis=axes)
-
-        return reshaped
-
+            interior = 0.5 * (axis[:-1] + axis[1:])
+            first = axis[0] - (interior[0] - axis[0])
+            last = axis[-1] + (axis[-1] - interior[-1])
+        edges = np.concatenate(([first], interior, [last]))
+        if np.any(np.diff(edges) <= 0):
+            raise ValueError("Inferred coordinate edges are not strictly increasing.")
+        return edges
     # ------- Validation Methods -------
 
     def __validate_coords(self) -> None:
@@ -716,6 +922,8 @@ class GalDataSet:
         self._x_keys = None
         self._coord_keys = None
         self._target_metadata = {}
+        self._coarsening_signature = None
+        self._coordinate_reference = None
 
     # --------- Properties -------- 将零散的天体物理快照数据，无缝转化为 Python 机器学习框架可以直接摄入的标准张量格式
 
@@ -827,6 +1035,17 @@ class GalDataSet:
                 "Cannot combine datasets with different target semantics: "
                 f"{self._target_metadata} != {other._target_metadata}"
             )
+        if self._coarsening_signature != other._coarsening_signature:
+            raise ValueError(
+                "Cannot combine datasets produced by different coarsening operators: "
+                f"{self._coarsening_signature} != {other._coarsening_signature}"
+            )
+        if self._coordinate_reference is not None and other._coordinate_reference is not None:
+            if len(self._coordinate_reference) != len(other._coordinate_reference) or any(
+                left.shape != right.shape or not np.array_equal(left, right)
+                for left, right in zip(self._coordinate_reference, other._coordinate_reference)
+            ):
+                raise ValueError("Cannot combine datasets defined on different coordinate grids.")
         if self._x_keys != other._x_keys or self._coord_keys != other._coord_keys:
             raise ValueError("Cannot combine datasets with different input channels or coordinates.")
 
@@ -834,6 +1053,8 @@ class GalDataSet:
         new_dataset._x_keys = self._x_keys
         new_dataset._coord_keys = self._coord_keys
         new_dataset._target_metadata = self._target_metadata.copy()
+        new_dataset._coarsening_signature = self._coarsening_signature
+        new_dataset._coordinate_reference = self._coordinate_reference
 
         new_dataset._raw_data = {}
         for key in self._raw_data:
@@ -914,11 +1135,24 @@ class GalDataSet:
         data = GalData()
         
         # 寻找第一个合法的 .h5 文件用来初始化数据集结构
-        first_file = [f for f in os.listdir(self.folder_path[0]) if f.endswith(".h5")][0]
+        first_file = sorted(
+            f for f in os.listdir(self.folder_path[0]) if f.endswith(".h5")
+        )[0]
         data_path = os.path.join(self.folder_path[0], first_file)
         
         data.load_h5(data_path)
         self._target_metadata = data.target_metadata
+        signature_keys = (
+            "operator", "operator_version", "source_shape", "output_shape",
+            "mass_filter", "kernel", "distance_metric", "mass_geometry",
+            "graph_eta_initial", "graph_eta_max", "partition_semantics",
+        )
+        self._coarsening_signature = tuple(
+            (key, repr(data.coarsening_metadata.get(key))) for key in signature_keys
+        )
+        self._coordinate_reference = tuple(
+            np.asarray(axis).copy() for axis in data.raw_axes
+        )
         self._x_keys = list(data.snapshot.keys())
         self._coord_keys = [f"coordinate_{i}" for i in range(len(data.coordinate))]
         self._x_keys += ["gas_mass", "grid_volume"] 
@@ -942,7 +1176,7 @@ class GalDataSet:
             fp = fp_info[0] if isinstance(fp_info, (list, tuple)) else fp_info
             group_idx = fp_info[1] if isinstance(fp_info, (list, tuple)) and len(fp_info) > 1 else None
             
-            for file_name in os.listdir(fp):
+            for file_name in sorted(os.listdir(fp)):
                 if not file_name.endswith('.h5'):
                     continue
                 file_path = os.path.join(fp, file_name)
@@ -951,6 +1185,25 @@ class GalDataSet:
                     raise ValueError(
                         f"Inconsistent target metadata in '{file_path}': "
                         f"{data.target_metadata} != {self._target_metadata}"
+                    )
+                signature = tuple(
+                    (key, repr(data.coarsening_metadata.get(key)))
+                    for key in signature_keys
+                )
+                if signature != self._coarsening_signature:
+                    raise ValueError(
+                        f"Inconsistent coarsening operator in '{file_path}': "
+                        f"{signature} != {self._coarsening_signature}. Do not mix R_h/R_m "
+                        "or different mass_filter values silently."
+                    )
+                current_axes = tuple(np.asarray(axis) for axis in data.raw_axes)
+                if len(current_axes) != len(self._coordinate_reference) or any(
+                    left.shape != right.shape or not np.array_equal(left, right)
+                    for left, right in zip(self._coordinate_reference, current_axes)
+                ):
+                    raise ValueError(
+                        f"Inconsistent coordinate grid in '{file_path}'. "
+                        "Do not concatenate same-shaped tensors with different physical geometry."
                     )
                 for key, value in data.snapshot.items():
                     self._raw_data[key].append(value)
@@ -1290,6 +1543,8 @@ class GalDataSet:
         ds._x_keys = self._x_keys.copy()
         ds._coord_keys = self._coord_keys.copy()
         ds._target_metadata = self._target_metadata.copy()
+        ds._coarsening_signature = self._coarsening_signature
+        ds._coordinate_reference = self._coordinate_reference
         ds._raw_data = {k: [self._raw_data[k][i] for i in idx] for k in self._raw_data}
         ds._group_labels = [self._group_labels[i] for i in idx]
         ds.folder_path = self.folder_path.copy() if self.folder_path is not None else None
@@ -1313,7 +1568,58 @@ if __name__ == "__main__":
         default=[],
         help="Process only this generated name (for example disk_galaxy_fiducial). May be repeated.",
     )
+    parser.add_argument(
+        "--coarsener",
+        choices=("spatial_block", "axisymmetric_rm_v0", "axisymmetric_rm_v1"),
+        default="spatial_block",
+        help="Coarse-graining operator applied after each fine snapshot.",
+    )
+    parser.add_argument(
+        "--coarse-shape", nargs=2, type=int, default=(8, 8),
+        metavar=("N_THETA", "N_R"),
+    )
+    parser.add_argument(
+        "--mass-filter", type=float, default=None,
+        help="Required for R_m; units are density*Data-Set-15 volume.",
+    )
+    parser.add_argument(
+        "--kernel", choices=("top_hat", "cubic_spline", "wendland_c2"),
+        default=None,
+    )
+    parser.add_argument(
+        "--coarse-dirname", default=None,
+        help="Defaults to coarse for R_h and coarse_<operator> for R_m.",
+    )
+    parser.add_argument("--initial-neighbors", type=int, default=None)
+    parser.add_argument("--balance-tolerance", type=float, default=1e-6)
+    parser.add_argument(
+        "--balance-max-iterations", type=int, default=30000,
+        help="Rm-v0 IPFP limit (default 30000; ignored by v1).",
+    )
+    parser.add_argument(
+        "--v1-max-neighbors", type=int, default=4096,
+        help="Maximum adaptive KNN count for Rm-v1.",
+    )
+    parser.add_argument("--v1-max-runtime-seconds", type=float, default=60.0)
+    parser.add_argument("--v1-solver-max-iterations", type=int, default=300)
+    parser.add_argument("--v1-polish-max-iterations", type=int, default=500)
     cli_args = parser.parse_args()
+    if any(value <= 0 for value in cli_args.coarse_shape):
+        parser.error("--coarse-shape values must be positive.")
+    if cli_args.coarsener != "spatial_block" and (
+        cli_args.mass_filter is None or cli_args.mass_filter <= 0
+    ):
+        parser.error("--mass-filter must be positive for axisymmetric R_m operators.")
+    if cli_args.coarsener == "spatial_block" and cli_args.kernel is not None:
+        parser.error("--kernel applies only to axisymmetric R_m operators.")
+    if cli_args.coarsener == "axisymmetric_rm_v0" and cli_args.kernel == "wendland_c2":
+        parser.error("R_m-v0 supports top_hat or cubic_spline, not wendland_c2.")
+    if cli_args.coarsener == "axisymmetric_rm_v1" and cli_args.kernel not in (None, "wendland_c2"):
+        parser.error("R_m-v1 uses the fixed wendland_c2 kernel.")
+    if cli_args.balance_tolerance <= 0 or cli_args.balance_max_iterations <= 0:
+        parser.error("Balance tolerance and iteration limits must be positive.")
+    if cli_args.v1_max_neighbors < 2 or cli_args.v1_max_runtime_seconds <= 0:
+        parser.error("v1 neighbour and runtime limits must be positive.")
     selected_galaxies = set(cli_args.galaxy)
 
     raw_data_dir = configs["BaseConfig"]["raw_data_dir"]
@@ -1370,7 +1676,11 @@ if __name__ == "__main__":
 
             save_path_fine = os.path.join(data_dir, gal_name, "fine")
             os.makedirs(save_path_fine, exist_ok=True)
-            save_path_coarse = os.path.join(data_dir, gal_name, "coarse")
+            coarse_dirname = cli_args.coarse_dirname or (
+                "coarse" if cli_args.coarsener == "spatial_block"
+                else f"coarse_{cli_args.coarsener}"
+            )
+            save_path_coarse = os.path.join(data_dir, gal_name, coarse_dirname)
             os.makedirs(save_path_coarse, exist_ok=True)
 
             stable_from_start = gal_name in [
@@ -1406,6 +1716,31 @@ if __name__ == "__main__":
                 file.set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射
                 file.save_h5(os.path.join(save_path_fine, output_name)) # 将原始分辨率数据的HDF5文件保存至fine文件夹
 
-                # Scale transform to coarse grid
-                file_coarse = file.rescale(new_shape=(8, 8), weights={"density": file.grid_volume}) # 调用rescale方法，将原始分辨率数据下采样到8*8
-                file_coarse.save_h5(os.path.join(save_path_coarse, output_name)) # 将下采样后的数据保存至coarse文件夹
+                operator_kwargs = {}
+                if cli_args.mass_filter is not None:
+                    operator_kwargs["mass_filter"] = cli_args.mass_filter
+                if cli_args.kernel is not None and cli_args.coarsener == "axisymmetric_rm_v0":
+                    operator_kwargs["kernel"] = cli_args.kernel
+                if cli_args.coarsener == "axisymmetric_rm_v0":
+                    operator_kwargs.update(
+                        balance_tolerance=cli_args.balance_tolerance,
+                        balance_max_iterations=cli_args.balance_max_iterations,
+                    )
+                    if cli_args.initial_neighbors is not None:
+                        operator_kwargs["initial_neighbors"] = cli_args.initial_neighbors
+                elif cli_args.coarsener == "axisymmetric_rm_v1":
+                    operator_kwargs.update(
+                        balance_tolerance=cli_args.balance_tolerance,
+                        max_neighbors=cli_args.v1_max_neighbors,
+                        max_runtime_seconds=cli_args.v1_max_runtime_seconds,
+                        solver_max_iterations=cli_args.v1_solver_max_iterations,
+                        polish_max_iterations=cli_args.v1_polish_max_iterations,
+                    )
+                    if cli_args.initial_neighbors is not None:
+                        operator_kwargs["initial_neighbors"] = cli_args.initial_neighbors
+                file_coarse = file.coarsen(
+                    cli_args.coarsener,
+                    new_shape=tuple(cli_args.coarse_shape),
+                    **operator_kwargs,
+                )
+                file_coarse.save_h5(os.path.join(save_path_coarse, output_name))

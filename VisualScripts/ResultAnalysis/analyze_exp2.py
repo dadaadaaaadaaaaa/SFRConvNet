@@ -5,6 +5,10 @@ This script deliberately separates four evaluation domains:
   2. cached held-out galaxy snapshots (out.pt),
   3. complete raw trajectories for galaxies used by training,
   4. complete raw trajectory for the held-out galaxy.
+
+The in-distribution and raw in-domain branches are optional. Disabling either
+branch skips its dataset loading/inference as well as its figures and outputs.
+The two held-out branches are always evaluated.
 """
 
 from __future__ import annotations
@@ -95,23 +99,30 @@ def _validate_logo_contract(metadata: dict, test_ds, out_ds) -> None:
     if train_groups.intersection(held_out_groups):
         raise RuntimeError("Exp2 metadata contains overlapping train and held-out groups.")
 
-    actual_test = _unique_groups(test_ds)
     actual_out = _unique_groups(out_ds)
-    if actual_test != train_groups:
-        raise RuntimeError(
-            f"test.pt groups {sorted(actual_test)} do not match train_groups "
-            f"{sorted(train_groups)}."
-        )
     if actual_out != held_out_groups:
         raise RuntimeError(
             f"out.pt groups {sorted(actual_out)} do not match held_out_groups "
             f"{sorted(held_out_groups)}."
         )
-    if actual_test.intersection(actual_out):
-        raise RuntimeError("Actual cached test and out data share a galaxy group.")
+    if test_ds is not None:
+        actual_test = _unique_groups(test_ds)
+        if actual_test != train_groups:
+            raise RuntimeError(
+                f"test.pt groups {sorted(actual_test)} do not match train_groups "
+                f"{sorted(train_groups)}."
+            )
+        if actual_test.intersection(actual_out):
+            raise RuntimeError("Actual cached test and out data share a galaxy group.")
+        test_status = sorted(actual_test)
+    else:
+        # Metadata still enforces disjoint train/held-out galaxy identities.
+        # The potentially large test.pt tensor is deliberately not loaded when
+        # its analysis branch is disabled.
+        test_status = "skipped (metadata-only validation)"
     print(
         "[PASS] Analysis split contract: "
-        f"in-domain={sorted(actual_test)}, held-out={sorted(actual_out)}"
+        f"in-domain={test_status}, held-out={sorted(actual_out)}"
     )
 
 
@@ -133,6 +144,7 @@ def _predict_raw_domain(
     model,
     model_type,
     device,
+    batch_size,
     domain_label,
 ):
     group_paths = metadata.get("group_paths", {})
@@ -156,7 +168,9 @@ def _predict_raw_domain(
                 f"but path resolves to {dataset.type!r}."
             )
         print(f"  Predicting {domain_label}: {group_name} ({len(dataset)} snapshots)")
-        frame = utils.predict_dataset(dataset, model, device, model_type)
+        frame = utils.predict_dataset(
+            dataset, model, device, model_type, batch_size=batch_size
+        )
         frame["evaluation_domain"] = domain_label
         frame["type"] = group_name
         frame.attrs["target_metadata"] = dataset.target_metadata
@@ -237,7 +251,11 @@ def analyze_result(
     *,
     plot_in_distribution: bool = True,
     plot_in_domain: bool = True,
+    batch_size: int = 128,
 ) -> Path:
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}.")
     result_dir = result_dir.resolve()
     hyperparameters_path = result_dir / "hyperparameters.json"
     if not hyperparameters_path.exists():
@@ -255,14 +273,18 @@ def analyze_result(
     test_path = Path(f"{cache_prefix}test.pt")
     out_path = Path(f"{cache_prefix}out.pt")
     norm_path = Path(f"{cache_prefix}norm.npz")
-    for required in (test_path, out_path, norm_path):
+    required_paths = [out_path, norm_path]
+    if plot_in_distribution:
+        required_paths.append(test_path)
+    for required in required_paths:
         if not required.exists():
             raise FileNotFoundError(f"Required Exp2 artifact is missing: {required}")
 
     print("\n" + "=" * 80)
     print(f"Analyzing: {result_dir.name}")
     print(f"Cache prefix: {data_exp}")
-    test_ds = utils.CachedPTDataset(test_path)
+    print(f"Analysis inference batch size: {batch_size}")
+    test_ds = utils.CachedPTDataset(test_path) if plot_in_distribution else None
     out_ds = utils.CachedPTDataset(out_path)
     _validate_logo_contract(metadata, test_ds, out_ds)
 
@@ -274,32 +296,49 @@ def analyze_result(
     )
     norm = utils.load_norm_stats(norm_path)
     mean, std = norm["mean"], norm["std"]
+    reference_ds = test_ds if test_ds is not None else out_ds
 
-    test_frame = utils.predict_dataset(test_ds, model, device, model_type)
-    test_frame["evaluation_domain"] = "In-Distribution Test"
-    out_frame = utils.predict_dataset(out_ds, model, device, model_type)
+    test_frame = None
+    if plot_in_distribution:
+        test_frame = utils.predict_dataset(
+            test_ds, model, device, model_type, batch_size=batch_size
+        )
+        test_frame["evaluation_domain"] = "In-Distribution Test"
+    else:
+        print("  Skipping In-Distribution Test loading, inference, outputs, and figures.")
+
+    out_frame = utils.predict_dataset(
+        out_ds, model, device, model_type, batch_size=batch_size
+    )
     out_frame["evaluation_domain"] = "Held-Out Galaxy Test"
 
-    raw_in = _predict_raw_domain(
-        metadata["train_groups"],
-        metadata=metadata,
-        mean=mean,
-        std=std,
-        reference_dataset=test_ds,
-        model=model,
-        model_type=model_type,
-        device=device,
-        domain_label="Raw In-Domain",
-    )
+    raw_in = None
+    if plot_in_domain:
+        raw_in = _predict_raw_domain(
+            metadata["train_groups"],
+            metadata=metadata,
+            mean=mean,
+            std=std,
+            reference_dataset=reference_ds,
+            model=model,
+            model_type=model_type,
+            device=device,
+            batch_size=batch_size,
+            domain_label="Raw In-Domain",
+        )
+    else:
+        print("  Skipping Raw In-Domain loading, inference, outputs, and figures.")
+
     raw_out = _predict_raw_domain(
         metadata["held_out_groups"],
         metadata=metadata,
         mean=mean,
         std=std,
-        reference_dataset=test_ds,
+        reference_dataset=reference_ds,
         model=model,
         model_type=model_type,
         device=device,
+        batch_size=batch_size,
         domain_label="Raw Held-Out",
     )
     held_out_consistency = _compare_held_out_predictions(out_frame, raw_out)
@@ -318,7 +357,7 @@ def analyze_result(
     _save_domain_outputs(
         result_dir, "in_dist_test", test_frame,
         "In-Distribution Test", fig_dir, metrics,
-        make_plots=plot_in_distribution,
+        make_plots=True,
     )
     _save_domain_outputs(
         result_dir, "held_out_test", out_frame,
@@ -328,7 +367,7 @@ def analyze_result(
     _save_domain_outputs(
         result_dir, "raw_in_domain", raw_in,
         "Raw In-Domain", fig_dir, metrics,
-        make_plots=plot_in_domain,
+        make_plots=True,
     )
     _save_domain_outputs(
         result_dir, "raw_held_out", raw_out,
@@ -339,7 +378,7 @@ def analyze_result(
     metrics_path = result_dir / "metrics_exp2.csv"
     pd.DataFrame(metrics).to_csv(metrics_path, index=False)
     analysis_metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "model": model_path.name,
         "data_exp": data_exp,
         "split_strategy": metadata["split_strategy"],
@@ -350,12 +389,21 @@ def analyze_result(
             "plot_in_domain": bool(plot_in_domain),
             "plot_held_out": True,
         },
+        "domain_execution": {
+            "in_distribution_test": bool(plot_in_distribution),
+            "held_out_galaxy_test": True,
+            "raw_in_domain": bool(plot_in_domain),
+            "raw_held_out": True,
+        },
         "figure_directory": figure_dir_name,
+        "inference_batch_size": batch_size,
         "held_out_cache_raw_consistency": held_out_consistency,
         "outputs": {
-            "in_distribution_test": "in_dist_test_predictions.csv",
+            "in_distribution_test": (
+                "in_dist_test_predictions.csv" if plot_in_distribution else None
+            ),
             "held_out_galaxy_test": "held_out_test_predictions.csv",
-            "raw_in_domain": "raw_in_domain_predictions.csv",
+            "raw_in_domain": "raw_in_domain_predictions.csv" if plot_in_domain else None,
             "raw_held_out": "raw_held_out_predictions.csv",
             "metrics": metrics_path.name,
         },
@@ -400,13 +448,22 @@ def parse_args():
     parser.add_argument("--results-root", type=Path, default=PROJECT_ROOT / "Results")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or a torch device string.")
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        help="Inference batch size for ConvNet and non-ViT models (default: 128).",
+    )
+    parser.add_argument(
         "--plot-in-distribution",
         type=_parse_bool,
         nargs="?",
         const=True,
         default=True,
         metavar="BOOL",
-        help="Draw figures for cached in-distribution test data (default: true).",
+        help=(
+            "Run cached in-distribution inference and save its outputs/figures "
+            "(default: true)."
+        ),
     )
     parser.add_argument(
         "--plot-in-domain",
@@ -415,7 +472,10 @@ def parse_args():
         const=True,
         default=True,
         metavar="BOOL",
-        help="Draw figures for complete raw in-domain trajectories (default: true).",
+        help=(
+            "Run complete raw in-domain inference and save its outputs/figures "
+            "(default: true)."
+        ),
     )
     return parser.parse_args()
 
@@ -442,6 +502,7 @@ def main():
             device,
             plot_in_distribution=args.plot_in_distribution,
             plot_in_domain=args.plot_in_domain,
+            batch_size=args.batch_size,
         )
         frame = pd.read_csv(metrics_path)
         analysis_metadata = _load_json(Path(result_dir) / "exp2_analysis_metadata.json")
