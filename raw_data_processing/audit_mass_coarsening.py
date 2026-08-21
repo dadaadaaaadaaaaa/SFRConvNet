@@ -1,18 +1,17 @@
-"""Audit axisymmetric mass-adaptive coarsening on a diverse snapshot sample.
+"""在多样化 snapshot 样本上审计轴对称质量自适应粗粒化。
 
-The audit deliberately distinguishes two masses that have different meanings:
+审计明确区分以下两种含义不同的质量：
 
 ``source_enclosed_mass``
-    Mass inside each overlapping adaptive source support.  It is constrained to
-    reach ``mass_filter`` (with discrete-cell overshoot), but is not a partition.
+    每个重叠自适应 source 支撑域内的质量。它需要达到 ``mass_filter``，
+    允许离散单元造成超调，但不表示互斥分区。
 
 ``output_cell_mass``
-    Gas mass deposited into each regular CNN output cell.  It is conserved
-    globally, but is not constrained to equal ``mass_filter``.
+    沉积到每个规则 CNN 输出格的气体质量。它只要求全局守恒，
+    不要求等于 ``mass_filter``。
 
-The stored ``gas_energy`` field is audited as an internal-energy-like extensive
-quantity, ``sum(gas_energy * volume)``.  Resolved kinetic energy is reported
-separately.  This module never claims conservation of physical total energy.
+存储字段 ``gas_energy`` 是气体内能密度，因此审计的广延量是气体内能
+``sum(gas_energy * volume)``。解析动能单独报告；Data-Set-10 不是总能量。
 """
 
 from __future__ import annotations
@@ -33,8 +32,12 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 try:
+    from raw_data_processing.coarsening_common import (
+        temperature_from_internal_energy_density,
+    )
     from raw_data_processing.galaxy_data import GalData
 except ModuleNotFoundError:  # Direct execution from raw_data_processing/.
+    from coarsening_common import temperature_from_internal_energy_density
     from galaxy_data import GalData
 
 
@@ -207,9 +210,10 @@ def _selection_feature_payload(
     total_mass = float(mass.sum(dtype=np.float64))
     if total_mass <= 0 or not math.isfinite(total_mass):
         raise ValueError("Snapshot has no finite positive selection-weight gas mass.")
-    temperature = np.asarray(snapshot.get("temperature"), dtype=np.float64)
-    if temperature.shape != density.shape:
-        temperature = 93.0 * np.asarray(snapshot["gas_energy"]) / density
+    # Data-Set-10 与 density 唯一决定温度；不把缓存中的派生温度当成独立状态量。
+    temperature = temperature_from_internal_energy_density(
+        snapshot["gas_energy"], density
+    )
     r, theta = np.meshgrid(*axes)
     cylindrical_r = r * np.sin(theta)
     z = r * np.cos(theta)
@@ -524,6 +528,21 @@ def _extensive_state(data: GalData) -> dict[str, Any]:
         state["initial_stellar_mass_terms"] = (
             np.asarray(snapshot["initial_stellar_density"], dtype=np.float64) * volume
         )
+    if "cooling_rate_density" in snapshot:
+        state["cooling_power_terms"] = (
+            np.asarray(snapshot["cooling_rate_density"], dtype=np.float64) * volume
+        )
+    if {"radial_acceleration", "theta_acceleration"}.issubset(snapshot):
+        acceleration_r = np.asarray(snapshot["radial_acceleration"], dtype=np.float64)
+        acceleration_theta = np.asarray(
+            snapshot["theta_acceleration"], dtype=np.float64
+        )
+        state["gravitational_force_R_terms"] = mass * (
+            acceleration_r * np.sin(theta) + acceleration_theta * np.cos(theta)
+        )
+        state["gravitational_force_z_terms"] = mass * (
+            acceleration_r * np.cos(theta) - acceleration_theta * np.sin(theta)
+        )
     return state
 
 
@@ -687,6 +706,13 @@ def audit_galdata(
             required_stored.append(name)
     if "initial_stellar_mass_terms" in fine_state:
         required_stored.append("initial_stellar_mass")
+    for name in (
+        "cooling_power",
+        "gravitational_force_R",
+        "gravitational_force_z",
+    ):
+        if f"{name}_terms" in fine_state:
+            required_stored.append(name)
     for name in required_stored + ["pz", "lz"]:
         fine_key = f"{name}_terms"
         if fine_key in fine_state and fine_key in coarse_state:
@@ -701,7 +727,7 @@ def audit_galdata(
             "resolved_kinetic_energy_coarse": coarse_kinetic,
             "resolved_kinetic_energy_loss": kinetic_loss,
             "resolved_kinetic_energy_loss_fraction": kinetic_loss / fine_kinetic if fine_kinetic > 0 else math.nan,
-            "energy_statement": "stored internal-energy-like integral audited separately; no physical total-energy conservation claim",
+            "energy_statement": "gas internal energy = sum(gas internal-energy density * cell volume); Data-Set-10 is not total energy",
         }
     )
     stored_pass = True

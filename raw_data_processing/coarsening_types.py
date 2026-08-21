@@ -1,8 +1,6 @@
-"""Array-only data contracts shared by MACER coarse-graining schemes.
-
-The coarsening implementations deliberately do not import :class:`GalData`.
-Keeping this boundary free of HDF4/HDF5 and training concerns avoids circular
-imports and makes every numerical operator independently testable.
+"""MACER粗粒化方案共用的仅数组数据契约。
+这些粗粒化实现有意未导入 :class:`GalData`。将该边界与HDF4/HDF5及训练相关问题隔离，既可避免循环
+导入，又能使每个数值运算符都能独立进行测试。
 """
 
 from __future__ import annotations

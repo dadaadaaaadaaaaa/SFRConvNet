@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Flatten overwrite-cycle snapshot folders into one globally indexed directory.
+"""将覆盖循环快照文件夹合并到一个全局索引目录中。
 
-Legacy MACER output reuses local names such as ``hdfra.001`` through
-``hdfra.999`` in folders named ``<series>_0``, ``<series>_1``, ... .  This
-utility converts those local names to unique global snapshot names using
+旧版 MACER 输出会在名为 ``<series>_0``、``<series>_1``、... 的文件夹中重复使用诸如 ``hdfra.001`` 至
+``hdfra.999`` 之类的本地名称。该
+实用程序使用以下规则将这些本地名称转换为唯一的全局快照名称：
 
-    segment 0: global_index = local_index
-    segment k >= 1: global_index = cycle_size * k + local_index
+    段 0：全局索引 = 本地索引
+    段 k ≥ 1：全局索引 = 循环大小 * k + 本地索引
 
-The default cycle size is 999.  Missing files and even missing segment folders
-are allowed: they remain gaps in the global index instead of shifting later
-snapshot times.
+默认循环大小为 999。允许存在缺失的文件甚至缺失的段文件夹：
+它们将在全局索引中保留为空缺，而非导致后续
+快照时间发生偏移。
 
-By default the utility creates hard links, so the flattened view does not make
-another full copy of the snapshot data.  Source data are never modified, the
-destination must not already exist, and construction happens in a temporary
-sibling directory before an atomic rename.
+默认情况下，该工具会创建硬链接，因此扁平化视图不会
+生成快照数据的另一份完整副本。源数据绝不会被修改，
+目标目录必须不存在，且构建过程会在临时
+同级目录中进行，随后执行原子重命名操作。
 
-Example (Fiducial4)::
+示例（Fiducial4）：:
 
     python raw_data_processing/flatten_segmented_snapshots.py \
         --source-dir RawData/DiskGalaxy/Fiducial4 \
@@ -26,7 +26,7 @@ Example (Fiducial4)::
         --include-file Fiducial4_new.log \
         --expected-range 0 9541
 
-Use ``--dry-run`` first to validate the mapping without creating anything.
+请先使用 ``--dry-run`` 选项进行模拟运行，以验证映射关系，而不会实际生成任何文件。
 """
 
 from __future__ import annotations

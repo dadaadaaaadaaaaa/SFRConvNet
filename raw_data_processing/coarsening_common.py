@@ -1,4 +1,4 @@
-"""Shared validation, geometry, reduction, and conservation utilities."""
+"""共享的验证、几何、简化及守恒工具"""
 
 from __future__ import annotations
 
@@ -22,8 +22,126 @@ SUPPORTED_COARSENING_FIELDS = frozenset(
         "v2",
         "v3",
         "initial_stellar_density",
+        "radial_acceleration",
+        "theta_acceleration",
+        "cooling_time",
+        "cooling_rate_density",
     }
 )
+
+
+# Data-Set-10 保存的是气体内能密度。字段名 ``gas_energy`` 仅为兼容旧缓存；
+# 任何守恒沉积都必须先乘单元体积，得到单元气体内能。
+GAS_INTERNAL_ENERGY_DENSITY_FIELD = "gas_energy"
+GAS_INTERNAL_ENERGY_DENSITY_DATASET = "Data-Set-10"
+TEMPERATURE_FROM_INTERNAL_ENERGY_DENSITY_FACTOR = 93.0
+COOLING_TIME_FIELD = "cooling_time"
+COOLING_RATE_DENSITY_FIELD = "cooling_rate_density"
+
+
+def cooling_rate_density_from_time(
+    internal_energy_density: np.ndarray,
+    cooling_time: np.ndarray,
+) -> np.ndarray:
+    """由 ``C=e/t_cool`` 构造冷却率密度。
+
+    原始盘星系的初始帧可能把尚未定义的冷却时标写为 0；这里将其解释为
+    零冷却功率，而不是执行除零。正常演化帧的正时标严格按公式换算。
+    """
+
+    energy_density = np.asarray(internal_energy_density, dtype=np.float64)
+    timescale = np.asarray(cooling_time, dtype=np.float64)
+    if energy_density.shape != timescale.shape:
+        raise ValueError("Internal-energy density and cooling time must have identical shapes.")
+    if not np.all(np.isfinite(timescale)) or np.any(timescale < 0):
+        raise ValueError("Cooling time must contain only finite, non-negative values.")
+    return np.divide(
+        energy_density,
+        timescale,
+        out=np.zeros_like(energy_density),
+        where=timescale > 0,
+    )
+
+
+def cooling_time_from_rate_density(
+    internal_energy_density: np.ndarray,
+    cooling_rate_density: np.ndarray,
+) -> np.ndarray:
+    """由粗粒化后的 ``e_C/C_C`` 重建冷却时标。"""
+
+    energy_density = np.asarray(internal_energy_density, dtype=np.float64)
+    rate_density = np.asarray(cooling_rate_density, dtype=np.float64)
+    if energy_density.shape != rate_density.shape:
+        raise ValueError(
+            "Internal-energy density and cooling-rate density must have identical shapes."
+        )
+    if not np.all(np.isfinite(rate_density)) or np.any(rate_density < 0):
+        raise ValueError("Cooling-rate density must contain only finite, non-negative values.")
+    return np.divide(
+        energy_density,
+        rate_density,
+        out=np.zeros_like(energy_density),
+        where=rate_density > 0,
+    )
+
+
+def spherical_meridional_to_cylindrical(
+    radial: np.ndarray,
+    theta_component: np.ndarray,
+    theta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """把球坐标 ``(r,theta)`` 分量转到固定 ``(R,z)`` 基。"""
+
+    sin_theta = np.sin(theta)
+    cos_theta = np.cos(theta)
+    return (
+        radial * sin_theta + theta_component * cos_theta,
+        radial * cos_theta - theta_component * sin_theta,
+    )
+
+
+def cylindrical_meridional_to_spherical(
+    cylindrical_r: np.ndarray,
+    cylindrical_z: np.ndarray,
+    theta: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """把固定 ``(R,z)`` 分量转回粗网格中心的球坐标基。"""
+
+    sin_theta = np.sin(theta)
+    cos_theta = np.cos(theta)
+    return (
+        cylindrical_r * sin_theta + cylindrical_z * cos_theta,
+        cylindrical_r * cos_theta - cylindrical_z * sin_theta,
+    )
+
+
+def temperature_from_internal_energy_density(
+    internal_energy_density: np.ndarray,
+    density: np.ndarray,
+) -> np.ndarray:
+    """按 MACER 恒等式 ``T = 93 e / rho`` 由内能密度重建温度。"""
+
+    energy_density = np.asarray(internal_energy_density, dtype=np.float64)
+    density_values = np.asarray(density, dtype=np.float64)
+    if energy_density.shape != density_values.shape:
+        raise ValueError(
+            "Internal-energy-density and density arrays must have identical shapes."
+        )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return TEMPERATURE_FROM_INTERNAL_ENERGY_DENSITY_FACTOR * energy_density / density_values
+
+
+def thermodynamic_coarsening_metadata() -> dict[str, object]:
+    """返回可序列化的 Data-Set-10 字段语义，供粗粒化结果写入 HDF5。"""
+
+    return {
+        "gas_energy_semantics": "gas_internal_energy_density",
+        "gas_energy_source_dataset": GAS_INTERNAL_ENERGY_DENSITY_DATASET,
+        "conserved_internal_energy_definition": "sum(gas_energy*cell_volume)",
+        "temperature_relation": "temperature=93*gas_energy/density",
+        "cooling_coarsening": "sum((gas_energy/cooling_time)*cell_volume)/sum(cell_volume)",
+        "cooling_time_reconstruction": "cooling_time=gas_energy/cooling_rate_density",
+    }
 
 
 def block_reduce_sum(data: np.ndarray, new_shape: Tuple[int, ...]) -> np.ndarray:
@@ -83,6 +201,56 @@ def validate_input_fields(
         )
     if not np.all(np.isfinite(density)) or np.any(density < 0):
         raise ValueError("Density must contain only finite, non-negative values.")
+
+    internal_energy_density = np.asarray(
+        data.snapshot["gas_energy"], dtype=np.float64
+    )
+    if internal_energy_density.shape != fine_shape:
+        raise ValueError(
+            "Internal-energy-density shape does not match the density shape."
+        )
+    if not np.all(np.isfinite(internal_energy_density)) or np.any(
+        internal_energy_density < 0
+    ):
+        raise ValueError(
+            "Gas internal-energy density must contain only finite, non-negative values."
+        )
+
+    if "temperature" in data.snapshot:
+        stored_temperature = np.asarray(data.snapshot["temperature"], dtype=np.float64)
+        if stored_temperature.shape != fine_shape:
+            raise ValueError("Temperature shape does not match the density shape.")
+        expected_temperature = temperature_from_internal_energy_density(
+            internal_energy_density, density
+        )
+        positive_density = density > 0
+        if np.any(positive_density) and not np.allclose(
+            stored_temperature[positive_density],
+            expected_temperature[positive_density],
+            rtol=1e-6,
+            atol=1e-8,
+        ):
+            raise ValueError(
+                "Stored temperature violates the MACER relation "
+                "T = 93 * gas_energy / density."
+            )
+
+    if COOLING_TIME_FIELD in data.snapshot:
+        cooling_time = np.asarray(data.snapshot[COOLING_TIME_FIELD], dtype=np.float64)
+        if cooling_time.shape != fine_shape:
+            raise ValueError("Cooling-time shape does not match the density shape.")
+        derived_rate = cooling_rate_density_from_time(
+            internal_energy_density, cooling_time
+        )
+        if COOLING_RATE_DENSITY_FIELD in data.snapshot and not np.allclose(
+            np.asarray(data.snapshot[COOLING_RATE_DENSITY_FIELD], dtype=np.float64),
+            derived_rate,
+            rtol=1e-6,
+            atol=1e-12,
+        ):
+            raise ValueError(
+                "Stored cooling_rate_density violates C = gas_energy/cooling_time."
+            )
 
     volume = np.asarray(data.grid_volume, dtype=np.float64)
     if volume.shape != fine_shape:
@@ -191,41 +359,76 @@ def validate_coarsening_conservation(
     *,
     rtol: float,
     atol: float,
-) -> None:
-    """Validate the same stored extensive quantities as the legacy GalData path."""
+) -> dict[str, float]:
+    """验证广延量守恒，并返回可持久化的逐量诊断报告。"""
 
     fine_volume = np.asarray(fine.grid_volume, dtype=np.float64)
     coarse_volume = np.asarray(coarse.grid_volume, dtype=np.float64)
     fine_mass = np.asarray(fine.snapshot["density"], dtype=np.float64) * fine_volume
     coarse_mass = np.asarray(coarse.snapshot["density"], dtype=np.float64) * coarse_volume
 
-    fine_energy = np.asarray(fine.snapshot["gas_energy"], dtype=np.float64) * fine_volume
-    coarse_energy = np.asarray(coarse.snapshot["gas_energy"], dtype=np.float64) * coarse_volume
+    fine_internal_energy = (
+        np.asarray(fine.snapshot["gas_energy"], dtype=np.float64) * fine_volume
+    )
+    coarse_internal_energy = (
+        np.asarray(coarse.snapshot["gas_energy"], dtype=np.float64) * coarse_volume
+    )
     quantities = {
-        "cell volume": (
+        "cell_volume": (
             fine_volume.sum(dtype=np.float64),
             coarse_volume.sum(dtype=np.float64),
             np.abs(fine_volume).sum(dtype=np.float64),
         ),
-        "gas mass": (
+        "gas_mass": (
             fine_mass.sum(dtype=np.float64),
             coarse_mass.sum(dtype=np.float64),
             np.abs(fine_mass).sum(dtype=np.float64),
         ),
-        "gas energy": (
-            fine_energy.sum(dtype=np.float64),
-            coarse_energy.sum(dtype=np.float64),
-            np.abs(fine_energy).sum(dtype=np.float64),
+        "gas_internal_energy": (
+            fine_internal_energy.sum(dtype=np.float64),
+            coarse_internal_energy.sum(dtype=np.float64),
+            np.abs(fine_internal_energy).sum(dtype=np.float64),
         ),
     }
     for name in ("v1", "v2", "v3"):
         if name in fine.snapshot:
             fine_component = np.asarray(fine.snapshot[name], dtype=np.float64) * fine_mass
             coarse_component = np.asarray(coarse.snapshot[name], dtype=np.float64) * coarse_mass
-            quantities[f"{name} momentum"] = (
+            quantities[f"{name}_momentum"] = (
                 fine_component.sum(dtype=np.float64),
                 coarse_component.sum(dtype=np.float64),
                 np.abs(fine_component).sum(dtype=np.float64),
+            )
+    acceleration_fields = {"radial_acceleration", "theta_acceleration"}
+    if acceleration_fields.issubset(fine.snapshot):
+        fine_shape = fine_mass.shape
+        coarse_shape = coarse_mass.shape
+        fine_theta = np.broadcast_to(
+            np.asarray(fine.axes[1], dtype=np.float64)[:, None], fine_shape
+        )
+        coarse_theta = np.broadcast_to(
+            np.asarray(coarse.axes[1], dtype=np.float64)[:, None], coarse_shape
+        )
+        fine_a_r, fine_a_z = spherical_meridional_to_cylindrical(
+            np.asarray(fine.snapshot["radial_acceleration"], dtype=np.float64),
+            np.asarray(fine.snapshot["theta_acceleration"], dtype=np.float64),
+            fine_theta,
+        )
+        coarse_a_r, coarse_a_z = spherical_meridional_to_cylindrical(
+            np.asarray(coarse.snapshot["radial_acceleration"], dtype=np.float64),
+            np.asarray(coarse.snapshot["theta_acceleration"], dtype=np.float64),
+            coarse_theta,
+        )
+        for component, fine_values, coarse_values in (
+            ("R", fine_a_r, coarse_a_r),
+            ("z", fine_a_z, coarse_a_z),
+        ):
+            fine_force = fine_values * fine_mass
+            coarse_force = coarse_values * coarse_mass
+            quantities[f"gravitational_force_{component}"] = (
+                fine_force.sum(dtype=np.float64),
+                coarse_force.sum(dtype=np.float64),
+                np.abs(fine_force).sum(dtype=np.float64),
             )
     if "initial_stellar_density" in fine.snapshot:
         fine_stellar_mass = (
@@ -236,21 +439,49 @@ def validate_coarsening_conservation(
             np.asarray(coarse.snapshot["initial_stellar_density"], dtype=np.float64)
             * coarse_volume
         )
-        quantities["initial stellar mass"] = (
+        quantities["initial_stellar_mass"] = (
             fine_stellar_mass.sum(dtype=np.float64),
             coarse_stellar_mass.sum(dtype=np.float64),
             np.abs(fine_stellar_mass).sum(dtype=np.float64),
         )
+    if COOLING_RATE_DENSITY_FIELD in fine.snapshot:
+        fine_cooling_power = (
+            np.asarray(fine.snapshot[COOLING_RATE_DENSITY_FIELD], dtype=np.float64)
+            * fine_volume
+        )
+        coarse_cooling_power = (
+            np.asarray(coarse.snapshot[COOLING_RATE_DENSITY_FIELD], dtype=np.float64)
+            * coarse_volume
+        )
+        quantities["cooling_power"] = (
+            fine_cooling_power.sum(dtype=np.float64),
+            coarse_cooling_power.sum(dtype=np.float64),
+            np.abs(fine_cooling_power).sum(dtype=np.float64),
+        )
 
     failures = []
+    report: dict[str, float] = {}
+    maximum_scaled_relative_error = 0.0
     for name, (fine_total, coarse_total, reference_scale) in quantities.items():
         error = abs(coarse_total - fine_total)
         tolerance = atol + rtol * reference_scale
+        scaled_relative_error = error / max(reference_scale, atol)
+        maximum_scaled_relative_error = max(
+            maximum_scaled_relative_error, scaled_relative_error
+        )
+        prefix = f"conservation_{name}"
+        report[f"{prefix}_fine"] = float(fine_total)
+        report[f"{prefix}_coarse"] = float(coarse_total)
+        report[f"{prefix}_absolute_error"] = float(error)
+        report[f"{prefix}_scaled_relative_error"] = float(scaled_relative_error)
+        report[f"{prefix}_tolerance"] = float(tolerance)
         if error > tolerance:
-            relative_error = error / max(reference_scale, atol)
             failures.append(
                 f"{name}: fine={fine_total:.16g}, coarse={coarse_total:.16g}, "
-                f"scaled_rel_error={relative_error:.3e}, tolerance={tolerance:.3e}"
+                f"scaled_rel_error={scaled_relative_error:.3e}, tolerance={tolerance:.3e}"
             )
     if failures:
         raise ValueError("Conservative coarsening validation failed: " + "; ".join(failures))
+    report["epsilon_conservation"] = float(maximum_scaled_relative_error)
+    report["conservation_passed"] = 1.0
+    return report

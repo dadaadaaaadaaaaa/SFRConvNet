@@ -13,6 +13,42 @@ import numpy as np
 from typing import Callable, List, Tuple
 
 try:
+    from raw_data_processing.metadata_schema import (
+        build_derived_metadata,
+        build_fine_metadata,
+        build_physics_product_uid,
+        metadata_from_json,
+        metadata_to_json,
+        sha256_file,
+        validate_complete_metadata,
+    )
+except ModuleNotFoundError:  # 兼容直接运行 raw_data_processing/galaxy_data.py。
+    from metadata_schema import (
+        build_derived_metadata,
+        build_fine_metadata,
+        build_physics_product_uid,
+        metadata_from_json,
+        metadata_to_json,
+        sha256_file,
+        validate_complete_metadata,
+    )
+
+try:
+    from raw_data_processing.coarsening_common import (
+        GAS_INTERNAL_ENERGY_DENSITY_DATASET,
+        GAS_INTERNAL_ENERGY_DENSITY_FIELD,
+        cooling_rate_density_from_time,
+        temperature_from_internal_energy_density,
+    )
+except ModuleNotFoundError:  # 兼容直接运行 raw_data_processing/galaxy_data.py。
+    from coarsening_common import (
+        GAS_INTERNAL_ENERGY_DENSITY_DATASET,
+        GAS_INTERNAL_ENERGY_DENSITY_FIELD,
+        cooling_rate_density_from_time,
+        temperature_from_internal_energy_density,
+    )
+
+try:
     from pyhdf.SD import SD
 except ImportError:  # Processed HDF5 files and unit tests do not require HDF4.
     SD = None
@@ -22,6 +58,49 @@ def _validate_file_path(file_path: str):
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"The file at {file_path} does not exist.")
     return file_path
+
+
+def _validate_macer_thermodynamic_correspondence(correspondence: dict) -> None:
+    """确保旧字段名 ``gas_energy`` 只对应 Data-Set-10 内能密度。"""
+
+    sources = [
+        original_name
+        for original_name, new_name in correspondence.items()
+        if new_name == GAS_INTERNAL_ENERGY_DENSITY_FIELD
+    ]
+    if sources != [GAS_INTERNAL_ENERGY_DENSITY_DATASET]:
+        raise ValueError(
+            "MACER 'gas_energy' means gas internal-energy density and must map "
+            f"exclusively from {GAS_INTERNAL_ENERGY_DENSITY_DATASET}; got {sources}. "
+            "Data-Set-6 is temperature, not internal-energy density."
+        )
+
+
+def _validate_macer_dataset_labels(handle, datasets: set[str]) -> None:
+    """用 HDF ``long_name`` 防止条件输出造成 Data-Set 编号整体错位。"""
+
+    expected_tokens = {
+        "Data-Set-5": ("DENSITY",),
+        "Data-Set-8": ("A1",),
+        "Data-Set-9": ("A2",),
+        "Data-Set-10": ("GAS ENERGY",),
+        "Data-Set-11": ("SFR",),
+        "Data-Set-15": ("VOL",),
+        "Data-Set-17": ("COOLT",),
+    }
+    for dataset_name in sorted(datasets.intersection(expected_tokens)):
+        try:
+            long_name = str(handle.select(dataset_name).attributes()["long_name"])
+        except Exception as exc:
+            raise ValueError(
+                f"无法验证 {dataset_name} 的 HDF long_name；拒绝猜测字段编号。"
+            ) from exc
+        normalized = long_name.upper()
+        if not any(token in normalized for token in expected_tokens[dataset_name]):
+            raise ValueError(
+                f"{dataset_name} 的 long_name={long_name!r} 与预期语义不符；"
+                "该运行可能因条件输出导致 Data-Set 编号偏移。"
+            )
 
 
 def _validate_half_open_range(value, config_key: str) -> tuple[int, int]:
@@ -189,6 +268,7 @@ class GalData:
         self._data_hdfra = None
         self._data_log = None
         self._target_metadata = {}
+        self._sfr_products = {}
         self._corr = None
         self._axes = None
         self._axis_edges = None
@@ -197,19 +277,32 @@ class GalData:
         self._volume_source = None
         self._coarsening_metadata = {}
         self._coarsening_diagnostics = {}
+        self._metadata = {}
+        self._pending_source_metadata = None
 
     # -------- Properties --------
 
     @property
     def snapshot(self) -> dict:
         if isinstance(self._data_hdfra, dict):
-            return self._data_hdfra
+            data = dict(self._data_hdfra)
+            if "cooling_time" in data and "cooling_rate_density" not in data:
+                data["cooling_rate_density"] = cooling_rate_density_from_time(
+                    data["gas_energy"], data["cooling_time"]
+                )
+            return data
 
         data = {}
         for original_name, new_name in self._corr.items():
             arr = self._data_hdfra.select(original_name)[:]
             data[new_name] = arr[0, ...]
-        data["temperature"] = 93 * data["gas_energy"] / data["density"]  # temprature
+        data["temperature"] = temperature_from_internal_energy_density(
+            data["gas_energy"], data["density"]
+        )
+        if "cooling_time" in data:
+            data["cooling_rate_density"] = cooling_rate_density_from_time(
+                data["gas_energy"], data["cooling_time"]
+            )
         return data
 
     @property
@@ -219,6 +312,31 @@ class GalData:
     @property
     def target_metadata(self) -> dict:
         return self._target_metadata.copy()
+
+    @property
+    def sfr_products(self) -> dict:
+        """返回不含逐格数组的 SFR 监督产品摘要。"""
+
+        summary = {}
+        for mode, product in self._sfr_products.items():
+            summary[mode] = {
+                key: value
+                for key, value in product.items()
+                if key != "cell_sfr_baseline"
+            }
+        return metadata_from_json(metadata_to_json(summary)) if summary else {}
+
+    @property
+    def sfr_macer_baseline(self) -> float:
+        """默认数据兼容 MACER 算子在当前分辨率上的总 SFR。"""
+
+        return float(self._sfr_products["data_compatible"]["baseline_total"])
+
+    @property
+    def sfr_closure_true(self) -> float:
+        """有符号真闭合项 ``Y-B``。"""
+
+        return float(self._sfr_products["data_compatible"]["closure_true"])
 
     @property
     def coarsening_metadata(self) -> dict:
@@ -232,6 +350,24 @@ class GalData:
             name: np.asarray(values).copy()
             for name, values in self._coarsening_diagnostics.items()
         }
+
+    @property
+    def metadata(self) -> dict:
+        """返回该 snapshot 的版本化身份、来源、几何和字段契约。"""
+
+        return metadata_from_json(metadata_to_json(self._metadata)) if self._metadata else {}
+
+    @property
+    def parent_hr_uid(self) -> str | None:
+        """返回所有同源粗粒化变体共享的 HR snapshot UID。"""
+
+        return self._metadata.get("identity", {}).get("parent_hr_uid")
+
+    @property
+    def sample_uid(self) -> str | None:
+        """返回当前具体数据产品的稳定 UID。"""
+
+        return self._metadata.get("identity", {}).get("sample_uid")
 
     @property
     def raw_axes(self) -> list: # 返回原始的坐标轴数组。
@@ -420,6 +556,123 @@ class GalData:
         
         return float(sfr_estimated)
 
+    def compute_macer_sfr_products(
+        self,
+        *,
+        time_step: float | None = None,
+        context_selection: str = "log_window_mean",
+    ) -> "GalData":
+        """计算两套 MACER SFR 基线，并构造当前样本的 ``Y、B、Y-B``。
+
+        默认基线为数据兼容版本。``paper_physical`` 版本只作为物理对照保留。
+        这些量保存在独立监督产品中，不会进入 ``snapshot`` 模型输入通道。
+        """
+
+        try:
+            from raw_data_processing.macer_sfr_operator import calculate_macer_sfr
+        except ModuleNotFoundError:
+            from macer_sfr_operator import calculate_macer_sfr
+
+        required_fields = {"density", "gas_energy", "cooling_time", "radial_acceleration"}
+        missing_fields = sorted(required_fields.difference(self.snapshot))
+        if missing_fields:
+            raise KeyError(f"构造 MACER SFR baseline 缺少字段: {missing_fields}")
+        if self._data_log is None or "mbh" not in self._data_log:
+            raise KeyError("构造数据兼容 MACER SFR baseline 需要 log_data['mbh']。")
+        if "sfr_target" not in self._data_log:
+            raise KeyError("构造 closure 需要从 Data-Set-11 得到的 sfr_target。")
+
+        mbh = float(self._data_log["mbh"])
+        if not np.isfinite(mbh) or mbh <= 0:
+            raise ValueError(f"黑洞质量必须为正有限值，得到 {mbh!r}。")
+        if time_step is None:
+            candidate = float(self._data_log.get("dt", 0.0))
+            time_step = candidate if np.isfinite(candidate) and candidate >= 0 else 0.0
+            time_step_source = "log_data.dt" if time_step > 0 else "continuous_limit"
+        else:
+            time_step = float(time_step)
+            time_step_source = "explicit_argument"
+        if not np.isfinite(time_step) or time_step < 0:
+            raise ValueError("SFR 算子的 time_step 必须是非负有限值。")
+
+        target = float(self.sfr_target)
+        common = {
+            "density": self.snapshot["density"],
+            "internal_energy_density": self.snapshot["gas_energy"],
+            "cooling_time": self.snapshot["cooling_time"],
+            "cell_volume": self.grid_volume,
+            "radius": self.r,
+            "time_step": time_step,
+        }
+        results = {
+            "data_compatible": calculate_macer_sfr(
+                **common,
+                mode="data_compatible",
+                black_hole_mass=mbh,
+            ),
+            "paper_physical": calculate_macer_sfr(
+                **common,
+                mode="paper_physical",
+                radial_acceleration=self.snapshot["radial_acceleration"],
+            ),
+        }
+        context = {
+            "black_hole_mass": mbh,
+            "black_hole_mass_units": "2.5e7_Msun",
+            "black_hole_mass_source": "log_data.mbh",
+            "time_step": time_step,
+            "time_step_units": "Gyr",
+            "time_step_source": time_step_source,
+            "log_context_selection": str(context_selection),
+            "log_context_scope_gyr": float(
+                self._data_log.get("log_context_scope", 0.0)
+            ),
+            "snapshot_time_gyr": float(self.time),
+        }
+        products = {}
+        metadata_operators = {}
+        for mode, result in results.items():
+            parameters = dict(result.parameters)
+            product_uid = None
+            if self.sample_uid:
+                product_uid = build_physics_product_uid(
+                    self.sample_uid,
+                    operator_id=str(parameters["operator_id"]),
+                    operator_version=int(parameters["operator_version"]),
+                    operator_parameters=parameters,
+                    context=context,
+                )
+            baseline = float(result.total_sfr)
+            products[mode] = {
+                "baseline_total": baseline,
+                "closure_true": target - baseline,
+                "target_total": target,
+                "units": self._target_metadata.get("units", "MACER_mass_code/Gyr"),
+                "physics_product_uid": product_uid,
+                "parameters": parameters,
+                "context": dict(context),
+                "cell_sfr_baseline": np.asarray(result.cell_sfr, dtype=np.float64),
+            }
+            metadata_operators[mode] = {
+                "physics_product_uid": product_uid,
+                "parameters": parameters,
+                "context": dict(context),
+            }
+        self._sfr_products = products
+        if self._metadata:
+            self._metadata["supervision"] = {
+                "canonical_target": "sfr_target",
+                "canonical_baseline_mode": "data_compatible",
+                "closure_definition": "sfr_target-sfr_macer_baseline",
+                "signed_closure": True,
+                "target_units": self._target_metadata.get(
+                    "units", "MACER_mass_code/Gyr"
+                ),
+                "sfr_operators": metadata_operators,
+            }
+            validate_complete_metadata(self._metadata)
+        return self
+
     # -------- Public Methods -------- # 用户直接调用的接口
 
     def read_hdfra( # 使用 pyhdf 库读取 HDF4 格式的Snapshot
@@ -430,6 +683,7 @@ class GalData:
         func_parse_log: Callable,
         scope: float,
         target_config: dict | None = None,
+        source_metadata: dict | None = None,
     ) -> "GalData":
         """
         Reads snapshot data and associated BH accretion rates from specified paths.
@@ -440,9 +694,40 @@ class GalData:
             func_parse_log (Callable): Function to parse the log file into readable data.
             scope (float): Time scope for filtering log data. If provided, only entries within [time - scope, time + scope] are retained.
         """
-        self._load_snapshot_hdfra(hdfra_path, time)._load_log(log_path, func_parse_log, scope)
+        self._load_snapshot_hdfra(hdfra_path, time)
+        datasets_to_validate = {
+            name
+            for name, semantic in (self._corr or {}).items()
+            if name in {"Data-Set-5", "Data-Set-10", "Data-Set-17"}
+            or semantic in {"radial_acceleration", "theta_acceleration"}
+        }
+        datasets_to_validate.add("Data-Set-15")
+        if target_config is not None:
+            datasets_to_validate.add(str(target_config["dataset"]))
+        _validate_macer_dataset_labels(self._data_hdfra, datasets_to_validate)
+        self._load_log(log_path, func_parse_log, scope)
+        self._pending_source_metadata = dict(source_metadata) if source_metadata is not None else None
         if target_config is not None:
             self._set_target_from_snapshot(target_config)
+        return self
+
+    def attach_fine_source_metadata(self, source_metadata: dict) -> "GalData":
+        """为已重建的 legacy fine HDF5 补充完整源身份，不改变任何物理数组。"""
+
+        if self._coarsening_metadata:
+            raise ValueError("只能给 fine snapshot 附加源身份，不能重写粗粒化结果的身份。")
+        self.__validate_coords()
+        self._metadata = build_fine_metadata(
+            source=source_metadata,
+            snapshot_fields=tuple(self.snapshot),
+            axes=self._axes,
+            axis_edges=self._axis_edges,
+            coordinate_mode=self._coordinate_mode,
+            ndim=self.ndim,
+            target_metadata=self._target_metadata,
+            volume_source=self._volume_source,
+        )
+        validate_complete_metadata(self._metadata)
         return self
 
     def _set_target_from_snapshot(self, target_config: dict) -> "GalData":
@@ -487,8 +772,11 @@ class GalData:
             "name": target_name,
             "reduction": reduction,
             "quantity": "instantaneous_sfr",
-            "units": str(target_config.get("units", "Msun/yr")),
+            "units": str(target_config.get("units", "MACER_mass_code/Gyr")),
         }
+        for key in ("mass_unit_msun", "time_unit_gyr", "to_msun_per_yr"):
+            if key in target_config:
+                self._target_metadata[key] = float(target_config[key])
         return self
 
     def _as_coarsening_input(self):
@@ -520,7 +808,7 @@ class GalData:
             from raw_data_processing.coarsening_common import validate_coarsening_conservation
         except ModuleNotFoundError:
             from coarsening_common import validate_coarsening_conservation
-        validate_coarsening_conservation(
+        conservation_report = validate_coarsening_conservation(
             source, result, rtol=conservation_rtol, atol=conservation_atol
         )
         coarse = GalData(ndim=self.ndim, coordinate_mode=self._coordinate_mode)
@@ -540,6 +828,23 @@ class GalData:
         coarse._coarsening_diagnostics = {
             name: np.asarray(values) for name, values in result.diagnostics.items()
         }
+        coarse._coarsening_diagnostics.update(
+            {name: np.asarray(value) for name, value in conservation_report.items()}
+        )
+        coarse._metadata = build_derived_metadata(
+            self._metadata,
+            operator_metadata=coarse._coarsening_metadata,
+            axes=coarse._axes,
+            axis_edges=coarse._axis_edges,
+            coordinate_mode=coarse._coordinate_mode,
+            volume_source=coarse._volume_source,
+        )
+        if {
+            "cooling_time", "radial_acceleration"
+        }.issubset(coarse.snapshot) and coarse._data_log is not None and {
+            "mbh", "sfr_target"
+        }.issubset(coarse._data_log):
+            coarse.compute_macer_sfr_products()
         return coarse
 
     def coarsen(
@@ -649,6 +954,7 @@ class GalData:
             self._corr = dict([corr])
         else:
             self._corr = dict(corr)
+        _validate_macer_thermodynamic_correspondence(self._corr)
         return self
 
     def set_coord(self, coords: List[str] | str) -> "GalData":
@@ -691,6 +997,18 @@ class GalData:
             raise ValueError("Data-Set-15 must contain only finite, strictly positive volumes.")
         self._grid_volume = volume
         self._volume_source = "Data-Set-15"
+        if self._pending_source_metadata is not None:
+            self._metadata = build_fine_metadata(
+                source=self._pending_source_metadata,
+                snapshot_fields=tuple(self.snapshot),
+                axes=self._axes,
+                axis_edges=self._axis_edges,
+                coordinate_mode=self._coordinate_mode,
+                ndim=self.ndim,
+                target_metadata=self._target_metadata,
+                volume_source=self._volume_source,
+            )
+            validate_complete_metadata(self._metadata)
         return self
 
     def save_h5(self, file_path: str) -> None: # 将Galdata保存为HDF5格式
@@ -699,11 +1017,41 @@ class GalData:
         Args:
             file_path (str): Path to the output HDF5 file.
         """
+        if not self._sfr_products and {
+            "cooling_time", "radial_acceleration"
+        }.issubset(self.snapshot) and self._data_log is not None and {
+            "mbh", "sfr_target"
+        }.issubset(self._data_log):
+            self.compute_macer_sfr_products()
         with h5py.File(file_path, "w") as f:
-            f.attrs["processed_format_version"] = 4
+            f.attrs["processed_format_version"] = 6
             snap_grp = f.create_group("snapshot")
             for name, data in self.snapshot.items():
-                snap_grp.create_dataset(name, data=data)
+                dataset = snap_grp.create_dataset(name, data=data)
+                if name == GAS_INTERNAL_ENERGY_DENSITY_FIELD:
+                    dataset.attrs["physical_quantity"] = "gas_internal_energy_density"
+                    dataset.attrs["source_dataset"] = GAS_INTERNAL_ENERGY_DENSITY_DATASET
+                    dataset.attrs["integrated_quantity"] = "gas_internal_energy"
+                    dataset.attrs["integration_weight"] = "geometry/cell_volume"
+                    dataset.attrs["temperature_relation"] = "temperature=93*gas_energy/density"
+                elif name == "cooling_time":
+                    dataset.attrs["physical_quantity"] = "gas_cooling_time"
+                    dataset.attrs["source_dataset"] = "Data-Set-17"
+                    dataset.attrs["coarsening_rule"] = (
+                        "derive_from_gas_energy/cooling_rate_density"
+                    )
+                elif name == "cooling_rate_density":
+                    dataset.attrs["physical_quantity"] = "gas_cooling_rate_density"
+                    dataset.attrs["definition"] = "gas_energy/cooling_time"
+                    dataset.attrs["conserved_integral"] = (
+                        "sum(cooling_rate_density*cell_volume)"
+                    )
+                elif name in {"radial_acceleration", "theta_acceleration"}:
+                    dataset.attrs["physical_quantity"] = "gravitational_acceleration"
+                    dataset.attrs["basis"] = "spherical"
+                    dataset.attrs["source_dataset"] = (
+                        "Data-Set-8" if name == "radial_acceleration" else "Data-Set-9"
+                    )
 
             coord_grp = f.create_group("coordinates")
             for i, ax in enumerate(self._axes):
@@ -724,6 +1072,26 @@ class GalData:
 
             f.attrs["time"] = self.time
 
+            if self._metadata:
+                metadata_grp = f.create_group("metadata")
+                metadata_grp.attrs["schema_name"] = self._metadata.get("schema_name", "")
+                metadata_grp.attrs["schema_version"] = int(
+                    self._metadata.get("schema_version", 0)
+                )
+                metadata_grp.attrs["metadata_completeness"] = self._metadata.get(
+                    "metadata_completeness", "unknown"
+                )
+                identity = self._metadata.get("identity", {})
+                if identity.get("parent_hr_uid"):
+                    metadata_grp.attrs["parent_hr_uid"] = identity["parent_hr_uid"]
+                if identity.get("sample_uid"):
+                    metadata_grp.attrs["sample_uid"] = identity["sample_uid"]
+                metadata_grp.create_dataset(
+                    "contract_json",
+                    data=metadata_to_json(self._metadata),
+                    dtype=h5py.string_dtype(encoding="utf-8"),
+                )
+
             corr_grp = f.create_group("correlation")
             corr_grp.attrs["length"] = len(self._corr)
             for i, (orig, new) in enumerate(self._corr.items()):
@@ -733,9 +1101,54 @@ class GalData:
             if self._coarsening_metadata or self._coarsening_diagnostics:
                 coarse_grp = f.create_group("coarsening")
                 for key, value in self._coarsening_metadata.items():
-                    coarse_grp.attrs[key] = value
+                    if isinstance(value, dict):
+                        coarse_grp.attrs[key] = "__json__:" + metadata_to_json(value)
+                    else:
+                        coarse_grp.attrs[key] = value
                 for name, values in self._coarsening_diagnostics.items():
                     coarse_grp.create_dataset(name, data=np.asarray(values))
+
+            if self._sfr_products:
+                sfr_grp = f.create_group("sfr_supervision")
+                sfr_grp.attrs["schema_version"] = 1
+                sfr_grp.attrs["default_mode"] = "data_compatible"
+                sfr_grp.attrs["target_total"] = float(self.sfr_target)
+                sfr_grp.attrs["target_units"] = self._target_metadata.get(
+                    "units", "MACER_mass_code/Gyr"
+                )
+                canonical = self._sfr_products["data_compatible"]
+                canonical_grp = sfr_grp.create_group("canonical")
+                canonical_grp.create_dataset("Y_alpha", data=float(self.sfr_target))
+                canonical_grp.create_dataset(
+                    "B_alpha", data=float(canonical["baseline_total"])
+                )
+                canonical_grp.create_dataset(
+                    "C_alpha_true", data=float(canonical["closure_true"])
+                )
+                canonical_grp.attrs["definition"] = "C_alpha_true=Y_alpha-B_alpha"
+                for mode, product in self._sfr_products.items():
+                    mode_grp = sfr_grp.create_group(mode)
+                    mode_grp.attrs["baseline_total"] = float(product["baseline_total"])
+                    mode_grp.attrs["closure_true"] = float(product["closure_true"])
+                    mode_grp.attrs["units"] = str(product["units"])
+                    if product.get("physics_product_uid"):
+                        mode_grp.attrs["physics_product_uid"] = product[
+                            "physics_product_uid"
+                        ]
+                    mode_grp.create_dataset(
+                        "cell_sfr_baseline",
+                        data=np.asarray(product["cell_sfr_baseline"], dtype=np.float64),
+                    )
+                    mode_grp.create_dataset(
+                        "parameters_json",
+                        data=metadata_to_json(product["parameters"]),
+                        dtype=h5py.string_dtype(encoding="utf-8"),
+                    )
+                    mode_grp.create_dataset(
+                        "context_json",
+                        data=metadata_to_json(product["context"]),
+                        dtype=h5py.string_dtype(encoding="utf-8"),
+                    )
 
             # print(f"GalData saved to HDF5: {file_path}")
 
@@ -757,10 +1170,120 @@ class GalData:
             self._coordinate_mode = coordinate_mode
 
             self.time = f.attrs["time"]
+            self._metadata = {}
+            self._sfr_products = {}
+            self._pending_source_metadata = None
+            if "metadata" in f and "contract_json" in f["metadata"]:
+                payload = f["metadata"]["contract_json"][()]
+                self._metadata = metadata_from_json(payload)
+                if self._metadata.get("metadata_completeness") == "complete":
+                    validate_complete_metadata(self._metadata)
+
+            if "sfr_supervision" in f:
+                sfr_grp = f["sfr_supervision"]
+                stored_target = float(sfr_grp.attrs["target_total"])
+                canonical_grp = sfr_grp.get("canonical")
+                if canonical_grp is None:
+                    raise ValueError("sfr_supervision 缺少 canonical Y/B/C 数据组。")
+                canonical_y = float(canonical_grp["Y_alpha"][()])
+                canonical_b = float(canonical_grp["B_alpha"][()])
+                canonical_c = float(canonical_grp["C_alpha_true"][()])
+                if not np.isclose(
+                    canonical_c, canonical_y - canonical_b, rtol=1e-12, atol=1e-12
+                ):
+                    raise ValueError("canonical SFR 产品违反 C_alpha_true=Y_alpha-B_alpha。")
+                for mode in (name for name in sfr_grp if name != "canonical"):
+                    mode_grp = sfr_grp[mode]
+                    baseline = float(mode_grp.attrs["baseline_total"])
+                    closure = float(mode_grp.attrs["closure_true"])
+                    if not np.isclose(
+                        closure, stored_target - baseline, rtol=1e-12, atol=1e-12
+                    ):
+                        raise ValueError(
+                            f"SFR supervision {mode!r} violates closure=target-baseline."
+                        )
+                    product_uid = mode_grp.attrs.get("physics_product_uid")
+                    if isinstance(product_uid, bytes):
+                        product_uid = product_uid.decode()
+                    self._sfr_products[mode] = {
+                        "baseline_total": baseline,
+                        "closure_true": closure,
+                        "target_total": stored_target,
+                        "units": str(
+                            mode_grp.attrs.get(
+                                "units", sfr_grp.attrs.get("target_units", "")
+                            )
+                        ),
+                        "physics_product_uid": product_uid,
+                        "parameters": metadata_from_json(
+                            mode_grp["parameters_json"][()]
+                        ),
+                        "context": metadata_from_json(mode_grp["context_json"][()]),
+                        "cell_sfr_baseline": mode_grp["cell_sfr_baseline"][()],
+                    }
+                default_product = self._sfr_products.get("data_compatible")
+                if default_product is None or not (
+                    np.isclose(canonical_y, stored_target, rtol=1e-12, atol=1e-12)
+                    and np.isclose(
+                        canonical_b,
+                        default_product["baseline_total"],
+                        rtol=1e-12,
+                        atol=1e-12,
+                    )
+                    and np.isclose(
+                        canonical_c,
+                        default_product["closure_true"],
+                        rtol=1e-12,
+                        atol=1e-12,
+                    )
+                ):
+                    raise ValueError(
+                        "canonical Y/B/C 与 data_compatible 默认产品不一致。"
+                    )
+                supervision = self._metadata.get("supervision", {})
+                declared_operators = supervision.get("sfr_operators", {})
+                for mode, product in self._sfr_products.items():
+                    if not declared_operators:
+                        break
+                    declared = declared_operators.get(mode)
+                    if not isinstance(declared, dict):
+                        raise ValueError(f"metadata 未声明 SFR 产品模式 {mode!r}。")
+                    if (
+                        metadata_to_json(declared.get("parameters", {}))
+                        != metadata_to_json(product["parameters"])
+                        or metadata_to_json(declared.get("context", {}))
+                        != metadata_to_json(product["context"])
+                    ):
+                        raise ValueError(
+                            f"metadata 与 sfr_supervision/{mode} 的参数或上下文不一致。"
+                        )
+                    expected_product_uid = build_physics_product_uid(
+                        self.sample_uid,
+                        operator_id=str(product["parameters"]["operator_id"]),
+                        operator_version=product["parameters"]["operator_version"],
+                        operator_parameters=product["parameters"],
+                        context=product["context"],
+                    )
+                    if (
+                        product.get("physics_product_uid") != expected_product_uid
+                        or declared.get("physics_product_uid") != expected_product_uid
+                    ):
+                        raise ValueError(f"SFR 产品 {mode!r} 的 physics_product_uid 不一致。")
 
             self._data_hdfra = {}
             for name in f["snapshot"]:
                 self._data_hdfra[name] = f["snapshot"][name][()]
+            gas_energy_dataset = f["snapshot"].get(GAS_INTERNAL_ENERGY_DENSITY_FIELD)
+            stored_semantics = None
+            if gas_energy_dataset is not None:
+                stored_semantics = gas_energy_dataset.attrs.get("physical_quantity")
+                if isinstance(stored_semantics, bytes):
+                    stored_semantics = stored_semantics.decode()
+                if stored_semantics not in (None, "gas_internal_energy_density"):
+                    raise ValueError(
+                        f"Processed file '{file_path}' assigns incompatible semantics "
+                        f"{stored_semantics!r} to 'gas_energy'."
+                    )
 
             axis_names = sorted(
                 (name for name in f["coordinates"] if name.startswith("axis_") and not name.endswith("_edges")),
@@ -806,18 +1329,44 @@ class GalData:
                     for key, value in f["log_data"].attrs.items()
                     if key.startswith("target_")
                 }
+                if self._sfr_products:
+                    stored_target = float(
+                        self._sfr_products["data_compatible"]["target_total"]
+                    )
+                    if not np.isclose(
+                        stored_target,
+                        float(self._data_log["sfr_target"]),
+                        rtol=1e-12,
+                        atol=1e-12,
+                    ):
+                        raise ValueError(
+                            "sfr_supervision target 与 log_data/sfr_target 不一致。"
+                        )
 
             corr_grp = f["correlation"]
             self._corr = dict(
                 (corr_grp.attrs[f"{i}_orig"], corr_grp.attrs[f"{i}_new"]) for i in range(corr_grp.attrs["length"])
             )
+            if self._corr:
+                _validate_macer_thermodynamic_correspondence(self._corr)
+            elif stored_semantics != "gas_internal_energy_density":
+                raise ValueError(
+                    f"Processed file '{file_path}' has no raw-field correspondence and "
+                    "does not explicitly identify 'gas_energy' as internal-energy density."
+                )
 
             self._coarsening_metadata = {}
             self._coarsening_diagnostics = {}
             if "coarsening" in f:
                 coarse_grp = f["coarsening"]
                 self._coarsening_metadata = {
-                    key: value.decode() if isinstance(value, bytes) else value
+                    key: (
+                        metadata_from_json(value.decode()[len("__json__:"):])
+                        if isinstance(value, bytes) and value.decode().startswith("__json__:")
+                        else metadata_from_json(value[len("__json__:"):])
+                        if isinstance(value, str) and value.startswith("__json__:")
+                        else value.decode() if isinstance(value, bytes) else value
+                    )
                     for key, value in coarse_grp.attrs.items()
                 }
                 self._coarsening_diagnostics = {
@@ -862,7 +1411,9 @@ class GalData:
         path = _validate_file_path(path)
         if self.time is None:
             raise ValueError("Simulation time not set. Please call load_snapshot_hdfra() first.")
-        self._data_log = f(path, time=self.time, scope=scope)
+        parsed = f(path, time=self.time, scope=scope)
+        self._data_log = dict(parsed.items()) if hasattr(parsed, "items") else dict(parsed)
+        self._data_log["log_context_scope"] = float(scope)
         return self
 
     @staticmethod
@@ -952,6 +1503,52 @@ class GalDataSet:
         return self._target_metadata.copy()
 
     @property
+    def sample_uid(self) -> np.ndarray:
+        """返回与样本轴对齐的衍生数据产品 UID。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["sample_uid"], dtype=str)
+
+    @property
+    def parent_hr_uid(self) -> np.ndarray:
+        """返回与样本轴对齐的 HR 母 snapshot UID。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["parent_hr_uid"], dtype=str)
+
+    @property
+    def mass_filter(self) -> np.ndarray:
+        """返回 R_m 的目标质量尺度；非 R_m 样本为 NaN。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["mass_filter"], dtype=np.float64)
+
+    @property
+    def log_mass_filter(self) -> np.ndarray:
+        """返回模型可用的 log10(M_filter) 分辨率条件。"""
+
+        values = self.mass_filter
+        if not np.all(np.isfinite(values)) or np.any(values <= 0):
+            raise ValueError(
+                "log_mass_filter 仅适用于具有正有限 mass_filter 的完整 R_m 数据集。"
+            )
+        return np.log10(values)
+
+    @property
+    def h_eff(self) -> np.ndarray:
+        """返回预留的 H_eff 场，目前不会自动加入模型输入。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["h_eff"], dtype=np.float64)
+
+    @property
+    def n_eff(self) -> np.ndarray:
+        """返回预留的 N_eff 场，目前不会自动加入模型输入。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["n_eff"], dtype=np.float64)
+
+    @property
     def y(self) -> np.ndarray: # 提取恒星形成率并计算对数
         self.__verify_data_loaded()
         sfr_target = np.array(self._raw_data["sfr_target"])
@@ -988,6 +1585,25 @@ class GalDataSet:
         """Physical (untransformed) Kennicutt-Schmidt SFR baseline."""
         self.__verify_data_loaded()
         return np.array(self._raw_data["sfr_ks"])
+
+    @property
+    def sfr_macer_baseline(self) -> np.ndarray:
+        """默认数据兼容 MACER 物理基线 ``B_alpha``。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["sfr_macer_baseline"], dtype=np.float64)
+
+    @property
+    def sfr_closure_true(self) -> np.ndarray:
+        """允许为负的真闭合项 ``C_alpha=Y_alpha-B_alpha``。"""
+
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["sfr_closure_true"], dtype=np.float64)
+
+    @property
+    def physics_product_uid(self) -> np.ndarray:
+        self.__verify_data_loaded()
+        return np.asarray(self._raw_data["physics_product_uid"], dtype=str)
 
     @property
     def groups(self) -> np.ndarray: # 将内部的 _group_labels 列表转化为字符串数组返回。这对应了原始数据属于哪个模拟子目录（如不同的星系初始条件或 AGN 反馈参数）。它是后续进行分层切分和样本均衡的核心依据。
@@ -1102,7 +1718,13 @@ class GalDataSet:
         self._x_keys = selected
         return self
 
-    def load_data(self, folder_path) -> "GalDataSet":
+    def load_data(
+        self,
+        folder_path,
+        *,
+        allow_mixed_coarsening: bool = False,
+        require_complete_metadata: bool = False,
+    ) -> "GalDataSet":
         """
         整个数据集的入口。它接收一个或多个文件夹路径，遍历里面所有的 HDF5 数据文件。
         它把每个文件里的物理场（如密度、能量）、坐标网格、黑洞质量（mbh）、实际吸积率（mdot_macer 和 mdot_edd）提取出来，分别追加到内部的 _raw_data 字典中。
@@ -1142,14 +1764,22 @@ class GalDataSet:
         
         data.load_h5(data_path)
         self._target_metadata = data.target_metadata
-        signature_keys = (
-            "operator", "operator_version", "source_shape", "output_shape",
-            "mass_filter", "kernel", "distance_metric", "mass_geometry",
-            "graph_eta_initial", "graph_eta_max", "partition_semantics",
-        )
-        self._coarsening_signature = tuple(
-            (key, repr(data.coarsening_metadata.get(key))) for key in signature_keys
-        )
+        def processing_signature(sample: GalData) -> tuple:
+            derivation = sample.metadata.get("derivation", {})
+            supervision = sample.metadata.get("supervision", {})
+            operator_parameters = {
+                mode: entry.get("parameters", {})
+                for mode, entry in supervision.get("sfr_operators", {}).items()
+            }
+            return (
+                str(derivation.get("operator_id", "unknown")),
+                str(derivation.get("operator_version", "unknown")),
+                metadata_to_json(derivation.get("operator_parameters", {})),
+                str(supervision.get("canonical_baseline_mode", "none")),
+                metadata_to_json(operator_parameters),
+            )
+
+        self._coarsening_signature = processing_signature(data)
         self._coordinate_reference = tuple(
             np.asarray(axis).copy() for axis in data.raw_axes
         )
@@ -1165,6 +1795,16 @@ class GalDataSet:
                 # "mdot_edd",
                 "time",
                 "sfr_ks",
+                "sfr_macer_baseline",
+                "sfr_closure_true",
+                "physics_product_uid",
+                "sample_uid",
+                "parent_hr_uid",
+                "operator_id",
+                "mass_filter",
+                "h_eff",
+                "n_eff",
+                "sample_metadata",
                 # "mdot_bondi",
             ]
         )
@@ -1181,16 +1821,15 @@ class GalDataSet:
                     continue
                 file_path = os.path.join(fp, file_name)
                 data = GalData().load_h5(file_path)
+                if require_complete_metadata:
+                    validate_complete_metadata(data.metadata)
                 if data.target_metadata != self._target_metadata:
                     raise ValueError(
                         f"Inconsistent target metadata in '{file_path}': "
                         f"{data.target_metadata} != {self._target_metadata}"
                     )
-                signature = tuple(
-                    (key, repr(data.coarsening_metadata.get(key)))
-                    for key in signature_keys
-                )
-                if signature != self._coarsening_signature:
+                signature = processing_signature(data)
+                if signature != self._coarsening_signature and not allow_mixed_coarsening:
                     raise ValueError(
                         f"Inconsistent coarsening operator in '{file_path}': "
                         f"{signature} != {self._coarsening_signature}. Do not mix R_h/R_m "
@@ -1217,6 +1856,51 @@ class GalDataSet:
                 self._raw_data["time"].append(data.time)
                 # self._raw_data["mdot_bondi"].append(data.mdot_bondi()) # 计算邦迪吸积率
                 self._raw_data["sfr_ks"].append(data.sfr_ks()) # 计算KS定律SFR
+                default_product = data.sfr_products.get("data_compatible")
+                if default_product is None:
+                    self._raw_data["sfr_macer_baseline"].append(np.nan)
+                    self._raw_data["sfr_closure_true"].append(np.nan)
+                    self._raw_data["physics_product_uid"].append("")
+                else:
+                    self._raw_data["sfr_macer_baseline"].append(
+                        float(default_product["baseline_total"])
+                    )
+                    self._raw_data["sfr_closure_true"].append(
+                        float(default_product["closure_true"])
+                    )
+                    self._raw_data["physics_product_uid"].append(
+                        default_product.get("physics_product_uid") or ""
+                    )
+                output_shape = data.snapshot["density"].shape
+                diagnostics = data.coarsening_diagnostics
+                self._raw_data["sample_uid"].append(data.sample_uid or "")
+                self._raw_data["parent_hr_uid"].append(data.parent_hr_uid or "")
+                self._raw_data["operator_id"].append(
+                    data.coarsening_metadata.get(
+                        "operator",
+                        data.metadata.get("derivation", {}).get("operator_id", "unknown"),
+                    )
+                )
+                self._raw_data["mass_filter"].append(
+                    float(data.coarsening_metadata.get("mass_filter", np.nan))
+                )
+                self._raw_data["h_eff"].append(
+                    np.asarray(
+                        diagnostics.get(
+                            "effective_support_scale", np.full(output_shape, np.nan)
+                        ),
+                        dtype=np.float64,
+                    )
+                )
+                self._raw_data["n_eff"].append(
+                    np.asarray(
+                        diagnostics.get(
+                            "effective_source_count", np.full(output_shape, np.nan)
+                        ),
+                        dtype=np.float64,
+                    )
+                )
+                self._raw_data["sample_metadata"].append(data.metadata)
                 self._group_labels.append(group_idx) # 为每个galaxydata添加group标签
 
         return self
@@ -1302,6 +1986,7 @@ class GalDataSet:
         n_bins: int = 10,
         random_state: int | None = None,
         shuffle: bool = True,
+        group_by_parent_uid: bool = False,
     ):
         """
         Split dataset into train / validation / test sets.
@@ -1323,6 +2008,27 @@ class GalDataSet:
         indices = np.arange(len(self))
 
         labels = self._build_stratified_labels(stratify, n_bins) # private method 中构建了_build_stratified_labels函数，用于构建stratify,这是对数据分成训练集、验证集和测试集的依据
+        if group_by_parent_uid:
+            parent_uid = self.parent_hr_uid
+            if np.any(parent_uid == ""):
+                raise ValueError(
+                    "按 parent_hr_uid 划分需要所有样本具有完整 metadata。"
+                )
+            member_map: dict[str, list[int]] = {}
+            for sample_index, uid in enumerate(parent_uid.tolist()):
+                member_map.setdefault(uid, []).append(sample_index)
+            grouped_members = list(member_map.values())
+            indices = np.arange(len(grouped_members))
+            if labels is not None:
+                grouped_labels = []
+                for members in grouped_members:
+                    member_labels = np.asarray(labels)[members]
+                    if not np.all(member_labels == member_labels[0]):
+                        raise ValueError(
+                            "同一 parent_hr_uid 的多分辨率变体具有不一致的分层标签。"
+                        )
+                    grouped_labels.append(member_labels[0])
+                labels = np.asarray(grouped_labels)
         train_idx, val_idx, test_idx = [], [], []
         if labels is None:
             tr, va, te = self._split_group(indices, train_size, validation_size, rng, shuffle)
@@ -1353,6 +2059,18 @@ class GalDataSet:
             if validation_size > 0:
                 rng.shuffle(val_idx)
             rng.shuffle(test_idx)
+
+        if group_by_parent_uid:
+            def expand_group_indices(group_indices):
+                if len(group_indices) == 0:
+                    return np.empty(0, dtype=int)
+                return np.concatenate(
+                    [np.asarray(grouped_members[index], dtype=int) for index in group_indices]
+                )
+
+            train_idx = expand_group_indices(train_idx)
+            val_idx = expand_group_indices(val_idx)
+            test_idx = expand_group_indices(test_idx)
 
         train_set = self.__subset_by_idx(train_idx)
         val_set = self.__subset_by_idx(val_idx) if validation_size > 0 else None
@@ -1712,6 +2430,19 @@ if __name__ == "__main__":
                     func_parse_log=func_parse_log,
                     scope=scope,
                     target_config=target_config,
+                    source_metadata={
+                        "simulation_code": "MACER2D",
+                        "galaxy_type": gal_type,
+                        "galaxy_id": gal_name,
+                        "run_id": gal_name,
+                        "source_series_id": gal_config["folder_name"],
+                        "raw_snapshot_index": int(output_indices[index]),
+                        "source_file_id": file_name,
+                        "source_file_sha256": sha256_file(file_path),
+                        "source_file_size_bytes": int(os.path.getsize(file_path)),
+                        "time": float(time_seq[index]),
+                        "time_units": "Gyr",
+                    },
                 )
                 file.set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射
                 file.save_h5(os.path.join(save_path_fine, output_name)) # 将原始分辨率数据的HDF5文件保存至fine文件夹

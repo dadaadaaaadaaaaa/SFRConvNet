@@ -68,7 +68,7 @@ class HDFdata():
     Gas properties:
         d      : gas number density
         T_file : gas temperature stored directly in the HDF file
-        e      : gas internal energy
+        e      : 气体内能密度（Data-Set-10）
         T      : temperature recomputed from e and d using the original script
         K      : entropy-like quantity
 
@@ -115,7 +115,7 @@ class HDFdata():
         self.a1 = self.hdffile.select("Data-Set-8")[0, :, :]      # auxiliary field, not used
         self.a2 = self.hdffile.select("Data-Set-9")[0, :, :]      # auxiliary field, not used
 
-        self.e = self.hdffile.select("Data-Set-10")[0, :, :]   # gas internal energy
+        self.e = self.hdffile.select("Data-Set-10")[0, :, :]   # 气体内能密度
 
         # Star formation and stellar quantities
         self.sfr = self.hdffile.select("Data-Set-11")[0, :, :]      # star formation rate
@@ -156,7 +156,7 @@ class HDFdata():
             self.dtheta[i] = 9 / 10 * np.pi / self.lentheta
 
         # Keep the original script convention:
-        # recompute temperature from internal energy and number density
+        # 按 MACER 恒等式由内能密度和气体密度重新计算温度。
         with np.errstate(divide='ignore', invalid='ignore'):
             self.T = 93 * self.e / self.d
             self.K = self.T * 8.625e-8 / self.d ** (2 / 3)

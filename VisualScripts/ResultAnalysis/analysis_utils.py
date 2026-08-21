@@ -286,7 +286,7 @@ class CachedPTDataset:
             raise FileNotFoundError(f"Cached dataset not found: {pt_path}")
 
         loaded = torch.load(pt_path, map_location="cpu", weights_only=False)
-        items = list(loaded)
+        items = list(loaded) if isinstance(loaded, (list, tuple)) else None
 
         self.coord = None
         self.y_baseline = None
@@ -295,6 +295,10 @@ class CachedPTDataset:
         self.n_groups = None
         self.time = None
         self.type = "cached"
+        self.sample_uid = None
+        self.parent_hr_uid = None
+        conditioning_value = None
+        payload_conditioning_variable = None
         channel_metadata = load_cache_metadata(pt_path)
         self.input_channels = tuple(channel_metadata.get("input_channels", ()))
         self.excluded_channels = tuple(channel_metadata.get("excluded_channels", ()))
@@ -306,9 +310,27 @@ class CachedPTDataset:
         if "includes_zero_targets" in channel_metadata:
             self.target_metadata["includes_zero_targets"] = bool(channel_metadata["includes_zero_targets"])
 
-        # Current SFR cache format from prepare_data.py:
+        # Version-3 缓存把 KS baseline 与 log10(M_filter) 条件明确分开。
+        if isinstance(loaded, dict):
+            schema = loaded.get("schema", {})
+            if schema.get("name") != "macnet_sfr_cache" or int(schema.get("version", -1)) != 3:
+                raise RuntimeError(f"Unsupported cache schema in '{pt_path}': {schema!r}")
+            tensors = loaded["tensors"]
+            self.x = tensors["x"]
+            self.coord = tensors["coord"]
+            self.y = tensors["target_sfr"]
+            self.y_baseline = tensors["sfr_ks_baseline"]
+            conditioning_value = tensors["log_mass_filter"]
+            self.groups = tensors["groups"]
+            self.time = tensors["time"]
+            identity = loaded.get("sample_identity", {})
+            self.sample_uid = np.asarray(identity.get("sample_uid", ()), dtype=str)
+            self.parent_hr_uid = np.asarray(identity.get("parent_hr_uid", ()), dtype=str)
+            payload_conditioning_variable = "log_mass_filter"
+            self.kind = "vit"
+        # Legacy SFR cache format:
         # (x, coord, target_sfr, transformed_ks_sfr, groups, n_groups, time)
-        if len(items) >= 7 and isinstance(items[1], (torch.Tensor, np.ndarray)) and np.asarray(items[1]).ndim >= 2:
+        elif len(items) >= 7 and isinstance(items[1], (torch.Tensor, np.ndarray)) and np.asarray(items[1]).ndim >= 2:
             self.x, self.coord, self.y, self.y_baseline, self.groups, self.n_groups, self.time = items[:7]
             self.kind = "vit"
         elif len(items) >= 5 and isinstance(items[1], (torch.Tensor, np.ndarray)) and np.asarray(items[1]).ndim >= 2:
@@ -331,8 +353,15 @@ class CachedPTDataset:
         self.y = ensure_tensor(self.y).view(-1, 1)
         self.y_baseline = ensure_tensor(self.y_baseline).view(-1, 1) if self.y_baseline is not None else None
         self.baseline = self.y_baseline
-        self.conditioning_scalar = self.y_baseline
-        self.conditioning_variable = channel_metadata.get("conditioning_variable")
+        self.conditioning_scalar = (
+            ensure_tensor(conditioning_value).view(-1, 1)
+            if conditioning_value is not None
+            else self.y_baseline
+        )
+        self.conditioning_variable = (
+            payload_conditioning_variable
+            or channel_metadata.get("conditioning_variable")
+        )
         if self.conditioning_variable is None:
             # Compatibility with instantaneous-SFR caches created before this
             # field was recorded explicitly.
@@ -367,6 +396,34 @@ class CachedPTDataset:
         return len(self.y)
 
 
+def _resolve_mirror_mode(mirror, native_shape, reference_shape=None):
+    """根据缓存张量与原生 HDF5 网格的空间形状决定是否执行旧版 mirror。"""
+    native_shape = tuple(int(value) for value in native_shape)
+    reference_shape = (
+        tuple(int(value) for value in reference_shape)
+        if reference_shape is not None
+        else None
+    )
+    if isinstance(mirror, (bool, np.bool_)):
+        return bool(mirror)
+    if mirror != "match_reference":
+        raise ValueError(
+            "mirror 必须是布尔值或 'match_reference'，"
+            f"实际得到 {mirror!r}。"
+        )
+    if reference_shape is None:
+        raise ValueError("mirror='match_reference' 需要 reference_dataset。")
+    if reference_shape == native_shape:
+        return False
+    mirrored_shape = (native_shape[0], native_shape[1] * 2)
+    if reference_shape == mirrored_shape:
+        return True
+    raise RuntimeError(
+        "无法使原生 HDF5 空间形状与缓存形状匹配："
+        f"native={native_shape}, reference={reference_shape}。"
+    )
+
+
 class HDF5Dataset:
     def __init__(
         self,
@@ -375,7 +432,7 @@ class HDF5Dataset:
         mean=None,
         std=None,
         log_transform=True,
-        mirror=True,
+        mirror=False,
         balance=None,
         input_channels=None,
         exclude_channels=None,
@@ -406,7 +463,18 @@ class HDF5Dataset:
         self.input_channels = loaded.input_channels
         self.excluded_channels = tuple(exclude_channels or ())
 
-        if mirror:
+        native_shape = tuple(loaded.x.shape[-2:])
+        reference_shape = (
+            tuple(reference_dataset.x.shape[-2:])
+            if reference_dataset is not None
+            else None
+        )
+        self.mirror_applied = _resolve_mirror_mode(
+            mirror,
+            native_shape,
+            reference_shape,
+        )
+        if self.mirror_applied:
             loaded.mirror_data()
         if balance is not None:
             loaded.balance_groups(method=balance)
@@ -424,6 +492,12 @@ class HDF5Dataset:
         else:
             self.x, _, _ = loaded.standardize(log_transform=log_transform)
         self.coord = loaded.coordinate
+        if reference_shape is not None and tuple(self.x.shape[-2:]) != reference_shape:
+            raise RuntimeError(
+                "Raw HDF5 预处理后的空间形状与缓存不一致："
+                f"raw={tuple(self.x.shape[-2:])}, reference={reference_shape}, "
+                f"mirror_applied={self.mirror_applied}。"
+            )
         raw_target_metadata = loaded.target_metadata
         if raw_target_metadata.get("quantity") != "instantaneous_sfr":
             raise ValueError(

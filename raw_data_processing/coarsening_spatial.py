@@ -1,4 +1,4 @@
-"""Conservative regular spatial-block coarse graining (R_h)."""
+"""保守的常规空间块粗粒化，空间降采样"""
 
 from __future__ import annotations
 
@@ -10,6 +10,12 @@ try:
     from raw_data_processing.coarsening_common import (
         block_reduce_sum,
         build_regular_coarse_geometry,
+        cooling_rate_density_from_time,
+        cooling_time_from_rate_density,
+        cylindrical_meridional_to_spherical,
+        spherical_meridional_to_cylindrical,
+        temperature_from_internal_energy_density,
+        thermodynamic_coarsening_metadata,
         validate_coarsening_conservation,
         validate_input_fields,
     )
@@ -18,6 +24,12 @@ except ModuleNotFoundError:  # Support ``python raw_data_processing/galaxy_data.
     from coarsening_common import (
         block_reduce_sum,
         build_regular_coarse_geometry,
+        cooling_rate_density_from_time,
+        cooling_time_from_rate_density,
+        cylindrical_meridional_to_spherical,
+        spherical_meridional_to_cylindrical,
+        temperature_from_internal_energy_density,
+        thermodynamic_coarsening_metadata,
         validate_coarsening_conservation,
         validate_input_fields,
     )
@@ -31,10 +43,10 @@ def coarsen_spatial_block(
     conservation_rtol: float = 1e-6,
     conservation_atol: float = 1e-10,
 ) -> CoarseningResult:
-    """Apply the existing Data-Set-15-based R_h semantics to pure arrays.
+    """在纯数组上应用基于 Data-Set-15 的既有 R_h 语义。
 
-    Volume densities are volume-integrated, velocity components are gas-mass
-    weighted, and temperature is recomputed from coarse gas energy and density.
+    密度场先乘体积再沉积，速度分量采用气体质量加权；温度由粗网格内能密度
+    和气体密度重新计算。
     """
 
     fine_shape = validate_input_fields(data)
@@ -50,10 +62,14 @@ def coarsen_spatial_block(
     if np.any(coarse_mass <= 0):
         raise ValueError("Every coarse cell must contain strictly positive gas mass.")
 
-    fine_energy = np.asarray(data.snapshot["gas_energy"], dtype=np.float64) * fine_volume
+    fine_internal_energy = (
+        np.asarray(data.snapshot["gas_energy"], dtype=np.float64) * fine_volume
+    )
     coarse_snapshot: dict[str, np.ndarray] = {
         "density": coarse_mass / coarse_volume,
-        "gas_energy": block_reduce_sum(fine_energy, new_shape) / coarse_volume,
+        "gas_energy": (
+            block_reduce_sum(fine_internal_energy, new_shape) / coarse_volume
+        ),
     }
     for name in ("v1", "v2", "v3"):
         if name in data.snapshot:
@@ -74,8 +90,56 @@ def coarsen_spatial_block(
             block_reduce_sum(fine_stellar_mass, new_shape) / coarse_volume
         )
 
-    coarse_snapshot["temperature"] = (
-        93.0 * coarse_snapshot["gas_energy"] / coarse_snapshot["density"]
+    if "cooling_time" in data.snapshot:
+        fine_cooling_rate_density = np.asarray(
+            data.snapshot.get(
+                "cooling_rate_density",
+                cooling_rate_density_from_time(
+                    data.snapshot["gas_energy"], data.snapshot["cooling_time"]
+                ),
+            ),
+            dtype=np.float64,
+        )
+        coarse_snapshot["cooling_rate_density"] = (
+            block_reduce_sum(fine_cooling_rate_density * fine_volume, new_shape)
+            / coarse_volume
+        )
+        coarse_snapshot["cooling_time"] = cooling_time_from_rate_density(
+            coarse_snapshot["gas_energy"], coarse_snapshot["cooling_rate_density"]
+        )
+
+    acceleration_fields = {"radial_acceleration", "theta_acceleration"}
+    if acceleration_fields.intersection(data.snapshot):
+        if not acceleration_fields.issubset(data.snapshot):
+            raise ValueError(
+                "radial_acceleration and theta_acceleration must be coarsened together."
+            )
+        fine_theta = np.broadcast_to(
+            np.asarray(data.axes[1], dtype=np.float64)[:, None], fine_shape
+        )
+        acceleration_r, acceleration_z = spherical_meridional_to_cylindrical(
+            np.asarray(data.snapshot["radial_acceleration"], dtype=np.float64),
+            np.asarray(data.snapshot["theta_acceleration"], dtype=np.float64),
+            fine_theta,
+        )
+        coarse_acceleration_r = (
+            block_reduce_sum(acceleration_r * fine_mass, new_shape) / coarse_mass
+        )
+        coarse_acceleration_z = (
+            block_reduce_sum(acceleration_z * fine_mass, new_shape) / coarse_mass
+        )
+        coarse_theta = np.broadcast_to(
+            np.asarray(coarse_axes[1], dtype=np.float64)[:, None], new_shape
+        )
+        (
+            coarse_snapshot["radial_acceleration"],
+            coarse_snapshot["theta_acceleration"],
+        ) = cylindrical_meridional_to_spherical(
+            coarse_acceleration_r, coarse_acceleration_z, coarse_theta
+        )
+
+    coarse_snapshot["temperature"] = temperature_from_internal_energy_density(
+        coarse_snapshot["gas_energy"], coarse_snapshot["density"]
     )
     for name, values in coarse_snapshot.items():
         if not np.all(np.isfinite(values)):
@@ -89,8 +153,18 @@ def coarsen_spatial_block(
         volume_source="Data-Set-15:block_sum",
         metadata={
             "operator": "spatial_block",
+            "operator_version": 2,
             "source_shape": fine_shape,
             "output_shape": new_shape,
+            "operator_parameters": {
+                "source_shape": fine_shape,
+                "output_shape": new_shape,
+                "aggregation": "non_overlapping_index_blocks",
+                "volume_source": "Data-Set-15:block_sum",
+                "cooling_aggregation": "conserve_cooling_power",
+                "acceleration_aggregation": "mass_weighted_in_fixed_Rz_basis",
+            },
+            **thermodynamic_coarsening_metadata(),
         },
         diagnostics={},
     )

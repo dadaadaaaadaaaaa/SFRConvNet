@@ -1,10 +1,9 @@
-"""Axisymmetric fixed-mass-support coarse graining, version 0.
+"""轴对称固定质量支撑粗粒化, version 0.
 
-This module deliberately contains only the numerical operator.  HDF I/O,
-target handling, and construction of ``GalData`` objects remain in
-``galaxy_data.py``.  The method is a fixed-mass *support filter* followed by a
-balanced conservative projection to a regular output grid; it is not an
-exclusive equal-mass tessellation.
+该模块特意仅包含数值算子。
+HDF 输入/输出、目标处理以及 ``GalData`` 对象的构建仍保留在``galaxy_data.py`` 中。
+该方法采用固定质量 *支撑滤波器*，随后进行平衡守恒投影以生成规则输出网格；
+它并不是互斥的等质量剖分。
 """
 
 from __future__ import annotations
@@ -15,10 +14,26 @@ import warnings
 import numpy as np
 
 try:
-    from raw_data_processing.coarsening_common import build_regular_coarse_geometry
+    from raw_data_processing.coarsening_common import (
+        build_regular_coarse_geometry,
+        cooling_rate_density_from_time,
+        cooling_time_from_rate_density,
+        cylindrical_meridional_to_spherical,
+        spherical_meridional_to_cylindrical,
+        temperature_from_internal_energy_density,
+        thermodynamic_coarsening_metadata,
+    )
     from raw_data_processing.coarsening_types import CoarseningInput, CoarseningResult
 except ModuleNotFoundError:  # Support direct execution of galaxy_data.py.
-    from coarsening_common import build_regular_coarse_geometry
+    from coarsening_common import (
+        build_regular_coarse_geometry,
+        cooling_rate_density_from_time,
+        cooling_time_from_rate_density,
+        cylindrical_meridional_to_spherical,
+        spherical_meridional_to_cylindrical,
+        temperature_from_internal_energy_density,
+        thermodynamic_coarsening_metadata,
+    )
     from coarsening_types import CoarseningInput, CoarseningResult
 
 
@@ -30,6 +45,10 @@ SUPPORTED_FIELDS = {
     "v2",
     "v3",
     "initial_stellar_density",
+    "radial_acceleration",
+    "theta_acceleration",
+    "cooling_time",
+    "cooling_rate_density",
 }
 
 
@@ -402,10 +421,12 @@ def coarsen_mass_v0(
     coarse_mass = deposit_extensive(fine_mass)
     if np.any(coarse_mass <= 0):
         raise ValueError("Every Rm-v0 output cell must contain positive gas mass.")
-    coarse_energy = deposit_extensive(np.asarray(snapshot["gas_energy"]) * fine_volume)
+    coarse_internal_energy = deposit_extensive(
+        np.asarray(snapshot["gas_energy"]) * fine_volume
+    )
     new_snapshot = {
         "density": coarse_mass / coarse_volume,
-        "gas_energy": coarse_energy / coarse_volume,
+        "gas_energy": coarse_internal_energy / coarse_volume,
     }
     for name in ("v1", "v2", "v3"):
         if name in snapshot:
@@ -414,7 +435,50 @@ def coarsen_mass_v0(
         new_snapshot["initial_stellar_density"] = deposit_extensive(
             np.asarray(snapshot["initial_stellar_density"]) * fine_volume
         ) / coarse_volume
-    new_snapshot["temperature"] = 93 * new_snapshot["gas_energy"] / new_snapshot["density"]
+    if "cooling_time" in snapshot:
+        fine_cooling_rate_density = np.asarray(
+            snapshot.get(
+                "cooling_rate_density",
+                cooling_rate_density_from_time(
+                    snapshot["gas_energy"], snapshot["cooling_time"]
+                ),
+            ),
+            dtype=np.float64,
+        )
+        new_snapshot["cooling_rate_density"] = (
+            deposit_extensive(fine_cooling_rate_density * fine_volume) / coarse_volume
+        )
+        new_snapshot["cooling_time"] = cooling_time_from_rate_density(
+            new_snapshot["gas_energy"], new_snapshot["cooling_rate_density"]
+        )
+    acceleration_fields = {"radial_acceleration", "theta_acceleration"}
+    if acceleration_fields.intersection(snapshot):
+        if not acceleration_fields.issubset(snapshot):
+            raise ValueError(
+                "radial_acceleration and theta_acceleration must be coarsened together."
+            )
+        fine_theta = np.broadcast_to(
+            np.asarray(source.axes[1], dtype=np.float64)[:, None], fine_shape
+        )
+        acceleration_r, acceleration_z = spherical_meridional_to_cylindrical(
+            np.asarray(snapshot["radial_acceleration"], dtype=np.float64),
+            np.asarray(snapshot["theta_acceleration"], dtype=np.float64),
+            fine_theta,
+        )
+        coarse_acceleration_r = deposit_extensive(acceleration_r * fine_mass) / coarse_mass
+        coarse_acceleration_z = deposit_extensive(acceleration_z * fine_mass) / coarse_mass
+        coarse_theta = np.broadcast_to(
+            np.asarray(new_axes[1], dtype=np.float64)[:, None], new_shape
+        )
+        (
+            new_snapshot["radial_acceleration"],
+            new_snapshot["theta_acceleration"],
+        ) = cylindrical_meridional_to_spherical(
+            coarse_acceleration_r, coarse_acceleration_z, coarse_theta
+        )
+    new_snapshot["temperature"] = temperature_from_internal_energy_density(
+        new_snapshot["gas_energy"], new_snapshot["density"]
+    )
     for name, values in new_snapshot.items():
         if not np.all(np.isfinite(values)):
             raise ValueError(f"Rm-v0 field {name!r} contains NaN or infinity.")
@@ -438,9 +502,24 @@ def coarsen_mass_v0(
     total_seconds = perf_counter() - started
     metadata = {
         "operator": "adaptive_mass_axisymmetric_v0",
-        "operator_version": 0,
+        "operator_version": 1,
         "source_shape": fine_shape,
         "output_shape": new_shape,
+        "operator_parameters": {
+            "source_shape": fine_shape,
+            "output_shape": new_shape,
+            "mass_filter": mass_filter,
+            "kernel": kernel,
+            "initial_neighbors": int(initial_neighbors),
+            "balance_tolerance": float(balance_tolerance),
+            "balance_max_iterations": int(balance_max_iterations),
+            "distance_metric": "meridional_euclidean_Rz",
+            "mass_geometry": "full_axisymmetric_ring",
+            "partition_semantics": "overlapping_support_plus_soft_transport",
+            "cooling_aggregation": "conserve_cooling_power",
+            "acceleration_aggregation": "mass_weighted_in_fixed_Rz_basis",
+        },
+        **thermodynamic_coarsening_metadata(),
         "mass_filter": mass_filter,
         "kernel": kernel,
         "distance_metric": "meridional_euclidean_Rz",

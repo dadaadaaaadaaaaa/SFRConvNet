@@ -1,12 +1,8 @@
-"""Visual diagnostics for mass-adaptive coarse graining.
+"""基于质量自适应粗粒化的可视化诊断。
 
-The ``dominant_destination`` image produced here is a *pseudo-partition*: it
-hardens the largest weight of an overlapping soft transport plan after the
-fact.  It is not an exclusive physical tessellation and its component masses
-are not expected to equal ``mass_filter``.  Four-colour rendering is used only
-to distinguish adjacent connected components.  If DSATUR requests more than
-four colours, the tool reports the failure and does not fabricate a four-colour
-map.
+此处生成的“dominant_destination”图像是一种*伪分区*：它在事后将重叠的软传输路径中权重最大的那条
+固定下来。它并非排他的物理细分，且其组成质量不期望等于“mass_filter”。四色渲染仅用于
+区分相邻的连通分量。 如果 DSATUR 请求的颜色数量超过四种，该工具将报告失败，且不会生成四色图。
 """
 
 from __future__ import annotations

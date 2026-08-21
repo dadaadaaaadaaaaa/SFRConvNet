@@ -1,12 +1,9 @@
-"""Paired comparison of Rm-v0 and Rm-v1 numerical audit tables.
+"""Rm-v0 与 Rm-v1 数值审计表的成对比较。
 
-This module compares coarse-graining diagnostics only.  It does not evaluate
-an SFR closure operator and therefore cannot establish which method predicts
-SFR better.  Likewise, ``dominant_destination`` connectivity is an argmax
-diagnostic of overlapping soft transport, not connectivity of a physical
-mutually-exclusive tessellation.  Regular output-cell mass CV/Gini measure the
-heterogeneity of the CNN grid and are not errors relative to an equal-mass
-target.
+本模块仅比较粗粒化诊断结果。它不评估SFR 闭合算子，因此无法确定哪种方法对SFR 的预测效果更好。
+同样，“dominant_destination”连通性是重叠软传输的argmax诊断指标，而非物理上
+互斥的网格划分所具有的连通性。常规输出单元质量的 CV/基尼系数衡量的是CNN 网格的异质性，并非相对于等质量
+目标的误差。
 """
 
 from __future__ import annotations

@@ -127,6 +127,10 @@ class MassAdaptiveCoarseningTests(unittest.TestCase):
             restored.coarsening_metadata["operator"],
             "adaptive_mass_axisymmetric_v0",
         )
+        self.assertEqual(
+            restored.coarsening_metadata["gas_energy_semantics"],
+            "gas_internal_energy_density",
+        )
         np.testing.assert_allclose(
             restored.coarsening_diagnostics["effective_support_scale"],
             coarse.coarsening_diagnostics["effective_support_scale"],

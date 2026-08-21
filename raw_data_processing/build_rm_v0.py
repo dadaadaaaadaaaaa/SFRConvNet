@@ -1,4 +1,4 @@
-"""Build axisymmetric R_m-v0 datasets from processed MACER fine snapshots.
+"""根据已处理的 MACER 精细快照构建轴对称的 R_m-v0 数据集。
 
 Example (run from the repository root):
 
@@ -7,8 +7,8 @@ Example (run from the repository root):
         --output data/disk_galaxy_fiducial/coarse_rm_v0_m1e6/00000.h5 \
         --shape 8 8 --mass-filter 1e6
 
-Directory mode preserves input filenames and refuses to overwrite by default.
-The mass value must use the same code units as ``density * cell_volume``.
+目录模式默认保留输入文件名，且拒绝覆盖文件。
+质量值必须使用与 ``density * cell_volume`` 相同的代码单位。
 """
 
 from __future__ import annotations

@@ -115,7 +115,7 @@ class CoarseningAuditTests(unittest.TestCase):
             },
         )
         self.assertTrue(summary["stored_extensive_conservation_pass"])
-        self.assertEqual(summary["operator_version"], 1)
+        self.assertEqual(summary["operator_version"], 2)
         self.assertIn("lbfgs_iterations", summary)
         self.assertIn("graph_scc_count", summary)
         self.assertEqual(len(cells), 4)

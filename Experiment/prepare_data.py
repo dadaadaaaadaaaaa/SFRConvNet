@@ -16,12 +16,34 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from raw_data_processing.galaxy_data import GalDataSet
 from raw_data_processing.parse_log_file import load_config
-from Experiment.target_transform import SUPPORTED_TARGET_TRANSFORMS, transform_sfr
+from Experiment.target_transform import (
+    SUPPORTED_CLOSURE_TRANSFORMS,
+    SUPPORTED_TARGET_TRANSFORMS,
+    transform_sfr,
+    transform_signed_closure,
+)
+
+
+def _optional_sample_array(data, names):
+    """从 GalDataSet 的正式属性或 raw_data 中读取可选逐样本物理量。"""
+
+    for name in names:
+        if hasattr(type(data), name):
+            value = getattr(data, name)
+            if callable(value):
+                value = value()
+            return np.asarray(value, dtype=np.float64).reshape(-1)
+    raw_data = getattr(data, "raw_data", {})
+    for name in names:
+        if name in raw_data:
+            return np.asarray(raw_data[name], dtype=np.float64).reshape(-1)
+    return None
 
 
 class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、计算均值和方差、归一化、保存为.pt文件
     def __init__(self, dataset: GalDataSet = None):
         self._dataset = dataset
+        self._last_cache_schema_version = None
 
     # ------------ Properties -----------
 
@@ -32,6 +54,10 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
     @property
     def input_channels(self):
         return self._dataset.input_channels
+
+    @property
+    def last_cache_schema_version(self):
+        return self._last_cache_schema_version
 
     # ------------ Dunder Methods ------------
 
@@ -54,8 +80,14 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         exclude_channels=None,
         include_zero_targets: bool = True,
         require_target_quantity: str | None = "instantaneous_sfr",
+        allow_mixed_coarsening: bool = False,
+        require_complete_metadata: bool = False,
     ):
-        self._dataset = GalDataSet().load_data(path)
+        self._dataset = GalDataSet().load_data(
+            path,
+            allow_mixed_coarsening=allow_mixed_coarsening,
+            require_complete_metadata=require_complete_metadata,
+        )
         target_quantity = self._dataset.target_metadata.get("quantity")
         if require_target_quantity and target_quantity != require_target_quantity:
             raise ValueError(
@@ -75,16 +107,18 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         validation_size: float,
         stratify: str | np.ndarray | None = None,
         random_state: int | None = None,
+        group_by_parent_uid: bool = True,
     ):
         train_set, val_set, test_set = self._dataset.split(
             train_size=train_size,
             validation_size=validation_size,
             stratify=stratify,
             random_state=random_state,
+            group_by_parent_uid=group_by_parent_uid,
         )
         return CachePt(train_set), CachePt(val_set), CachePt(test_set)
 
-    def process(self, threshold: float = None, mirror: bool = True, balance: str = None):
+    def process(self, threshold: float = None, mirror: bool = False, balance: str = None):
         data = self._dataset
         if threshold is not None:
             data.filter(threshold) # 过滤掉恒星形成率小于threshold的样本
@@ -105,36 +139,131 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         target_transform: str = "log10_1p",
         target_scale: float = 1.0,
         target_floor: float = 1e-9,
+        objective_mode: str = "direct_sfr",
+        closure_transform: str = "signed_asinh",
+        closure_scale: float = 1.0,
     ):
         data = self._dataset
         if mean is not None and std is not None: # 验证集&测试集
             x = data.standardize(mean, std)
         else: # 训练集
             x, mean, std = data.standardize()
+        target_sfr_physical = np.asarray(data.sfr_target, dtype=np.float64).reshape(-1)
         y = transform_sfr(
-            data.sfr_target,
+            target_sfr_physical,
             transform=target_transform,
             scale=target_scale,
             floor=target_floor,
         )
-        # The fourth PT field is the transformed KS-law SFR. It is not mbh.
-        # SFRConvNet may use this scalar as a FiLM conditioner when use_film=True.
+        # KS 经验基线继续保存用于评估，但不再充当模型条件。
         sfr_ks_transformed = transform_sfr(
             data.sfr_ks,
             transform=target_transform,
             scale=target_scale,
             floor=target_floor,
         )
+        # 第一阶段只把 log10(M_filter) 作为分辨率条件；H_eff/N_eff 仅预留。
+        log_mass_filter = data.log_mass_filter.astype(np.float32)
+        baseline_physical = _optional_sample_array(
+            data,
+            ("sfr_macer_baseline", "sfr_baseline", "macer_sfr_baseline", "baseline_sfr"),
+        )
+        closure_physical = _optional_sample_array(
+            data,
+            ("sfr_closure_true", "closure_true", "true_closure", "closure_sfr"),
+        )
+        # 旧 processed HDF5 会由 GalDataSet 以全 NaN 占位；它表示字段缺失，不是
+        # 一个可训练的物理 baseline。部分缺失则属于不允许静默混合的数据错误。
+        if baseline_physical is not None and np.all(np.isnan(baseline_physical)):
+            baseline_physical = None
+        elif baseline_physical is not None and not np.all(np.isfinite(baseline_physical)):
+            raise ValueError("MACER-LR baseline is only partially available or non-finite.")
+        if closure_physical is not None and np.all(np.isnan(closure_physical)):
+            closure_physical = None
+        elif closure_physical is not None and not np.all(np.isfinite(closure_physical)):
+            raise ValueError("True closure is only partially available or non-finite.")
+        if objective_mode not in {"direct_sfr", "signed_closure"}:
+            raise ValueError(
+                "objective_mode must be 'direct_sfr' or 'signed_closure', "
+                f"got {objective_mode!r}."
+            )
+        if objective_mode == "signed_closure" and baseline_physical is None:
+            raise ValueError(
+                "signed_closure cache requires the MACER-LR physical baseline B_alpha. "
+                "Regenerate processed HDF5 files with sfr_baseline/macer_sfr_baseline."
+            )
+
+        tensors = {
+            "x": x,
+            "coord": data.coordinate,
+            "target_sfr": y,
+            "target_sfr_physical": target_sfr_physical.astype(np.float64),
+            "sfr_ks_baseline": sfr_ks_transformed,
+            "log_mass_filter": log_mass_filter,
+            "h_eff": data.h_eff,
+            "n_eff": data.n_eff,
+            "groups": data.groups,
+            "time": data.time,
+        }
+        cache_version = 3
+        if baseline_physical is not None:
+            if baseline_physical.shape != target_sfr_physical.shape:
+                raise ValueError("MACER-LR baseline length does not match target_sfr.")
+            if not np.all(np.isfinite(baseline_physical)) or np.any(baseline_physical < 0):
+                raise ValueError("MACER-LR baseline must contain finite non-negative SFR values.")
+            computed_closure = target_sfr_physical - baseline_physical
+            if closure_physical is not None and not np.allclose(
+                closure_physical,
+                computed_closure,
+                rtol=1e-6,
+                atol=1e-8,
+            ):
+                max_error = float(np.max(np.abs(closure_physical - computed_closure)))
+                raise ValueError(
+                    "Stored closure is inconsistent with Y_alpha - B_alpha; "
+                    f"maximum absolute error is {max_error:.6e}."
+                )
+            closure_physical = computed_closure
+            tensors.update(
+                {
+                    "macer_sfr_baseline": baseline_physical.astype(np.float64),
+                    "closure_true_physical": closure_physical.astype(np.float64),
+                    "closure_true": transform_signed_closure(
+                        closure_physical,
+                        transform=closure_transform,
+                        scale=closure_scale,
+                    ),
+                }
+            )
+            cache_version = 4
+        self._last_cache_schema_version = cache_version
         torch.save(
-            (
-                x,
-                data.coordinate,
-                y,
-                sfr_ks_transformed,
-                data.groups,
-                data.n_groups,
-                data.time,
-            ),
+            {
+                "schema": {"name": "macnet_sfr_cache", "version": cache_version},
+                "tensors": tensors,
+                "sample_identity": {
+                    "sample_uid": data.sample_uid.tolist(),
+                    "parent_hr_uid": data.parent_hr_uid.tolist(),
+                },
+                "model_input_contract": {
+                    "physical_fields": "x",
+                    "resolution_features": ["log_mass_filter"],
+                    "reserved_resolution_features": ["h_eff", "n_eff"],
+                    "baseline_is_model_input": False,
+                    "baseline_is_output_composition": cache_version >= 4,
+                },
+                "learning_contract": {
+                    "available_objectives": (
+                        ["direct_sfr", "signed_closure"]
+                        if cache_version >= 4
+                        else ["direct_sfr"]
+                    ),
+                    "prepared_objective": objective_mode,
+                    "final_prediction": "macer_sfr_baseline + closure_hat_physical",
+                    "closure_transform": closure_transform,
+                    "closure_scale": float(closure_scale),
+                },
+            },
             save_path,
         )
         return mean, std
@@ -151,6 +280,10 @@ def _save_norm_stats(
     target_transform="log10_1p",
     target_scale=1.0,
     target_floor=1e-9,
+    objective_mode="direct_sfr",
+    closure_transform="signed_asinh",
+    closure_scale=1.0,
+    cache_schema_version=None,
     includes_zero_targets=True,
     oversample_groups=True,
     split_metadata=None,
@@ -159,6 +292,11 @@ def _save_norm_stats(
     channel_names = np.asarray(tuple(input_channels), dtype=str)
     excluded_names = np.asarray(tuple(excluded_channels), dtype=str)
     target_metadata = dict(target_metadata or {})
+    resolved_cache_schema_version = int(
+        cache_schema_version
+        if cache_schema_version is not None
+        else (4 if objective_mode == "signed_closure" else 3)
+    )
     metadata = {
         "format_version": 2,
         "input_channels": channel_names.tolist(),
@@ -175,9 +313,24 @@ def _save_norm_stats(
         "includes_zero_targets": bool(includes_zero_targets),
         "oversample_groups": bool(oversample_groups),
         "group_balance": "oversample" if oversample_groups else "none",
-        # Describes the fourth tensor stored in every current SFR PT cache.
-        "conditioning_variable": "sfr_ks",
-        "conditioning_transform": target_transform,
+        "cache_schema_version": resolved_cache_schema_version,
+        "objective_mode": objective_mode,
+        "prepared_objective": objective_mode,
+        "available_objectives": (
+            ["direct_sfr", "signed_closure"]
+            if resolved_cache_schema_version >= 4
+            else ["direct_sfr"]
+        ),
+        "closure_transform": closure_transform,
+        "closure_scale": float(closure_scale),
+        "closure_definition": "target_sfr_physical-macer_sfr_baseline",
+        "final_prediction": "macer_sfr_baseline+closure_hat_physical",
+        "conditioning_variable": "log_mass_filter",
+        "conditioning_transform": "log10",
+        "baseline_variable": "sfr_ks",
+        "baseline_transform": target_transform,
+        "resolution_features": ["log_mass_filter"],
+        "reserved_resolution_features": ["h_eff", "n_eff"],
     }
     if split_metadata:
         overlap = set(split_metadata.get("train_groups", ())).intersection(
@@ -208,6 +361,10 @@ def _save_norm_stats(
         group_balance=np.asarray(metadata["group_balance"]),
         conditioning_variable=np.asarray(metadata["conditioning_variable"]),
         conditioning_transform=np.asarray(metadata["conditioning_transform"]),
+        objective_mode=np.asarray(metadata["objective_mode"]),
+        closure_transform=np.asarray(metadata["closure_transform"]),
+        closure_scale=np.asarray(metadata["closure_scale"]),
+        cache_schema_version=np.asarray(metadata["cache_schema_version"]),
     )
     metadata_path = f"{save_path}metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -358,13 +515,34 @@ def _parse_args():
         "--target-scale",
         type=float,
         default=1.0,
-        help="SFR scale in Msun/yr for log10_1p.",
+        help="log10_1p 的 SFR 尺度；单位必须与 processed HDF5 target_units 一致。",
     )
     parser.add_argument(
         "--target-floor",
         type=float,
         default=1e-9,
         help="Positive floor used only by log10_floor.",
+    )
+    parser.add_argument(
+        "--objective-mode",
+        choices=("direct_sfr", "signed_closure"),
+        default="direct_sfr",
+        help=(
+            "direct_sfr 保留历史直接预测；signed_closure 需要 processed HDF5 "
+            "提供 MACER-LR baseline，并训练 C_alpha=Y_alpha-B_alpha。"
+        ),
+    )
+    parser.add_argument(
+        "--closure-transform",
+        choices=SUPPORTED_CLOSURE_TRANSFORMS,
+        default="signed_asinh",
+        help="可正可负闭合项使用的可逆变换。",
+    )
+    parser.add_argument(
+        "--closure-scale",
+        type=float,
+        default=1.0,
+        help="signed_asinh 的物理 SFR 尺度；单位与 target_units 相同，所有数据划分必须一致。",
     )
     parser.add_argument(
         "--drop-zero-targets",
@@ -423,6 +601,8 @@ def _parse_args():
         parser.error("--target-scale must be positive.")
     if args.target_floor <= 0:
         parser.error("--target-floor must be positive.")
+    if args.closure_scale <= 0:
+        parser.error("--closure-scale must be positive.")
     if args.exclude_channels and not args.cache_tag:
         parser.error("--cache-tag is required when --exclude-channels is used, to avoid overwriting old caches.")
     try:
@@ -475,9 +655,9 @@ def _prepare_random_snapshot_experiment(
         random_state=args.seed,
     )
     np.random.seed(args.seed + int(experiment_number) * 1000)
-    train_cache = train_cache.process(balance=train_balance)
-    val_cache = val_cache.process()
-    test_cache = test_cache.process()
+    train_cache = train_cache.process(mirror=False, balance=train_balance)
+    val_cache = val_cache.process(mirror=False)
+    test_cache = test_cache.process(mirror=False)
 
     group_names = [entry[1] for entry in valid_paths]
     split_groups = {
@@ -500,6 +680,7 @@ def _prepare_random_snapshot_experiment(
         target_metadata=train_cache.dataset.target_metadata,
         includes_zero_targets=not args.drop_zero_targets,
         oversample_groups=args.oversample,
+        cache_schema_version=train_cache.last_cache_schema_version,
         split_metadata={
             "experiment": f"exp{experiment_number}",
             "split_strategy": split_label,
@@ -575,10 +756,10 @@ def _prepare_exp2_logo_folds(
         # to the same fold produced as part of an exhaustive run.
         oversample_seed = int(args.seed + fold_index)
         np.random.seed(oversample_seed)
-        train_cache = train_cache.process(balance=train_balance)
-        val_cache = val_cache.process()
-        test_cache = test_cache.process()
-        cache_out = CachePt().load([held_out_entry], **load_options).process()
+        train_cache = train_cache.process(mirror=False, balance=train_balance)
+        val_cache = val_cache.process(mirror=False)
+        test_cache = test_cache.process(mirror=False)
+        cache_out = CachePt().load([held_out_entry], **load_options).process(mirror=False)
 
         actual_groups = _assert_logo_partition(
             train_cache,
@@ -631,6 +812,7 @@ def _prepare_exp2_logo_folds(
             target_metadata=train_cache.dataset.target_metadata,
             includes_zero_targets=not args.drop_zero_targets,
             oversample_groups=args.oversample,
+            cache_schema_version=train_cache.last_cache_schema_version,
             split_metadata=split_metadata,
             **transform_options,
         )
@@ -688,6 +870,9 @@ if __name__ == "__main__":
         "target_transform": args.target_transform,
         "target_scale": args.target_scale,
         "target_floor": args.target_floor,
+        "objective_mode": args.objective_mode,
+        "closure_transform": args.closure_transform,
+        "closure_scale": args.closure_scale,
     }
     train_balance = "oversample" if args.oversample else None
     np.random.seed(args.seed)
@@ -765,10 +950,10 @@ if __name__ == "__main__":
             stratify="groups",
             random_state=args.seed,
         )
-        train_cache = train_cache.process(balance=train_balance)
-        val_cache = val_cache.process()
-        test_cache = test_cache.process()
-        cache_out = CachePt().load([held], **load_options).process()
+        train_cache = train_cache.process(mirror=False, balance=train_balance)
+        val_cache = val_cache.process(mirror=False)
+        test_cache = test_cache.process(mirror=False)
+        cache_out = CachePt().load([held], **load_options).process(mirror=False)
         actual_groups = _assert_logo_partition(
             train_cache,
             val_cache,
@@ -788,6 +973,7 @@ if __name__ == "__main__":
             target_metadata=train_cache.dataset.target_metadata,
             includes_zero_targets=include_zero_targets,
             oversample_groups=args.oversample,
+            cache_schema_version=train_cache.last_cache_schema_version,
             split_metadata={
                 "experiment": "exp4",
                 "split_strategy": "legacy_single_group_holdout",

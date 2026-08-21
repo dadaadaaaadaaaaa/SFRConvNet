@@ -298,7 +298,7 @@ class FourierPositionalEncoding2D(nn.Module):
 
 
 # Generic scalar FiLM conditioner. In the current SFR pipeline the scalar is
-# transformed KS-law SFR; legacy accretion models use separate BH-mass code.
+# SFRConvNet 的标量条件现在是 log10(M_filter)；旧吸积模型仍使用独立黑洞质量代码。
 class FiLMConditioner(nn.Module):  # Transformer架构，独立于前面的cnn架构
     """
     Map scalar baseline (e.g. KS SFR) to (gamma, beta) for feature modulation.
@@ -450,10 +450,10 @@ class AccretionTransformer(nn.Module):
         x: torch.Tensor,  # (B, C_in, H, W)
         r: torch.Tensor,  # (B, 1,    H, W)
         theta: torch.Tensor,  # (B, 1,    H, W)
-        y_baseline: torch.Tensor,  # (B,)
+        log_mass_filter: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """
-        x: (B, C_in, H, W), r, theta: (B, 1, H, W), y_baseline: (B,)
+        x: (B, C_in, H, W), r, theta: (B, 1, H, W), log_mass_filter: (B,)
         """
         B, C, H, W = x.shape
 
@@ -473,8 +473,8 @@ class AccretionTransformer(nn.Module):
         cls = self.cls_token.expand(B, -1, -1)  # (B,1,D)
         tokens = torch.cat([cls, tokens], dim=1)  # (B, N+1, D)
 
-        # FiLM params from baseline
-        gammas, betas = self.film(y_baseline)  # lists of (B,1,D)
+        # 由 log10(M_filter) 生成逐层 FiLM 参数。
+        gammas, betas = self.film(log_mass_filter)  # lists of (B,1,D)
 
         # Pass through layers
         x_tok = tokens
@@ -616,7 +616,7 @@ class SFRConvNet(nn.Module):
     Architecture:
       1. Fourier PE of (r, θ) → fused with content channels via concatenation
       2. Stem conv to lift to base_ch
-      3. Optional FiLM conditioning from transformed KS-law SFR
+      3. Optional FiLM conditioning from log10(M_filter)
          Each stage: ConvFiLMBlock × depth, stride-2 downsampling at stage boundaries
       4. Global average pooling → regression head → scalar output
 
@@ -626,7 +626,8 @@ class SFRConvNet(nn.Module):
         theta:   (B, 1,    H, W)
 
     Output:
-        y: (B,)
+        y: (B,)。``direct_sfr`` 时表示变换后的 SFR；``signed_closure`` 时表示
+        变换后的闭合项。物理量反变换和 ``B+C_hat`` 在训练/推理契约中完成。
     """
 
     def __init__(
@@ -638,7 +639,8 @@ class SFRConvNet(nn.Module):
         pos_max_freq: float = 64.0, # 傅里叶变换最大频率
         p_drop: float = 0.1, # dropout机制的概率
         se_reduction: int = 4, # SEBlock的通道数缩减率，控制SEBlock中隐藏层的大小，较小的reduction会增加模型容量，但也可能导致过拟合
-        use_film: bool = False, # If true, condition feature maps on transformed KS-law SFR. The head still predicts SFR directly, not a residual.
+        use_film: bool = False, # 若为真，使用 log10(M_filter) 调制特征。
+        prediction_mode: str = "direct_sfr",
     ):
         """
         Args:
@@ -651,6 +653,13 @@ class SFRConvNet(nn.Module):
             se_reduction:  SE block channel reduction ratio.
         """
         super().__init__()
+        if prediction_mode not in {"direct_sfr", "signed_closure"}:
+            raise ValueError(
+                "prediction_mode must be 'direct_sfr' or 'signed_closure', "
+                f"got {prediction_mode!r}."
+            )
+        # 网络头始终输出无界标量；该标量的语义由训练契约明确指定。
+        self.prediction_mode = prediction_mode
 
         # ---- Positional encoding (reuse existing module) ----
         self.posenc = FourierPositionalEncoding2D( # 傅里叶变换，提取位置信息 (15.32.32) -> (145,32,32)
@@ -716,7 +725,7 @@ class SFRConvNet(nn.Module):
         x: torch.Tensor,        # (B, C_in, H, W)
         r: torch.Tensor,        # (B, 1,    H, W)
         theta: torch.Tensor,    # (B, 1,    H, W)
-        sfr_ks_transformed: Optional[torch.Tensor] = None, # (B,) log-transformed KS-law SFR from the current snapshot
+        log_mass_filter: Optional[torch.Tensor] = None, # (B,) log10(M_filter)
     ) -> torch.Tensor:
         # Positional features
         pos = self.posenc(r, theta, normalize=True)  # (B, D_pos, H, W)
@@ -726,8 +735,8 @@ class SFRConvNet(nn.Module):
         feat = self.stem(feat)
 
         # 生成 FiLM 参数
-        if self.use_film and sfr_ks_transformed is not None:
-            gammas, betas = self.film(sfr_ks_transformed)
+        if self.use_film and log_mass_filter is not None:
+            gammas, betas = self.film(log_mass_filter)
         else:
             gammas, betas = [None] * len(self.stages), [None] * len(self.stages)
 

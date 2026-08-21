@@ -159,7 +159,7 @@ def _predict_raw_domain(
             (str(path), group_name),
             mean=mean,
             std=std,
-            mirror=True,
+            mirror="match_reference",
             reference_dataset=reference_dataset,
         )
         if dataset.type != group_name:

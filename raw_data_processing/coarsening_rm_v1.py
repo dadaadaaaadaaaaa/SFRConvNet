@@ -1,10 +1,8 @@
-"""Accelerated axisymmetric fixed-mass-support coarse graining, version 1.
+"""加速的轴对称固定质量支撑粗粒化, version 1.
 
-The operator remains an overlapping adaptive support followed by a soft,
-conservative transport to a regular output grid.  It is *not* an exclusive
-equal-mass tessellation.  Compared with :mod:`coarsening_rm_v0`, this module
-adds a reusable geometry-neighbour cache, a smooth Wendland C2 kernel,
-structural transport-graph auditing, and a low-dimensional dual solver.
+该运算符仍采用重叠自适应支撑，随后通过柔和、保守的传输方式转换至常规输出网格。它*并非*一种
+纯等质量细分。与 `coarsening_rm_v0` 相比，该模块新增了可重用的几何邻域缓存、平滑的 Wendland C2 内核、
+结构化传输图审计以及低维对偶求解器。
 """
 
 from __future__ import annotations
@@ -16,13 +14,29 @@ from time import perf_counter
 import numpy as np
 
 try:
-    from raw_data_processing.coarsening_common import build_regular_coarse_geometry
+    from raw_data_processing.coarsening_common import (
+        build_regular_coarse_geometry,
+        cooling_rate_density_from_time,
+        cooling_time_from_rate_density,
+        cylindrical_meridional_to_spherical,
+        spherical_meridional_to_cylindrical,
+        temperature_from_internal_energy_density,
+        thermodynamic_coarsening_metadata,
+    )
     from raw_data_processing.coarsening_rm_v0 import (
         _transport_diagnostics,
     )
     from raw_data_processing.coarsening_types import CoarseningInput, CoarseningResult
 except ModuleNotFoundError:  # Support direct execution from raw_data_processing.
-    from coarsening_common import build_regular_coarse_geometry
+    from coarsening_common import (
+        build_regular_coarse_geometry,
+        cooling_rate_density_from_time,
+        cooling_time_from_rate_density,
+        cylindrical_meridional_to_spherical,
+        spherical_meridional_to_cylindrical,
+        temperature_from_internal_energy_density,
+        thermodynamic_coarsening_metadata,
+    )
     from coarsening_rm_v0 import _transport_diagnostics
     from coarsening_types import CoarseningInput, CoarseningResult
 
@@ -35,6 +49,10 @@ SUPPORTED_FIELDS = {
     "v2",
     "v3",
     "initial_stellar_density",
+    "radial_acceleration",
+    "theta_acceleration",
+    "cooling_time",
+    "cooling_rate_density",
 }
 
 
@@ -944,12 +962,12 @@ def coarsen_mass_v1(
     coarse_mass = deposit_extensive(fine_mass)
     if np.any(coarse_mass <= 0):
         raise ValueError("Every Rm-v1 output cell must contain positive gas mass.")
-    coarse_energy = deposit_extensive(
+    coarse_internal_energy = deposit_extensive(
         np.asarray(snapshot["gas_energy"], dtype=np.float64) * fine_volume
     )
     new_snapshot: dict[str, np.ndarray] = {
         "density": coarse_mass / coarse_volume,
-        "gas_energy": coarse_energy / coarse_volume,
+        "gas_energy": coarse_internal_energy / coarse_volume,
     }
     for name in ("v1", "v2", "v3"):
         if name in snapshot:
@@ -961,8 +979,49 @@ def coarsen_mass_v1(
             np.asarray(snapshot["initial_stellar_density"], dtype=np.float64)
             * fine_volume
         ) / coarse_volume
-    new_snapshot["temperature"] = (
-        93.0 * new_snapshot["gas_energy"] / new_snapshot["density"]
+    if "cooling_time" in snapshot:
+        fine_cooling_rate_density = np.asarray(
+            snapshot.get(
+                "cooling_rate_density",
+                cooling_rate_density_from_time(
+                    snapshot["gas_energy"], snapshot["cooling_time"]
+                ),
+            ),
+            dtype=np.float64,
+        )
+        new_snapshot["cooling_rate_density"] = (
+            deposit_extensive(fine_cooling_rate_density * fine_volume) / coarse_volume
+        )
+        new_snapshot["cooling_time"] = cooling_time_from_rate_density(
+            new_snapshot["gas_energy"], new_snapshot["cooling_rate_density"]
+        )
+    acceleration_fields = {"radial_acceleration", "theta_acceleration"}
+    if acceleration_fields.intersection(snapshot):
+        if not acceleration_fields.issubset(snapshot):
+            raise ValueError(
+                "radial_acceleration and theta_acceleration must be coarsened together."
+            )
+        fine_theta = np.broadcast_to(
+            np.asarray(source.axes[1], dtype=np.float64)[:, None], fine_shape
+        )
+        acceleration_r, acceleration_z = spherical_meridional_to_cylindrical(
+            np.asarray(snapshot["radial_acceleration"], dtype=np.float64),
+            np.asarray(snapshot["theta_acceleration"], dtype=np.float64),
+            fine_theta,
+        )
+        coarse_acceleration_r = deposit_extensive(acceleration_r * fine_mass) / coarse_mass
+        coarse_acceleration_z = deposit_extensive(acceleration_z * fine_mass) / coarse_mass
+        coarse_theta = np.broadcast_to(
+            np.asarray(new_axes[1], dtype=np.float64)[:, None], new_shape
+        )
+        (
+            new_snapshot["radial_acceleration"],
+            new_snapshot["theta_acceleration"],
+        ) = cylindrical_meridional_to_spherical(
+            coarse_acceleration_r, coarse_acceleration_z, coarse_theta
+        )
+    new_snapshot["temperature"] = temperature_from_internal_energy_density(
+        new_snapshot["gas_energy"], new_snapshot["density"]
     )
     if any(not np.all(np.isfinite(values)) for values in new_snapshot.values()):
         raise ValueError("Rm-v1 generated a non-finite coarse field.")
@@ -1001,9 +1060,33 @@ def coarsen_mass_v1(
     _check_deadline(deadline, "result assembly")
     metadata = {
         "operator": "adaptive_mass_axisymmetric_v1",
-        "operator_version": 1,
+        "operator_version": 2,
         "source_shape": fine_shape,
         "output_shape": new_shape,
+        "operator_parameters": {
+            "source_shape": fine_shape,
+            "output_shape": new_shape,
+            "mass_filter": mass_filter,
+            "kernel": "wendland_c2",
+            "graph_eta": float(graph_eta),
+            "graph_eta_growth": float(graph_eta_growth),
+            "graph_eta_max": float(graph_eta_max),
+            "initial_neighbors": int(initial_neighbors),
+            "max_neighbors": int(max_neighbors),
+            "max_neighbor_expansions": int(max_neighbor_expansions),
+            "max_graph_repairs": int(max_graph_repairs),
+            "solver_max_iterations": int(solver_max_iterations),
+            "polish_max_iterations": int(polish_max_iterations),
+            "balance_tolerance": float(balance_tolerance),
+            "max_runtime_seconds": float(max_runtime_seconds),
+            "knn_workers": int(knn_workers),
+            "distance_metric": "meridional_euclidean_Rz",
+            "mass_geometry": "full_axisymmetric_ring",
+            "partition_semantics": "overlapping_support_plus_soft_transport",
+            "cooling_aggregation": "conserve_cooling_power",
+            "acceleration_aggregation": "mass_weighted_in_fixed_Rz_basis",
+        },
+        **thermodynamic_coarsening_metadata(),
         "mass_filter": mass_filter,
         "kernel": "wendland_c2",
         "distance_metric": "meridional_euclidean_Rz",

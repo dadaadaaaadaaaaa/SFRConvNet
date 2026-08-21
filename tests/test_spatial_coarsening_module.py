@@ -72,6 +72,13 @@ class SpatialCoarseningModuleTests(unittest.TestCase):
         self.assertEqual(coarse.metadata["operator"], "spatial_block")
         self.assertEqual(coarse.metadata["source_shape"], (4, 4))
         self.assertEqual(coarse.metadata["output_shape"], (2, 2))
+        self.assertEqual(
+            coarse.metadata["gas_energy_semantics"],
+            "gas_internal_energy_density",
+        )
+        self.assertEqual(
+            coarse.metadata["gas_energy_source_dataset"], "Data-Set-10"
+        )
         self.assertEqual(coarse.volume_source, "Data-Set-15:block_sum")
         self.assertEqual(coarse.runtime, {})
 
@@ -104,6 +111,61 @@ class SpatialCoarseningModuleTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "No conservative coarsening rule"):
             coarsen_spatial_block(invalid, (2, 2))
+
+    def test_cooling_power_and_fixed_basis_force_are_conserved(self):
+        fine = _input()
+        theta = np.broadcast_to(fine.axes[1][:, None], fine.snapshot["density"].shape)
+        # 同一个固定柱坐标矢量在不同 theta 处具有不同球坐标分量。
+        acceleration_R = np.full_like(theta, 7.0)
+        acceleration_z = np.full_like(theta, -3.0)
+        acceleration_r = acceleration_R * np.sin(theta) + acceleration_z * np.cos(theta)
+        acceleration_theta = (
+            acceleration_R * np.cos(theta) - acceleration_z * np.sin(theta)
+        )
+        cooling_time = 0.2 + np.arange(16, dtype=np.float64).reshape(4, 4) / 10.0
+        enriched = CoarseningInput(
+            snapshot={
+                **fine.snapshot,
+                "cooling_time": cooling_time,
+                "cooling_rate_density": fine.snapshot["gas_energy"] / cooling_time,
+                "radial_acceleration": acceleration_r,
+                "theta_acceleration": acceleration_theta,
+            },
+            grid_volume=fine.grid_volume,
+            axes=fine.axes,
+            axis_edges=fine.axis_edges,
+            coordinate_mode=fine.coordinate_mode,
+            ndim=fine.ndim,
+        )
+        coarse = coarsen_spatial_block(enriched, (2, 2))
+        fine_power = np.sum(
+            enriched.snapshot["cooling_rate_density"] * enriched.grid_volume
+        )
+        coarse_power = np.sum(
+            coarse.snapshot["cooling_rate_density"] * coarse.grid_volume
+        )
+        self.assertAlmostEqual(float(fine_power), float(coarse_power), places=11)
+        np.testing.assert_allclose(
+            coarse.snapshot["cooling_time"],
+            coarse.snapshot["gas_energy"] / coarse.snapshot["cooling_rate_density"],
+        )
+        self.assertFalse(
+            np.allclose(
+                coarse.snapshot["cooling_time"],
+                block_reduce_sum(cooling_time, (2, 2)) / 4.0,
+            )
+        )
+        coarse_theta = np.broadcast_to(coarse.axes[1][:, None], (2, 2))
+        recovered_R = (
+            coarse.snapshot["radial_acceleration"] * np.sin(coarse_theta)
+            + coarse.snapshot["theta_acceleration"] * np.cos(coarse_theta)
+        )
+        recovered_z = (
+            coarse.snapshot["radial_acceleration"] * np.cos(coarse_theta)
+            - coarse.snapshot["theta_acceleration"] * np.sin(coarse_theta)
+        )
+        np.testing.assert_allclose(recovered_R, 7.0, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(recovered_z, -3.0, rtol=1e-12, atol=1e-12)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,4 @@
-"""Estimate useful R_m-v0 mass-filter values from processed fine snapshots.
-
-The reference value is the median gas mass contained by an R_h block with the
-requested output shape.  It is only an information-budget matching convention;
-it is not a fitted physical parameter and is not a GIZMO particle mass.
+"""所需空间粗粒化后输出形状的 R_h 块所包含的气体质量的中位数，估算有用的 R_m-v0 质量滤波器值。
 """
 
 from __future__ import annotations

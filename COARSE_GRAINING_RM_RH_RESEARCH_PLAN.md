@@ -370,9 +370,10 @@ M_C=\sum_{k\in C}\rho_kV_k,
 V_C=\sum_{k\in C}V_k.
 \]
 
-#### 气体能量密度
+#### 气体内能密度
 
-当前代码把 `gas_energy` 解释为能量密度：
+`Data-Set-10` 的 `e` 是气体内能密度。代码为兼容旧缓存仍使用字段名
+`gas_energy`，但其单元积分量是气体内能 $E_{{\rm int},k}=e_kV_k$：
 
 \[
 e_C
@@ -406,7 +407,7 @@ e_C
 T_C=93\frac{e_C}{\rho_C}.
 \]
 
-代码还会自动检查总体积、气体质量、气体能量、三个方向的动量及初始恒星质量是否在给定数值容差内守恒。
+代码还会自动检查总体积、气体质量、由内能密度积分得到的气体内能、三个方向的动量及初始恒星质量是否在给定数值容差内守恒。`Data-Set-10` 不是总能量，也不是单元内能。
 
 ### 4.2 当前固定粗化尺度
 
@@ -1509,7 +1510,7 @@ processed/
    \qquad
    \sum_kT_{Ik}=V_I.
    \]
-4. 对质量、动量、气体内能、恒星质量等广延量做守恒沉积，再由沉积结果导出密度、速度和温度。
+4. 对质量、动量、由 `gas_energy*volume` 得到的气体内能、恒星质量等广延量做守恒沉积，再由沉积结果导出密度、内能密度、速度和温度。
 
 上述双边缘约束的目的不仅是保证总质量等广延量守恒，还保证常数密度场不会由于自适应核和规则输出网格的组合而产生人为起伏。
 
@@ -1681,7 +1682,7 @@ Rm 算子还需显式给出 `--mass-filter`。不同算子默认进入不同 coa
 
 - cell volume；
 - gas mass；
-- 存储的 `gas_energy*volume` 内能样广延量；
+- 由内能密度积分得到的气体内能 `gas_energy*volume`；
 - 数值上的 \(\sum m v_r,\sum m v_\theta,\sum m v_\phi\)；
 - 初始恒星质量。
 
@@ -1886,24 +1887,31 @@ A100 对后续 CNN/神经算子训练会有明显价值，但这与当前 CPU �
 
 ### 24.2 当前 Experiment 代码的高优先级风险
 
-Step 0 审查确认当前训练仍是
+Step 0 审查时，旧训练是
 
 \[
 \widehat z_{\rm SFR}=F_\theta(X,z_{\rm KS}),
 \]
 
-其中 KS 只是 FiLM conditioner；它不是 \(B_\alpha+\hat C_\theta\) 的 residual closure。进入 Rm/Rh 公平训练前必须处理：
+其中 KS 只是 FiLM conditioner；它不是 \(B_\alpha+\hat C_\theta\) 的 residual closure。本轮 metadata 修正后，新 version-3 cache 的第一阶段模型契约改为
 
-1. `CachePt.process(mirror=True)` 把已经代表完整轴对称环带的 \(8\times8\) 输入沿径向复制成 \(8\times16\)，标签却不变；物理上不一致，应关闭或重新证明；
-2. `SFRSpatialAugmentor` 把数组最后一维 \(r\) 当作 \(\theta\) 翻转/循环平移，甚至把外边界 wrap 到内边界，且没有同步变换速度分量；当前增强应禁用并重写；
-3. 随机 snapshot split 造成严重时间泄漏：现有 cache 中约 84% 的验证/测试样本与训练样本只差一个时间步；必须改成 time-block/run-block split；
-4. 同一 HR snapshot 的所有 Rm/Rh/多分辨率变体必须进入同一 split；
-5. PT cache 尚未完整传播 operator、\(M_{\rm filter}\)、kernel、\(H_{\rm eff}\)、\(N_{\rm eff}\)、sample UID 与代码版本；不能在缺少这些 metadata 的情况下混合训练；
-6. 未来物理加法残差可为负，不能直接复用当前只面向非负 SFR 的 `transform_sfr()`。
+\[
+\widehat z_{\rm SFR}
+=F_\theta\!\left(X_{\rm LR},\log_{10}M_{\rm filter}\right).
+\]
+
+KS 只保存为评估 baseline，不再作为模型条件；\(H_{\rm eff}\) 和 \(N_{\rm eff}\) 保存为预留字段但尚未输入模型。当前状态为：
+
+1. `mirror` 默认值和所有正式调用均已改为 false；旧 \(8\times16\) cache 仍是 legacy，不能因为代码已修正就继续使用；
+2. `SFRSpatialAugmentor` 默认概率已改为 0；当前不物理的实现尚未重写，正式训练继续保持禁用；
+3. 同一 HR snapshot 的所有 Rm/Rh/多分辨率变体已可按 `parent_hr_uid` 强制进入同一 split；
+4. 随机 parent-snapshot split 仍未解决相邻时间泄漏，正式生成新 cache 前仍需确定并实现 time-block/run-block 方案；
+5. HDF5 已传播 operator、\(M_{\rm filter}\)、kernel、\(H_{\rm eff}\)、\(N_{\rm eff}\)、源身份和逐量守恒诊断；PT version-3 写入/读取代码已实现，但本轮按计划没有生成永久 PT cache；
+6. 当前仍是 direct SFR 模型，不是 residual closure；未来物理加法残差可为负，不能直接复用只面向非负 SFR 的 `transform_sfr()`。
 
 ### 24.3 下一步执行顺序
 
-1. 先修复上述镜像、增强、时间划分和 metadata 契约；
+1. 在生成正式 PT cache 前，先确定 time-block/run-block 的具体划分尺度；metadata、mirror 和增强默认值已经修复；
 2. 在同一 30-snapshot 审计集上增加多个 \(M_{\rm filter}\)，确认 v1 的成功率、KNN 上限与核敏感性；
 3. 用相同 HR snapshot 同时生成 \(\mathcal R_h\)、Rm-v0、Rm-v1，匹配输出 shape 和信息预算；
 4. 先做 direct CNN 的严格 time-block/run-block 对照；
@@ -1913,3 +1921,287 @@ Step 0 审查确认当前训练仍是
 8. 最后才进入在线嵌入和稳定性实验。
 
 本轮数值审计的结论是：**axisymmetric Rm-v1 已经成为比 v0 更可用的候选预处理器，但尚没有任何结果支持“Rm 或 v1 的 SFR 预测一定优于 Rh”。**
+
+---
+
+## 25. 2026-08-18：metadata 契约、UID 与第一阶段训练接口
+
+### 25.1 metadata schema v1
+
+新增 `raw_data_processing/metadata_schema.py`，统一负责规范 JSON、文件 SHA-256、几何指纹、UID 构造和完整性验证。新 processed HDF5 格式版本为 5，并新增 `/metadata/contract_json`。metadata 分为：
+
+- `identity`：`parent_hr_uid` 与 `sample_uid`；
+- `source`：simulation/galaxy/run/series、原始 snapshot index、源文件 ID、SHA-256、文件大小、物理时间；
+- `geometry`：坐标系、坐标通道顺序、数组空间轴顺序、矢量基、volume source 和几何指纹；
+- `fields`：通道的 intensive/extensive/vector 语义；
+- `target`：Data-Set-11、reduction、quantity 和单位；
+- `derivation`：operator ID/version 和所有会改变结果的 operator parameters。
+
+HR 母身份定义为
+
+\[
+\texttt{parent\_hr\_uid}
+=H(\texttt{simulation\_code},\texttt{galaxy\_id},\texttt{run\_id},
+\texttt{source\_series\_id},\texttt{raw\_snapshot\_index}),
+\]
+
+不包含本机绝对路径。具体衍生样本定义为
+
+\[
+\texttt{sample\_uid}
+=H(\texttt{parent\_hr\_uid},\texttt{operator},\texttt{operator\_version},
+\texttt{operator\_parameters},\texttt{geometry\_fingerprint}).
+\]
+
+因此同一 HR snapshot 的 Rm/Rh/不同质量尺度共享 `parent_hr_uid`，但 `sample_uid` 必须不同。加载新文件时会重新计算两个 UID，拒绝被篡改或内部不一致的 metadata。
+
+### 25.2 算子与守恒诊断传播
+
+`spatial_block`、Rm-v0、Rm-v1 现在都返回结构化 `operator_parameters`。守恒验证不再只在失败时抛异常，也返回并写入 HDF5：
+
+- 每个广延量的 fine/coarse total；
+- absolute error；
+- scaled relative error；
+- tolerance；
+- 跨所有已声明广延量的 `epsilon_conservation`；
+- `conservation_passed`。
+
+Rm 原有的平衡误差、迭代数、\(H_{\rm eff}\)、\(N_{\rm eff}\) 和输运诊断继续保存。`GalDataSet` 新增逐样本 UID、operator、\(M_{\rm filter}\)、\(H_{\rm eff}\)、\(N_{\rm eff}\) 字段，并提供显式 `allow_mixed_coarsening`；默认仍拒绝静默混合。按 `parent_hr_uid` 分组的 split 已实现并由测试覆盖。
+
+### 25.3 第一阶段模型输入契约
+
+新 PT cache schema version 3 已完成代码实现，但本轮没有生成永久 cache，也没有训练。第一阶段只允许：
+
+\[
+\boldsymbol X_{\rm LR},\qquad \log_{10}M_{\rm filter}
+\]
+
+进入模型。`SFRConvNet` 通过 FiLM 使用 `log_mass_filter`，version-3 cache 若未启用 FiLM 会明确报错。KS baseline 被单独保存且 `baseline_is_model_input=false`。完整二维 `h_eff` 和 `n_eff` 一同保存在 tensor payload 中，但列入 `reserved_resolution_features`，不会被 `Dataset.__getitem__()` 返回给模型；是否启用必须由后续消融实验决定。
+
+该接口当前只适用于全部样本都有正有限 \(M_{\rm filter}\) 的 Rm 数据集。Rh 没有自然的 \(M_{\rm filter}\)，不能用 NaN 伪装后直接混入这一版模型；未来比较 Rm/Rh 时需先定义共同的物理分辨率描述。
+
+### 25.4 三份真实 fine snapshot 的小批验证
+
+本机当前 Python 环境缺少 `pyhdf`，因此没有声称重新读取原始 HDF4。本轮使用上一轮已经从 HDF4 重建、含 authoritative Data-Set-15 和坐标边界的 format-v4 fine HDF5，通过 `upgrade_fine_metadata.py` 生成 format-v5 metadata 升级副本。物理数组没有改变。产物位于：
+
+```text
+data/metadata_smoke/fine/<run>/00000.h5
+data/metadata_smoke/coarse_rh/<run>/00000.h5
+data/metadata_smoke/coarse_rm_v0/disk_galaxy_fiducial/00000.h5
+```
+
+三个 run 的 UID 与 Rh 守恒结果为：
+
+| run | `parent_hr_uid` | fine `sample_uid` | Rh `sample_uid` | Rh `epsilon_conservation` |
+|---|---|---|---|---:|
+| disk_galaxy_fiducial | `macerhr:7aa673463572b2a0083b` | `macnetsample:1aeb5af7994380e77e77` | `macnetsample:bd03a70c8b67f7353e72` | \(2.423\times10^{-16}\) |
+| disk_galaxy_fiducial_4 | `macerhr:f6f6998bfecd461a916e` | `macnetsample:f34ead0b387cbbfffd17` | `macnetsample:cd86b8d78cb8c5c7c3f2` | \(2.048\times10^{-16}\) |
+| disk_galaxy_fiducial_7 | `macerhr:74dffe3879ae7740157c` | `macnetsample:2953ce1779fa05c1fe01` | `macnetsample:b630611f380d7d4e2f3b` | \(2.898\times10^{-16}\) |
+
+每个 Rh 样本与对应 fine 的 `parent_hr_uid` 相同，`sample_uid` 不同。额外对 fiducial 做了一份 Rm-v0：
+
+\[
+M_{\rm filter}=1.2877608,
+\quad
+\epsilon_{\rm conservation}=3.615\times10^{-16},
+\quad
+\epsilon_{\rm balance}=9.993\times10^{-7},
+\quad
+N_{\rm iteration}=10280.
+\]
+
+其 `sample_uid=macnetsample:2c912e15fdfe87866de9`，并与 fine 共享同一 `parent_hr_uid`。当前本机 `scipy.spatial.cKDTree` 不可用，该 Rm-v0 smoke 使用了慢速 NumPy 全距离回退；这不影响 UID/守恒结论，但不能据此评价正式运行速度。
+
+### 25.5 测试与本轮明确未完成事项
+
+新增的对抗测试覆盖：路径移动不改变 UID、改变 \(M_{\rm filter}\) 改变 `sample_uid`、metadata 篡改被拒绝、HDF5 round-trip、逐量守恒诊断、parent-UID grouped split、version-3 cache 字段隔离，以及 `log_mass_filter` 确实影响 FiLM 输出。当前测试结果为 44 项全部通过。
+
+本轮按要求没有：
+
+- 生成新的永久 PT cache；
+- 启动任何训练；
+- 把 \(H_{\rm eff}\) 或 \(N_{\rm eff}\) 输入模型；
+- 实现 residual closure；
+- 决定最终 time-block/run-block 划分尺度；
+- 声称三份 smoke 可以代替完整 30-snapshot 或多质量尺度审计。
+
+---
+
+## 26. 2026-08-21：MACER SFR 物理基线、signed closure 与训练接口已实现
+
+### 26.1 两套 SFR 算子
+
+新增纯 NumPy 模块 `raw_data_processing/macer_sfr_operator.py`。两套算子共同采用
+
+\[
+\dot\rho_\star=c_\star\rho\,f_{\rm step}(\Delta t,\tau_{\rm SF}),
+\qquad
+\tau_{\rm SF}=\max[\tau_{\rm cool},\min(\tau_{\rm ff},\tau_{\rm rot})],
+\]
+
+\[
+\tau_{\rm ff}=\sqrt{\frac{3\pi}{32G\rho}},
+\qquad
+T=93e/\rho<4\times10^4\ {\rm K},
+\qquad
+1.02\rho>1.
+\]
+
+其中 `f_step` 复现 `star.F::exp_factor_sf`；如果离线数据没有内部流体时间步，
+`dt=0` 明确定义为连续极限 (1/\tau_{\rm SF})，不能把 snapshot 间隔冒充流体时间步。
+
+默认数据兼容模式为
+
+\[
+G=112.3,\quad c_\star=0.01,\quad
+\tau_{\rm rot}=2\pi\sqrt{\frac{r^3}{G M_{\rm code}(<r)}},
+\quad M_{\rm code}(<r)\simeq M_{\rm BH}.
+\]
+
+论文物理对照模式为
+
+\[
+G=112.3,\quad c_\star=0.1,\quad
+\tau_{\rm rot}=2\pi\sqrt{\frac{r}{|a_r|}}.
+\]
+
+默认模式中的 (M(<r)\simeq M_{\rm BH}) 仍是待获取实际运行配置后复核的近似，metadata
+以 `mass_enclosed_approximation` 和 `parameter_provenance` 显式记录，不能将其写成已确认的普适 MACER 公式。
+
+### 26.2 Data-Set 语义和单位
+
+源码核对后的语义为：
+
+- Data-Set-5 是源码变量 `d`，即气体质量密度；`n=1.02d` 只用于恒星形成阈值；
+- Data-Set-10 是气体内能密度 (e)，并始终满足 (T=93e/\rho)；
+- Data-Set-11 是每格 `cell_volume*rhodot_save`，总 SFR 应直接逐格求和；
+- Data-Set-15 是权威网格体积；
+- Data-Set-17 是冷却时标；Data-Set-8/9 是球坐标 (r/\theta) 方向加速度。
+
+Data-Set-11 的源码写出值保持代码质量/Gyr。质量单位为 (2.5\times10^7M_\odot)，所以
+
+\[
+1\;[M_0/{\rm Gyr}]=0.025\;M_\odot\,{\rm yr}^{-1}.
+\]
+
+旧 HDF `long_name` 中的 `M/yr` 不足以证明已执行单位换算。新 target metadata 使用
+`MACER_mass_code/Gyr`，并保存 `to_msun_per_yr=0.025`，避免固定 40 倍错误。
+
+原始 HDF 读取还会检查 `long_name`（density、a1、a2、gas energy、SFR、vol、coolt）；
+若某个运行因条件输出使 Data-Set 编号偏移，将直接报错而不是静默读取错误字段。
+
+### 26.3 多 snapshot 的 HR 复现结果
+
+从 Fiducial、Fiducial4、Fiducial7 三个盘星系运行中抽取 59 个早/中/晚期和末期低 SFR
+快照，结果保存为 `data/macer_sfr_multisnapshot_validation.csv`。除去尚未执行恒星形成更新的
+初始 `index=0` 和真值/算子都为零的晚期快照后，共有 51 个正 SFR 快照：
+
+| run | 正 SFR 数 | median (Y/B_{\rm cont}) | min | max |
+|---|---:|---:|---:|---:|
+| Fiducial | 17 | 1.000029 | 0.999659 | 1.058404 |
+| Fiducial4 | 17 | 1.000028 | 0.999936 | 1.000040 |
+| Fiducial7 | 17 | 1.000031 | 0.999983 | 1.000041 |
+
+一张独立真实快照回归给出
+
+\[
+B_{\rm operator}=70.99483,\qquad Y_{\rm DataSet11}=70.98279,
+\qquad Y/B=0.999830.
+\]
+
+普通和高 SFR 区间已达到约 (10^{-4}\) 量级的一致性。Fiducial 末期
+(Y\simeq1.14\times10^{-3}) 的极低 SFR 快照仍有约 5.84% 相对偏差；这对应很小的绝对误差，
+且很可能受到 (M(<r)\simeq M_{\rm BH})、日志上下文窗口平均及浮点输出精度影响。还有一个
+不可忽略的时间层差异：`star.F` 先用更新前的 (d,e) 计算并保存 `rhodot_save`，随后在同一步
+修改 (d,e)，而 HDF snapshot 写出的是更新后的场和先前保存的 SFR；因此仅凭同一输出
+snapshot 的后更新气体场，本来就不保证逐 bit 反演 Data-Set-11。
+因此结论是“数据兼容算子已足以作为当前 LR baseline，但不是源码逐 bit 复现”。初始快照
+`index=0` 的 Data-Set-11 为零而场公式给出非零，说明该输出发生在恒星形成更新启用前，
+应在 HR 回归统计或训练数据质量标记中单独处理。
+
+### 26.4 新字段的保守粗粒化
+
+Rh、Rm-v0、Rm-v1 均已接收冷却和加速度字段。冷却时标不直接平均，而是先构造
+
+\[
+C_i=\frac{e_i}{\tau_{{\rm cool},i}},\qquad
+L_C=\sum_i f_{Ci}C_iV_i,
+\]
+
+再重建
+
+\[
+C_C=L_C/V_C,\qquad \tau_{{\rm cool},C}=e_C/C_C.
+\]
+
+因此守恒的是总冷却功率 (sum CV)。加速度先转到固定柱坐标子午面基底
+
+\[
+a_R=a_r\sin\theta+a_\theta\cos\theta,\qquad
+a_z=a_r\cos\theta-a_\theta\sin\theta,
+\]
+
+再守恒沉积 (m a_R,m a_z)，最后转回粗网格中心的球坐标基。这样避免 Rm 跨
+(\theta) 输运时直接平均可变基分量产生非物理结果。相应冷却功率和 (R/z) 引力总力
+已经加入守恒审计。
+
+### 26.5 HDF、metadata 与 UID
+
+processed HDF5 提升为 format version 6，新增独立 `/sfr_supervision`，而不是把监督量写入
+`/snapshot`。canonical 组明确保存：
+
+```text
+Y_alpha
+B_alpha
+C_alpha_true
+```
+
+并强制验证 (C_\alpha^{\rm true}=Y_\alpha-B_\alpha)。两套算子的逐格 baseline、总 baseline、
+上下文、参数和单位均保存。`sample_uid` 仍只标识物理场与粗粒化产品；另增
+`physics_product_uid`，它对 sample UID、SFR 算子参数和上下文共同哈希，避免改变
+(G,c_\star,\tau_{\rm rot}) 或 MBH/dt 来源后仍得到相同产品身份。
+
+`GalDataSet` 的混合检查改为比较完整的 coarsening `operator_parameters` 和 SFR 参数，
+但允许每个 snapshot 的 MBH/dt 数值自然变化。Y/B/C 永远不进入 CNN `input_channels`。
+
+### 26.6 signed closure 训练接口
+
+PT cache schema version 4 保存物理 (Y,B,C) 和 signed-asinh 闭合标签；version 3/legacy
+仍可执行 direct-SFR。SFRConvNet 支持：
+
+```text
+prediction_mode=direct_sfr
+prediction_mode=signed_closure
+```
+
+closure 模式中网络输出变换空间的 (widehat C)，经可微反变换后显式组成
+
+\[
+\widehat Y=B+\widehat C.
+\]
+
+主损失直接作用于归一化后的最终物理 SFR：
+
+\[
+\mathcal L_{\rm final}
+=\ell\!\left(\frac{B+\widehat C}{s_C},\frac{Y}{s_C}\right).
+\]
+
+这里没有再重复添加一个与之物理等价的 (\lambda_C\mathcal L_{\rm closure})。另加可选非负软约束
+
+\[
+\mathcal L_{\rm negative}
+=\left[\frac{\max(0,-(B+\widehat C))}{s_C}\right]^2,
+\]
+
+它只惩罚不可能的负总 SFR，且在负区保留梯度；最终输出不做硬裁剪。KS 经验式继续仅作为
+评估 baseline，不能冒充 MACER (B_\alpha)。
+
+### 26.7 验证和仍未执行事项
+
+当前 66 项自动测试全部通过，覆盖两套算子分支、有限时间步、三种限制时标、温度/密度阈值、
+冷却功率与固定基引力守恒、Rh/Rm-v0/Rm-v1 字段传播、HDF round-trip、UID 区分、Y=B+C、
+标签不泄漏、signed 变换、显式 B+C 和负区梯度。
+
+本轮按要求没有生成完整 PT cache，也没有启动正式训练。旧 processed HDF5 不含 Data-Set-8/9/17
+及 SFR supervision，必须从原始 HDF4 重建后才能生成 schema-v4 closure cache。

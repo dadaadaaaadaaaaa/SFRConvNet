@@ -1,8 +1,7 @@
-"""Rebuild one processed fine MACER snapshot from its raw HDF4 source.
+"""根据其原始 HDF4 源文件重建一个已处理的精细 MACER 快照。
 
-This command is intentionally single-snapshot and refuses to overwrite by
-default.  It is the safe migration path for adding authoritative Data-Set-15
-cell volumes and coordinate edges to legacy processed HDF5 files.
+该命令设计为仅处理单个快照，并且默认情况下拒绝覆盖。
+这是将权威的 Data-Set-15网格体和坐标边界添加到旧版已处理 HDF5 文件的安全迁移路径。
 """
 
 from __future__ import annotations
@@ -19,9 +18,11 @@ try:
         _snapshot_index_from_filename,
     )
     from raw_data_processing.parse_log_file import load_config, ll_dg, ll_eg
+    from raw_data_processing.metadata_schema import sha256_file
 except ModuleNotFoundError:
     from galaxy_data import GalData, _build_snapshot_schedule, _snapshot_index_from_filename
     from parse_log_file import load_config, ll_dg, ll_eg
+    from metadata_schema import sha256_file
 
 
 def _parse_args():
@@ -121,6 +122,19 @@ def main():
         func_parse_log=log_parser,
         scope=scope,
         target_config=hdfra_config.get("target"),
+        source_metadata={
+            "simulation_code": "MACER2D",
+            "galaxy_type": galaxy_type,
+            "galaxy_id": args.galaxy,
+            "run_id": args.galaxy,
+            "source_series_id": galaxy_config["folder_name"],
+            "raw_snapshot_index": int(args.snapshot_index),
+            "source_file_id": raw_path.name,
+            "source_file_sha256": sha256_file(raw_path),
+            "source_file_size_bytes": int(raw_path.stat().st_size),
+            "time": time,
+            "time_units": "Gyr",
+        },
     )
     fine.set_coord(["fakeDim2", "fakeDim1"])
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +153,8 @@ def main():
     )
     print(
         f"target={restored.sfr_target}, "
-        f"format_version=4, round_trip=OK"
+        f"format_version=5, parent_hr_uid={restored.parent_hr_uid}, "
+        f"sample_uid={restored.sample_uid}, round_trip=OK"
     )
 
 

@@ -47,7 +47,7 @@
 | Data-Set-4 | `v3` | \(\phi\) 方向速度 |
 | Data-Set-5 | `d` | 气体数密度 |
 | Data-Set-6 | `T` | 气体温度 |
-| Data-Set-10 | `e` | 气体内能 |
+| Data-Set-10 | `e` | 气体内能密度；当前代码中的兼容字段名为 `gas_energy` |
 | Data-Set-11 | `sfr` | 恒星形成率或恒星形成率密度，精确定义和单位待核验 |
 | Data-Set-12 | `mnewstar` | 新形成恒星质量 |
 | Data-Set-13 | `dstar` | 恒星密度 |
@@ -535,16 +535,26 @@ M_{\rm disc}^{t},
 {\sum_{i\in C}\rho_iV_i}.
 \]
 
-总能量应保守平均：
+`Data-Set-10` 并不是总能量，而是气体内能密度。粗粒化时先积分得到单元内能，再重建粗网格内能密度：
 
 \[
-\bar E_C
+E_{{\rm int},C}
 =
-\frac{\sum_{i\in C}E_iV_i}
+\sum_{i\in C}e_iV_i,
+\qquad
+\bar e_C
+=
+\frac{E_{{\rm int},C}}
 {\sum_{i\in C}V_i}.
 \]
 
-之后从粗粒化总能量扣除解析动能，得到粗网格内能。不能把简单平均温度与简单平均内能同时当作彼此独立且严格守恒的变量。
+不应从该字段中扣除解析动能；那种操作只适用于代码实际保存总能量密度的情形。温度不是独立粗粒化变量，而应始终由
+
+\[
+T_C=93\frac{\bar e_C}{\bar\rho_C}
+\]
+
+重新计算。resolved kinetic energy 可作为单独诊断，但不能与 `Data-Set-10` 混为总能量守恒。
 
 SFR 标签使用 cell-integrated 形式：
 
@@ -973,7 +983,7 @@ S_E(\boldsymbol x),
 1. 当前 `sfr` 的精确定义、单位和计算公式是什么？
 2. `mnewstar` 对应哪个时间区间，是否与当前 snapshot 对齐？
 3. 当前数据中的 `d` 是哪一种数密度，平均分子量如何处理？
-4. `e` 是内能密度还是比内能？
+4. 已确认 `Data-Set-10` 的 `e` 是气体内能密度；仍需在迁移外部数据时核对其代码单位。
 5. MACER2D/3D 的具体网格、边界条件和 snapshot cadence 是什么？
 6. 现有 CNN 的训练/验证划分方式是什么？
 7. 所谓“泛化差”是跨 snapshot、跨 simulation、跨分辨率还是跨参数？

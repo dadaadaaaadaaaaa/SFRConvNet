@@ -21,7 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:  # 仅解析参数和读取缓存时不强制依赖 TensorBoard。
+    SummaryWriter = None
 
 from Experiment.models import AccretionTransformer, SFRConvNet, MACNetRes_mbh, MACNetFiLM
 
@@ -32,8 +35,8 @@ MBH_CONDITIONED_MODELS = (MACNetRes_mbh, MACNetFiLM)
 def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, conditioning_scalar: torch.Tensor) -> torch.Tensor:
     """Run one batch with the conditioning scalar required by the model family.
 
-    Current SFR caches store transformed KS-law SFR. Legacy ``*_mbh`` models
-    require an explicit BH-mass cache and must not silently consume KS SFR.
+    新 SFR 缓存使用 log10(M_filter)；legacy ``*_mbh`` 模型仍要求显式黑洞质量，
+    二者不得静默混用。
     """
     if isinstance(model, MBH_CONDITIONED_MODELS):
         conditioning_variable = getattr(model, "conditioning_variable", "unknown")
@@ -45,9 +48,100 @@ def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, conditioning_scal
         return model(x, conditioning_scalar)
     r = coord[:, 0:1]
     theta = coord[:, 1:2]
-    # For the current SFR pipeline this scalar is transformed KS-law SFR.
-    # SFRConvNet ignores it when use_film=False.
+    # 新 SFR 流程把该标量定义为 log10(M_filter)。
     return model(x, r, theta, conditioning_scalar)
+
+
+def inverse_closure_transform_torch(
+    transformed: torch.Tensor,
+    *,
+    transform: str,
+    scale: float,
+) -> torch.Tensor:
+    """以可微方式把网络输出还原为物理闭合项。"""
+
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("closure scale must be finite and positive.")
+    if transform == "signed_asinh":
+        # AMP 下 float16 的 sinh 很容易溢出；在 float32 中解码仍保留反向梯度。
+        return float(scale) * torch.sinh(transformed.float())
+    if transform == "identity":
+        return transformed
+    raise ValueError(f"Unsupported closure transform {transform!r}.")
+
+
+def compose_signed_closure_prediction(
+    transformed_closure: torch.Tensor,
+    baseline_physical: torch.Tensor,
+    *,
+    transform: str,
+    scale: float,
+) -> dict[str, torch.Tensor]:
+    """显式构造 ``C_hat`` 和 ``B + C_hat``，不对负预测做硬裁剪。"""
+
+    closure_physical = inverse_closure_transform_torch(
+        transformed_closure,
+        transform=transform,
+        scale=scale,
+    )
+    final_physical = baseline_physical.float() + closure_physical
+    return {
+        "closure_transformed": transformed_closure,
+        "closure_physical": closure_physical,
+        "final_sfr_physical": final_physical,
+    }
+
+
+def closure_training_loss(
+    transformed_prediction: torch.Tensor,
+    transformed_target: torch.Tensor,
+    baseline_physical: torch.Tensor,
+    target_sfr_physical: torch.Tensor,
+    *,
+    criterion: nn.Module,
+    groups: torch.Tensor | None,
+    transform: str,
+    scale: float,
+    negative_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """计算 signed-closure 主损失与最终 SFR 非负软约束。
+
+    负值约束采用平方 hinge ``relu(-(B+C_hat))^2``。它在非法负区间保留梯度，
+    不使用 ``clamp``/``ReLU`` 篡改模型的最终输出。主损失直接作用于归一化的
+    最终物理 SFR，即严格优化 ``B+C_hat`` 对 ``Y`` 的误差；
+    ``transformed_target`` 仅用于检查 batch 契约与形状。
+    """
+
+    if negative_weight < 0:
+        raise ValueError("negative_weight must be non-negative.")
+    if transformed_prediction.shape != transformed_target.shape:
+        raise ValueError("Predicted and target closure tensors must have identical shapes.")
+    composed = compose_signed_closure_prediction(
+        transformed_prediction,
+        baseline_physical,
+        transform=transform,
+        scale=scale,
+    )
+    target_physical = target_sfr_physical.float().view_as(
+        composed["final_sfr_physical"]
+    )
+    primary = criterion(
+        composed["final_sfr_physical"] / float(scale),
+        target_physical / float(scale),
+        groups,
+    )
+    negative_penalty = torch.mean(
+        torch.square(F.relu(-composed["final_sfr_physical"]) / float(scale))
+    )
+    total = primary + float(negative_weight) * negative_penalty
+    composed.update(
+        {
+            "primary_loss": primary,
+            "negative_penalty": negative_penalty,
+            "total_loss": total,
+        }
+    )
+    return total, composed
 
 
 # =============================================
@@ -139,8 +233,8 @@ class SFRSpatialAugmentor:
         return x_aug, coord_aug
     
 # =============================================
-# 1) Dataset: current SFR PT format
-#    [x, coord, target_sfr, transformed_ks_sfr, groups, n_groups, time]
+# 1) Dataset: versioned SFR PT format
+#    模型输入为 X_LR、坐标和 log10(M_filter)；KS 仅作为评估基线保存。
 # =============================================
 def _load_cache_channel_metadata(pt_path):
     pt_path = os.fspath(pt_path)
@@ -163,14 +257,123 @@ def _load_cache_channel_metadata(pt_path):
 
 
 class GalPTDataset(Dataset):
-    def __init__(self, pt_path, *, augmentor: Optional[SFRSpatialAugmentor] = None):
+    def __init__(
+        self,
+        pt_path,
+        *,
+        augmentor: Optional[SFRSpatialAugmentor] = None,
+        objective_mode: str = "direct_sfr",
+    ):
         super().__init__()
+        if objective_mode not in {"direct_sfr", "signed_closure"}:
+            raise ValueError(f"Unsupported objective_mode {objective_mode!r}.")
+        self.objective_mode = objective_mode
         try:
             loaded = torch.load(pt_path, weights_only=False) # 从prepare_data输出的pt文件中读取
         except Exception as exc:
             raise RuntimeError(f"Failed to load dataset cache '{pt_path}'. ") from exc
 
-        if isinstance(loaded, (list, tuple)):
+        payload_conditioning_variable = None
+        self.sfr_ks_transformed = None
+        self.sample_uid = None
+        self.parent_hr_uid = None
+        self.h_eff_reserved = None
+        self.n_eff_reserved = None
+        self.macer_sfr_baseline = None
+        self.target_sfr_physical = None
+        self.closure_true_physical = None
+        self.closure_transform = None
+        self.closure_scale = None
+        if isinstance(loaded, dict):
+            schema = loaded.get("schema", {})
+            schema_version = int(schema.get("version", -1))
+            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4}:
+                raise RuntimeError(
+                    f"Unsupported cache schema in '{pt_path}': {schema!r}"
+                )
+            tensors = loaded.get("tensors", {})
+            required = {
+                "x", "coord", "target_sfr", "sfr_ks_baseline",
+                "log_mass_filter", "groups", "time",
+            }
+            missing = sorted(required.difference(tensors))
+            if missing:
+                raise RuntimeError(f"Cache '{pt_path}' is missing tensor fields: {missing}")
+            self.x = tensors["x"]
+            self.coord = tensors["coord"]
+            self.y = tensors["target_sfr"]
+            self.conditioning_scalar = tensors["log_mass_filter"]
+            self.groups = tensors["groups"]
+            self.n_groups = None
+            self.time = tensors["time"]
+            self.sfr_ks_transformed = tensors["sfr_ks_baseline"]
+            self.h_eff_reserved = tensors.get("h_eff")
+            self.n_eff_reserved = tensors.get("n_eff")
+            if schema_version >= 4:
+                closure_required = {
+                    "target_sfr_physical",
+                    "macer_sfr_baseline",
+                    "closure_true",
+                    "closure_true_physical",
+                }
+                closure_missing = sorted(closure_required.difference(tensors))
+                if closure_missing:
+                    raise RuntimeError(
+                        f"Version-4 cache '{pt_path}' is missing closure fields: {closure_missing}"
+                    )
+                self.target_sfr_physical = tensors["target_sfr_physical"]
+                self.macer_sfr_baseline = tensors["macer_sfr_baseline"]
+                self.closure_true_transformed = tensors["closure_true"]
+                self.closure_true_physical = tensors["closure_true_physical"]
+                learning_contract = loaded.get("learning_contract", {})
+                if "signed_closure" not in learning_contract.get("available_objectives", ()):
+                    raise RuntimeError(
+                        f"Version-4 cache '{pt_path}' does not declare signed_closure support."
+                    )
+                self.closure_transform = learning_contract.get("closure_transform")
+                self.closure_scale = float(learning_contract.get("closure_scale", 0.0))
+                if self.closure_transform not in {"signed_asinh", "identity"}:
+                    raise RuntimeError(
+                        f"Version-4 cache '{pt_path}' has invalid closure transform "
+                        f"{self.closure_transform!r}."
+                    )
+                if not math.isfinite(self.closure_scale) or self.closure_scale <= 0:
+                    raise RuntimeError(
+                        f"Version-4 cache '{pt_path}' has invalid closure scale {self.closure_scale}."
+                    )
+            elif objective_mode == "signed_closure":
+                raise RuntimeError(
+                    "signed_closure requires a version-4 cache containing Y_alpha, "
+                    "B_alpha and C_alpha. Version-3/legacy caches remain direct_sfr-only."
+                )
+            identity = loaded.get("sample_identity", {})
+            self.sample_uid = np.asarray(identity.get("sample_uid", ()), dtype=str)
+            self.parent_hr_uid = np.asarray(identity.get("parent_hr_uid", ()), dtype=str)
+            if len(self.sample_uid) != len(self.y) or len(self.parent_hr_uid) != len(self.y):
+                raise RuntimeError(
+                    f"Cache '{pt_path}' has identity arrays that do not match its sample count."
+                )
+            contract = loaded.get("model_input_contract", {})
+            if contract.get("resolution_features") != ["log_mass_filter"]:
+                raise RuntimeError(
+                    f"Cache '{pt_path}' does not use the expected log_mass_filter contract."
+                )
+            if schema_version >= 4:
+                if contract.get("baseline_is_model_input") is not False:
+                    raise RuntimeError(
+                        f"Version-4 cache '{pt_path}' must keep B_alpha out of CNN inputs."
+                    )
+                if contract.get("baseline_is_output_composition") is not True:
+                    raise RuntimeError(
+                        f"Version-4 cache '{pt_path}' must declare B_alpha+C_hat composition."
+                    )
+            payload_conditioning_variable = "log_mass_filter"
+        elif isinstance(loaded, (list, tuple)):
+            if objective_mode == "signed_closure":
+                raise RuntimeError(
+                    "signed_closure cannot use a legacy tuple cache because it has no "
+                    "MACER-LR physical baseline."
+                )
             if len(loaded) >= 6:
                 self.x, self.coord, self.y, self.conditioning_scalar, self.groups, self.n_groups = loaded[:6]
                 self.time = loaded[6] if len(loaded) > 6 else None
@@ -182,7 +385,10 @@ class GalPTDataset(Dataset):
             else:
                 raise RuntimeError(f"Unexpected number of items in cached dataset '{pt_path}': {len(loaded)}")
         else:
-            raise RuntimeError(f"Cached dataset '{pt_path}' should be a tuple/list but got {type(loaded)!r}")
+            raise RuntimeError(
+                f"Cached dataset '{pt_path}' should be a versioned dict or legacy tuple/list, "
+                f"but got {type(loaded)!r}"
+            )
 
         def _ensure_tensor(arr, *, name: str):
             if isinstance(arr, torch.Tensor):
@@ -212,7 +418,10 @@ class GalPTDataset(Dataset):
         channel_metadata = _load_cache_channel_metadata(pt_path)
         self.cache_metadata = channel_metadata
         self.pt_path = os.fspath(pt_path)
-        self.conditioning_variable = channel_metadata.get("conditioning_variable")
+        self.conditioning_variable = (
+            payload_conditioning_variable
+            or channel_metadata.get("conditioning_variable")
+        )
         if self.conditioning_variable is None:
             # Compatibility with instantaneous-SFR caches created before the
             # conditioning_variable metadata field was introduced.
@@ -220,10 +429,39 @@ class GalPTDataset(Dataset):
                 self.conditioning_variable = "sfr_ks"
             else:
                 self.conditioning_variable = "unknown"
-        if self.conditioning_variable == "sfr_ks":
+        if self.conditioning_variable == "sfr_ks" and self.sfr_ks_transformed is None:
             self.sfr_ks_transformed = self.conditioning_scalar
-        # Read-only compatibility alias for older analysis/training helpers.
-        self.y_baseline = self.conditioning_scalar
+        # 新缓存的 baseline 与 resolution conditioning 明确分离；旧缓存保留兼容行为。
+        self.y_baseline = (
+            _ensure_tensor(self.sfr_ks_transformed, name="sfr_ks_baseline").view(-1, 1)
+            if self.sfr_ks_transformed is not None
+            else self.conditioning_scalar
+        )
+        if self.macer_sfr_baseline is not None:
+            self.macer_sfr_baseline = _ensure_tensor(
+                self.macer_sfr_baseline, name="macer_sfr_baseline"
+            ).view(-1, 1)
+            self.target_sfr_physical = _ensure_tensor(
+                self.target_sfr_physical, name="target_sfr_physical"
+            ).view(-1, 1)
+            self.closure_true_physical = _ensure_tensor(
+                self.closure_true_physical, name="closure_true_physical"
+            ).view(-1, 1)
+            self.closure_true_transformed = _ensure_tensor(
+                self.closure_true_transformed, name="closure_true"
+            ).view(-1, 1)
+            reconstructed = self.macer_sfr_baseline + self.closure_true_physical
+            if not torch.allclose(
+                reconstructed,
+                self.target_sfr_physical,
+                rtol=1e-5,
+                atol=1e-7,
+            ):
+                raise RuntimeError(
+                    f"Cache '{pt_path}' violates Y_alpha = B_alpha + C_alpha."
+                )
+            if self.objective_mode == "signed_closure":
+                self.y = self.closure_true_transformed
         self.input_channels = tuple(channel_metadata.get("input_channels", ()))
         self.excluded_channels = tuple(channel_metadata.get("excluded_channels", ()))
         self.target_metadata = {
@@ -280,10 +518,23 @@ class GalPTDataset(Dataset):
         coord = self.coord[idx]
         if self.augmentor is not None:
             x, coord = self.augmentor(x, coord) # 调用augmentor对特征图和坐标进行数据增强
+        if self.objective_mode == "signed_closure":
+            return (
+                x,
+                coord,
+                self.conditioning_scalar[idx],
+                self.y[idx],
+                self.macer_sfr_baseline[idx],
+                self.target_sfr_physical[idx],
+                self.groups[idx],
+                self.n_groups,
+            )
         return x, coord, self.conditioning_scalar[idx], self.y[idx], self.groups[idx], self.n_groups
 
 
-def _validate_leave_one_out_cache_contract(cache_dir, data_exp, datasets):
+def _validate_leave_one_out_cache_contract(
+    cache_dir, data_exp, datasets, *, objective_mode="direct_sfr"
+):
     """Validate new Exp2 caches against both metadata and actual PT group labels."""
     metadata = _load_cache_channel_metadata(os.path.join(cache_dir, data_exp + "train.pt"))
     if metadata.get("split_strategy") != "leave_one_galaxy_out":
@@ -315,7 +566,7 @@ def _validate_leave_one_out_cache_contract(cache_dir, data_exp, datasets):
         raise RuntimeError(
             f"Leave-one-galaxy-out cache is incomplete: required held-out cache not found: {out_path}"
         )
-    out_dataset = GalPTDataset(out_path)
+    out_dataset = GalPTDataset(out_path, objective_mode=objective_mode)
     actual_out = set(out_dataset.group_names)
     if actual_out != held_out_groups:
         raise RuntimeError(
@@ -398,6 +649,18 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
     # ↓ 损失函数的参数
     parser.add_argument("--loss", type=str, choices=["mse", "l1", "huber"], default="mse", help="Loss function to use") # 损失函数类型，支持均方误差（MSE）、平均绝对误差（L1）和Huber损失，默认使用MSE损失；Huber损失在误差较小时表现为MSE，在误差较大时表现为L1，可以在存在异常值时提供更稳健的训练；huber_delta参数控制Huber损失的转折点，默认为1
     parser.add_argument("--huber_delta", type=float, default=1, help="Delta parameter for Huber loss") # Huber损失的delta参数，控制损失函数从MSE模式切换到L1模式的阈值，默认值为1；较小的delta会使模型更快地切换到L1模式，从而对异常值更鲁棒；较大的delta会使模型在更大的误差范围内保持MSE模式，从而可能更好地拟合数据但对异常值更敏感
+    parser.add_argument(
+        "--objective_mode",
+        choices=("direct_sfr", "signed_closure"),
+        default="direct_sfr",
+        help="直接预测变换后 SFR，或预测 signed closure 并显式计算 B+C_hat。",
+    )
+    parser.add_argument(
+        "--negative_sfr_weight",
+        type=float,
+        default=1.0,
+        help="signed_closure 模式下最终 SFR<0 的可微平方 hinge 惩罚系数。",
+    )
     
     # ↓ 目标加权模式的参数
     parser.add_argument( # 目标加权模式，支持基于指数函数的权重（exp_clamp），基于组内z-score的指数权重（group_zscore_exp）和基于组内分位数的线性权重（group_quantile）；由于SFR分布相对平滑，默认改为 none
@@ -439,7 +702,7 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
     parser.add_argument(
         "--use_film",
         action="store_true",
-        help="Condition SFRConvNet feature maps on transformed KS-law SFR via FiLM.",
+        help="Condition SFRConvNet feature maps on log10(M_filter) via FiLM.",
     )
     parser.add_argument(
         "--hpo_params",
@@ -451,12 +714,15 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
     # ↓ 数据增强（augmentation）的参数
     parser.add_argument("--aug_prob", type=float, default=0.0, help="Probability to apply radial crop") # 设置触发RadialCropAugmentor的概率为0，从而移除这个功能
     parser.add_argument("--aug_min_crop_ratio", type=float, default=0.6, help="Minimum ratio r_cut/r_max for cropping")
-    parser.add_argument("--sfr_aug_prob", type=float, default=0.5, help="Probability to apply SFR spatial augmentation")
+    parser.add_argument("--sfr_aug_prob", type=float, default=0.0, help="Probability to apply SFR spatial augmentation")
 
     parser.add_argument("--log_dir", type=str, default="runs", help="Directory to write TensorBoard logs")
     parser.add_argument("--no_save", action="store_true", help="Disable saving results to disk (useful for HPO)")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.negative_sfr_weight < 0:
+        parser.error("--negative_sfr_weight must be non-negative.")
+    return args
 
 
 def _parse_stage_depths(value: str) -> Tuple[int, ...]: # 字符串转化为pytorch能够识别的元组的解析器
@@ -521,6 +787,8 @@ def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace: # 在�
         "aug_prob": float,
         "aug_min_crop_ratio": float,
         "use_film": bool,
+        "objective_mode": str,
+        "negative_sfr_weight": float,
     }
 
     applied = []
@@ -733,21 +1001,70 @@ class WarmupCosineScheduler:
 '''
 标准的一轮训练主循环，整合loader，model，输出prediction，计算加权损失，反向传播，更新权重和学习率
 '''
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, grad_clip=None, scheduler=None):
+def _move_batch(batch, device, objective_mode):
+    """统一解包 direct_sfr 六元组与 signed_closure 八元组。"""
+
+    x = batch[0].to(device, non_blocking=True)
+    coord = batch[1].to(device, non_blocking=True)
+    conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
+    y = batch[3].to(device, non_blocking=True).view(-1)
+    if objective_mode == "signed_closure":
+        if len(batch) != 8:
+            raise RuntimeError("signed_closure batch must contain 8 fields.")
+        baseline = batch[4].to(device, non_blocking=True).view(-1)
+        target_physical = batch[5].to(device, non_blocking=True).view(-1)
+        groups = batch[6].to(device, non_blocking=True).view(-1)
+        n_groups = batch[7]
+    else:
+        if len(batch) != 6:
+            raise RuntimeError("direct_sfr batch must contain 6 fields.")
+        baseline = None
+        target_physical = None
+        groups = batch[4].to(device, non_blocking=True).view(-1)
+        n_groups = batch[5]
+    return x, coord, conditioning_scalar, y, baseline, target_physical, groups, n_groups
+
+
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    scaler=None,
+    grad_clip=None,
+    scheduler=None,
+    *,
+    objective_mode="direct_sfr",
+    closure_transform=None,
+    closure_scale=None,
+    negative_sfr_weight=0.0,
+):
     model.train()
     total, n = 0.0, 0 
-    for batch in loader: # Batch field 3 is the cache-declared conditioning scalar (KS SFR for current SFR caches).
-        x = batch[0].to(device, non_blocking=True)  # (B, C_in, H, W)
-        coord = batch[1].to(device, non_blocking=True)  # (B, 2, H, W)
-        conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
-        y = batch[3].to(device, non_blocking=True).view(-1)  # (B,) 真实SFR值
-        groups = batch[4].to(device, non_blocking=True).view(-1)  # (B,)
+    for batch in loader: # Batch 第3项是 cache 声明的分辨率条件 log10(M_filter)。
+        x, coord, conditioning_scalar, y, baseline, target_physical, groups, _ = _move_batch(
+            batch, device, objective_mode
+        )
 
         optimizer.zero_grad(set_to_none=True)
         if scaler is not None:
             with torch.autocast(device_type=device.type, dtype=torch.float16):
                 pred = predict_batch(model, x, coord, conditioning_scalar)
-                loss = criterion(pred, y, groups) # 根据权重函数计算加权损失值
+                if objective_mode == "signed_closure":
+                    loss, _ = closure_training_loss(
+                        pred,
+                        y,
+                        baseline,
+                        target_physical,
+                        criterion=criterion,
+                        groups=groups,
+                        transform=closure_transform,
+                        scale=closure_scale,
+                        negative_weight=negative_sfr_weight,
+                    )
+                else:
+                    loss = criterion(pred, y, groups) # 根据权重函数计算加权损失值
             scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
                 scaler.unscale_(optimizer)
@@ -758,7 +1075,20 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, gr
                 scheduler.step()
         else:
             pred = predict_batch(model, x, coord, conditioning_scalar)
-            loss = criterion(pred, y, groups)
+            if objective_mode == "signed_closure":
+                loss, _ = closure_training_loss(
+                    pred,
+                    y,
+                    baseline,
+                    target_physical,
+                    criterion=criterion,
+                    groups=groups,
+                    transform=closure_transform,
+                    scale=closure_scale,
+                    negative_weight=negative_sfr_weight,
+                )
+            else:
+                loss = criterion(pred, y, groups)
             loss.backward()
             if grad_clip and grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -776,12 +1106,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler=None, gr
 打印当前dataloader里每一种星系（group）的样本数量，用于验证oversample平衡是否生效
 '''
 @torch.no_grad()
-def print_group_counts(loader, name: str):
+def print_group_counts(loader, name: str, *, objective_mode="direct_sfr"):
     counts = None
     for batch in loader:
-        groups = batch[4].view(-1)
+        group_index = 6 if objective_mode == "signed_closure" else 4
+        n_groups_index = 7 if objective_mode == "signed_closure" else 5
+        groups = batch[group_index].view(-1)
         if counts is None:
-            n_groups_tensor = batch[5]
+            n_groups_tensor = batch[n_groups_index]
             if isinstance(n_groups_tensor, torch.Tensor):
                 n_groups = int(n_groups_tensor.flatten()[0].item())
             else:
@@ -798,8 +1130,44 @@ def print_group_counts(loader, name: str):
 '''
 评估函数，计算每个组的平均损失，并返回worst domain loss（所有组中平均损失最大的那个）和所有组的平均损失列表。
 '''
+def _per_sample_weighted_loss(criterion, prediction, target, groups):
+    """返回不跨 batch 归约的现有 criterion 损失。"""
+
+    if isinstance(criterion, WeightedLoss):
+        per_sample_loss = criterion.base_criterion(prediction, target)
+        per_sample_loss = per_sample_loss * criterion.weights_fn(target, groups)
+    elif isinstance(criterion, nn.HuberLoss):
+        per_sample_loss = F.huber_loss(
+            prediction,
+            target,
+            reduction="none",
+            delta=getattr(criterion, "delta", 1.0),
+        )
+    elif isinstance(criterion, nn.MSELoss):
+        per_sample_loss = F.mse_loss(prediction, target, reduction="none")
+    elif isinstance(criterion, nn.L1Loss):
+        per_sample_loss = F.l1_loss(prediction, target, reduction="none")
+    else:
+        per_sample_loss = criterion(prediction, target)
+    if per_sample_loss.ndim > 1:
+        per_sample_loss = per_sample_loss.view(per_sample_loss.size(0), -1).mean(dim=1)
+    return per_sample_loss
+
+
 @torch.no_grad()
-def eval_epoch(model, loader, criterion, device, writer, epoch):
+def eval_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    writer,
+    epoch,
+    *,
+    objective_mode="direct_sfr",
+    closure_transform=None,
+    closure_scale=None,
+    negative_sfr_weight=0.0,
+):
     model.eval()
     try:
         first_batch = next(iter(loader))
@@ -807,7 +1175,7 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         print(f"[{epoch}] Warning: eval_epoch received an empty loader.")
         return float("nan"), []
 
-    n_groups_tensor = first_batch[5]
+    n_groups_tensor = first_batch[7] if objective_mode == "signed_closure" else first_batch[5]
     if isinstance(n_groups_tensor, torch.Tensor):
         n_groups = int(n_groups_tensor.flatten()[0].item())
     else:
@@ -819,12 +1187,25 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         total_loss = 0.0
         n_samples = 0
         for batch in loader:
-            x = batch[0].to(device, non_blocking=True)
-            coord = batch[1].to(device, non_blocking=True)
-            conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
-            y = batch[3].to(device, non_blocking=True).view(-1)
+            x, coord, conditioning_scalar, y, baseline, target_physical, groups, _ = _move_batch(
+                batch, device, objective_mode
+            )
             pred = predict_batch(model, x, coord, conditioning_scalar)
-            loss = criterion(pred, y).mean().item()
+            if objective_mode == "signed_closure":
+                loss, _ = closure_training_loss(
+                    pred,
+                    y,
+                    baseline,
+                    target_physical,
+                    criterion=criterion,
+                    groups=groups,
+                    transform=closure_transform,
+                    scale=closure_scale,
+                    negative_weight=negative_sfr_weight,
+                )
+            else:
+                loss = criterion(pred, y, groups)
+            loss = loss.item()
             total_loss += loss * y.size(0)
             n_samples += y.size(0)
         avg = total_loss / max(1, n_samples)
@@ -832,32 +1213,45 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
 
     groups_sum = [0.0] * n_groups
     groups_count = [0] * n_groups
+    closure_final_abs_sum = 0.0
+    closure_negative_count = 0
+    closure_sample_count = 0
 
     for batch in loader:
-        x = batch[0].to(device, non_blocking=True)
-        coord = batch[1].to(device, non_blocking=True)
-        conditioning_scalar = batch[2].to(device, non_blocking=True).view(-1)
-        y = batch[3].to(device, non_blocking=True).view(-1)
-        groups = batch[4].view(-1).to(device=y.device, dtype=torch.long)
+        x, coord, conditioning_scalar, y, baseline, target_physical, groups, _ = _move_batch(
+            batch, device, objective_mode
+        )
+        groups = groups.to(device=y.device, dtype=torch.long)
 
         pred = predict_batch(model, x, coord, conditioning_scalar)
-
-        if isinstance(criterion, WeightedLoss):
-            base_loss = criterion.base_criterion(pred, y)  # shape: (B, ...) or (B,)
-            weights = criterion.weights_fn(y, groups)  # 同形或可广播
-            per_sample_loss = base_loss * weights
-        elif isinstance(criterion, nn.HuberLoss):
-            per_sample_loss = F.huber_loss(pred, y, reduction="none", delta=getattr(criterion, "delta", 1.0))
-        elif isinstance(criterion, nn.MSELoss):
-            per_sample_loss = F.mse_loss(pred, y, reduction="none")
-        elif isinstance(criterion, nn.L1Loss):
-            per_sample_loss = F.l1_loss(pred, y, reduction="none")
+        if objective_mode == "signed_closure":
+            composed = compose_signed_closure_prediction(
+                pred,
+                baseline,
+                transform=closure_transform,
+                scale=closure_scale,
+            )
+            per_sample_loss = _per_sample_weighted_loss(
+                criterion,
+                composed["final_sfr_physical"] / float(closure_scale),
+                target_physical.float() / float(closure_scale),
+                groups,
+            )
+            negative = torch.square(
+                F.relu(-composed["final_sfr_physical"]) / float(closure_scale)
+            )
+            if negative.ndim > 1:
+                negative = negative.view(negative.size(0), -1).mean(dim=1)
+            per_sample_loss = per_sample_loss + float(negative_sfr_weight) * negative
+            closure_final_abs_sum += torch.abs(
+                composed["final_sfr_physical"] - target_physical.float()
+            ).sum().item()
+            closure_negative_count += int(
+                (composed["final_sfr_physical"] < 0).sum().item()
+            )
+            closure_sample_count += int(target_physical.numel())
         else:
-            per_sample_loss = criterion(pred, y)
-
-        # (B,) ensure shape: if multi-dimensional, average over non-batch dimensions first
-        if per_sample_loss.ndim > 1:
-            per_sample_loss = per_sample_loss.view(per_sample_loss.size(0), -1).mean(dim=1)
+            per_sample_loss = _per_sample_weighted_loss(criterion, pred, y, groups)
 
         # Cumulative by domain
         for g in range(n_groups): # 累加每个group的损失总和，计算每一种星系的平均损失
@@ -883,6 +1277,17 @@ def eval_epoch(model, loader, criterion, device, writer, epoch):
         if v == v:
             writer.add_scalar(f"val/loss_domain_{d}", v, epoch)
     writer.add_scalar("val/loss_metric", metric, epoch)
+    if objective_mode == "signed_closure" and closure_sample_count > 0:
+        writer.add_scalar(
+            "val/final_sfr_physical_mae",
+            closure_final_abs_sum / closure_sample_count,
+            epoch,
+        )
+        writer.add_scalar(
+            "val/final_sfr_negative_fraction",
+            closure_negative_count / closure_sample_count,
+            epoch,
+        )
 
     # Return main metric loss and all domain means
     return metric, groups_mean
@@ -895,6 +1300,12 @@ def main(args=None):
     if args is None:
         args = parse_args()
     args = _apply_hpo_overrides(args) # 取命令行参数，并允许 HPO（自动化调参）覆盖手写参数。
+    if args.objective_mode not in {"direct_sfr", "signed_closure"}:
+        raise ValueError(f"Unsupported objective_mode {args.objective_mode!r}.")
+    if args.objective_mode == "signed_closure" and args.model_type != "convnet":
+        raise ValueError("signed_closure 当前仅对 SFRConvNet 实现并验证。")
+    if args.negative_sfr_weight < 0:
+        raise ValueError("negative_sfr_weight must be non-negative.")
     set_seed(args.seed) # 固定随机数种子，保证实验的可复现性
     if args.cudnn_benchmark:
         torch.backends.cudnn.benchmark = True
@@ -909,6 +1320,8 @@ def main(args=None):
     run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S") # 根据当前时间生成一个独一无二的 TensorBoard 文件夹，准备记录即将产生的海量数据。
     clean_exp_name = args.exp_name.rstrip("_")
     log_dir = os.path.join(args.log_dir, f"{clean_exp_name}_{run_stamp}")
+    if SummaryWriter is None:
+        raise ImportError("启动训练需要安装 tensorboard；仅导入训练工具时不要求该依赖。")
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logs will be saved to: {log_dir}")
 
@@ -917,15 +1330,30 @@ def main(args=None):
     exp = clean_exp_name
     data_exp = args.data_exp if args.data_exp else exp
 
-    train_augmentor = SFRSpatialAugmentor(p_flip=args.sfr_aug_prob, p_rot=args.sfr_aug_prob) # 加入数据增强Augmentor
+    # 当增强概率为零时不实例化增强器，避免在每次取样时仍复制张量。
+    train_augmentor = None
+    if args.sfr_aug_prob > 0:
+        train_augmentor = SFRSpatialAugmentor(
+            p_flip=args.sfr_aug_prob,
+            p_rot=args.sfr_aug_prob,
+        )
 
-    train_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "train.pt"), augmentor=train_augmentor) # 训练集
-    val_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "val.pt")) # 验证集
-    test_ds = GalPTDataset(os.path.join(cache_dir, data_exp + "test.pt")) # 测试集
+    train_ds = GalPTDataset(
+        os.path.join(cache_dir, data_exp + "train.pt"),
+        augmentor=train_augmentor,
+        objective_mode=args.objective_mode,
+    ) # 训练集
+    val_ds = GalPTDataset(
+        os.path.join(cache_dir, data_exp + "val.pt"), objective_mode=args.objective_mode
+    ) # 验证集
+    test_ds = GalPTDataset(
+        os.path.join(cache_dir, data_exp + "test.pt"), objective_mode=args.objective_mode
+    ) # 测试集
     cache_split_metadata = _validate_leave_one_out_cache_contract(
         cache_dir,
         data_exp,
         {"train": train_ds, "val": val_ds, "test": test_ds},
+        objective_mode=args.objective_mode,
     )
 
     channel_counts = {int(ds.x.shape[1]) for ds in (train_ds, val_ds, test_ds)}
@@ -966,10 +1394,18 @@ def main(args=None):
             f"Model type {args.model_type!r} is a legacy BH-mass-conditioned model, "
             f"but cache {data_exp!r} provides {conditioning_variable!r}."
         )
-    if args.model_type == "convnet" and args.use_film and conditioning_variable != "sfr_ks":
+    if args.model_type == "convnet" and args.use_film and conditioning_variable != "log_mass_filter":
         raise RuntimeError(
-            "SFRConvNet FiLM requires conditioning_variable='sfr_ks'; "
+            "SFRConvNet FiLM requires conditioning_variable='log_mass_filter'; "
             f"got {conditioning_variable!r}."
+        )
+    if (
+        args.model_type == "convnet"
+        and conditioning_variable == "log_mass_filter"
+        and not args.use_film
+    ):
+        raise RuntimeError(
+            "Version-3 SFR caches require --use_film so log_mass_filter actually enters the model."
         )
     print(
         "Conditioning: "
@@ -984,9 +1420,32 @@ def main(args=None):
         print(f"Target metadata: {train_ds.target_metadata}")
     else:
         print("[Warning] Legacy cache has no target metadata; physical target semantics cannot be verified.")
+    if args.objective_mode == "signed_closure":
+        closure_contracts = {
+            (ds.closure_transform, ds.closure_scale)
+            for ds in (train_ds, val_ds, test_ds)
+        }
+        if len(closure_contracts) != 1:
+            raise RuntimeError(
+                f"Train/validation/test caches use inconsistent closure transforms: {closure_contracts}"
+            )
+        closure_transform, closure_scale = next(iter(closure_contracts))
+        print(
+            "Learning objective: signed_closure; "
+            f"transform={closure_transform}, scale={closure_scale}, "
+            f"negative_sfr_weight={args.negative_sfr_weight}"
+        )
+    else:
+        closure_transform, closure_scale = None, None
+        print("Learning objective: direct_sfr")
 
-    group_stats = _compute_group_stats( # 调用_compute_group_stats函数，计算训练集中每个组的吸积率分布统计信息（均值、标准差、10%分位数和90%分位数），这些统计信息将用于动态权重计算
-        train_ds.y,
+    group_stat_target = (
+        train_ds.target_sfr_physical / float(closure_scale)
+        if args.objective_mode == "signed_closure"
+        else train_ds.y
+    )
+    group_stats = _compute_group_stats( # 闭合模式按最终物理 SFR（除以 closure_scale）计算组权重统计。
+        group_stat_target,
         train_ds.groups,
         int(train_ds.n_groups),
         q_low=args.weight_q_low,
@@ -1005,9 +1464,9 @@ def main(args=None):
     test_loader = DataLoader(test_ds, shuffle=False, num_workers=max(0, args.num_workers // 2), **common, **dl_extra)
 
     if args.print_group_counts:
-        print_group_counts(train_loader, "train")
-        print_group_counts(val_loader, "val")
-        print_group_counts(test_loader, "test")
+        print_group_counts(train_loader, "train", objective_mode=args.objective_mode)
+        print_group_counts(val_loader, "val", objective_mode=args.objective_mode)
+        print_group_counts(test_loader, "test", objective_mode=args.objective_mode)
 
     # Model 根据指令调用model，发射到GPU上
     c_in = train_ds.x.shape[1]
@@ -1043,8 +1502,10 @@ def main(args=None):
             p_drop=args.p_drop,
             se_reduction=args.se_reduction,
             use_film=args.use_film, # 传入命令行控制的 FiLM 参数
+            prediction_mode=args.objective_mode,
         ).to(device)
     model.conditioning_variable = conditioning_variable
+    model.prediction_mode = args.objective_mode
 
     try:
         model.eval()
@@ -1052,7 +1513,8 @@ def main(args=None):
         with torch.no_grad():
             # Use a tiny temp loader with 0 workers to fetch a sample for the graph
             temp_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0)
-            sample_x, sample_coord, sample_conditioning_scalar, _, _, _ = next(iter(temp_loader))
+            sample_batch = next(iter(temp_loader))
+            sample_x, sample_coord, sample_conditioning_scalar = sample_batch[:3]
             if isinstance(model, MBH_CONDITIONED_MODELS):
                 writer.add_graph(model, (sample_x.to(device), sample_conditioning_scalar.view(-1).to(device)))
             elif isinstance(model, SFRConvNet):
@@ -1130,6 +1592,9 @@ def main(args=None):
                 "excluded_channels": list(train_ds.excluded_channels),
                 "target_metadata": train_ds.target_metadata,
                 "conditioning_variable": conditioning_variable,
+                "objective_mode": args.objective_mode,
+                "closure_transform": closure_transform,
+                "closure_scale": closure_scale,
                 "data_split_metadata": cache_split_metadata,
                 **train_ds.target_metadata,
             }
@@ -1159,8 +1624,23 @@ def main(args=None):
             scaler if use_amp else None,
             grad_clip=(args.grad_clip if args.grad_clip > 0 else None),
             scheduler=scheduler,
+            objective_mode=args.objective_mode,
+            closure_transform=closure_transform,
+            closure_scale=closure_scale,
+            negative_sfr_weight=args.negative_sfr_weight,
         )
-        val_metric, group_means = eval_epoch(model, val_loader, criterion, device, writer, epoch) # 在验证集上测试，返回综合指标与各星系均值
+        val_metric, group_means = eval_epoch(
+            model,
+            val_loader,
+            criterion,
+            device,
+            writer,
+            epoch,
+            objective_mode=args.objective_mode,
+            closure_transform=closure_transform,
+            closure_scale=closure_scale,
+            negative_sfr_weight=args.negative_sfr_weight,
+        ) # 在验证集上测试，返回综合指标与各星系均值
 
         valid_vals = [v for v in group_means if v == v]
         mean_val = sum(valid_vals) / len(valid_vals) if valid_vals else float("nan")
@@ -1190,6 +1670,10 @@ def main(args=None):
                         "excluded_channels": list(train_ds.excluded_channels),
                         "target_metadata": train_ds.target_metadata,
                         "conditioning_variable": conditioning_variable,
+                        "objective_mode": args.objective_mode,
+                        "closure_transform": closure_transform,
+                        "closure_scale": closure_scale,
+                        "negative_sfr_weight": args.negative_sfr_weight,
                         "data_split_metadata": cache_split_metadata,
                     },
                     best_path,
@@ -1220,7 +1704,18 @@ def main(args=None):
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model"])
 
-    test_metric, group_means = eval_epoch(model, test_loader, criterion, device, writer, epoch=0) # 在测试集中评估训练出来的最好的模型。
+    test_metric, group_means = eval_epoch(
+        model,
+        test_loader,
+        criterion,
+        device,
+        writer,
+        epoch=0,
+        objective_mode=args.objective_mode,
+        closure_transform=closure_transform,
+        closure_scale=closure_scale,
+        negative_sfr_weight=args.negative_sfr_weight,
+    ) # 在测试集中评估训练出来的最好的模型。
     print(f"Test metric loss: {test_metric:.6f}, per-domain: {group_means}")
     if not args.no_save:
         print(f"Best model saved to: {best_path}")

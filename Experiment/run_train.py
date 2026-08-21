@@ -32,6 +32,15 @@ EXPERIMENT_ALIASES = {
             "BaseInformation": {"data_exp": "Exp1_InstantSFR_NoInitialStellarDensity_"}
         },
     },
+    "Exp2_NoAug_SFRConvNet": {
+        "base_experiment": "Exp1_SFRConvNet",
+        "overrides": {
+            "BaseInformation": {
+                "data_exp": "Exp2_InstantSFR_NoInitialStellarDensity_NoAug_"
+            },
+            "DataAugmentation": {"sfr_aug_prob": 0.0},
+        },
+    },
 }
 
 # Shorthand experiments use the current instantaneous-SFR, no-initial-stellar-
@@ -200,7 +209,8 @@ def _expand_training_jobs(exp_key, held_out_galaxies=None):
         model_label = exp_key.rsplit("_", 1)[-1]
         short_group = _short_group_name(held_out_groups[0])
         if model_label == "SFRConvNet":
-            fold_config["exp_name"] = f"Exp2_LOO{short_group}"
+            suffix = "_NoAug" if "NoAug" in exp_key else ""
+            fold_config["exp_name"] = f"Exp2_LOO{short_group}{suffix}"
         else:
             fold_config["exp_name"] = f"Exp2_{model_label}_LOO{short_group}"
         jobs.append((fold_config["exp_name"], fold_config))
