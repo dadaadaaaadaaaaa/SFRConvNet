@@ -2199,9 +2199,31 @@ closure 模式中网络输出变换空间的 (widehat C)，经可微反变换后
 
 ### 26.7 验证和仍未执行事项
 
-当前 66 项自动测试全部通过，覆盖两套算子分支、有限时间步、三种限制时标、温度/密度阈值、
+截至 2026-08-21，当前 76 项自动测试全部通过，覆盖两套算子分支、有限时间步、三种限制时标、温度/密度阈值、
 冷却功率与固定基引力守恒、Rh/Rm-v0/Rm-v1 字段传播、HDF round-trip、UID 区分、Y=B+C、
 标签不泄漏、signed 变换、显式 B+C 和负区梯度。
 
 本轮按要求没有生成完整 PT cache，也没有启动正式训练。旧 processed HDF5 不含 Data-Set-8/9/17
 及 SFR supervision，必须从原始 HDF4 重建后才能生成 schema-v4 closure cache。
+
+## 27. 2026-08-21：固定 Rh 训练条件与稀疏日志空窗口修复
+
+固定单一分辨率 Rh 不再伪造 `mass_filter`。新 Rh CachePT 使用 schema version 5，保存
+inactive 的全零 `conditioning_scalar`，并声明 `conditioning.name=none`；此时禁止分辨率
+FiLM。Rm 继续原样使用 schema v3/v4 和 `log10(M_filter)`，旧 cache 可继续读取。初始化
+snapshot 可按 `raw_snapshot_index=0` 精确排除，不需要删除晚期物理零 SFR。
+
+`fiducial_4` 日志本身没有 NaN，但在 15 个 snapshot 的
+\(t\pm0.000625\,\mathrm{Gyr}\) 窗口中没有日志行；旧流程对空表求均值后把 NaN 静默写入
+`log_data`，新 SFR baseline 的有限性检查才将其暴露。现在盘星系日志选择采用：
+
+1. 窗口非空：保持原窗口平均；
+2. 窗口为空且有双侧日志：按 snapshot 时间对连续数值列做线性插值；
+3. snapshot 落在日志时间范围外：使用最近端点。
+
+重复日志时间会先聚合再插值。选择代码、窗口记录数、左右时间、bracket 宽度和插值权重
+均进入 SFR supervision context 并参与 `physics_product_uid`。真实 `fiducial_4` 的 15 个空
+窗口均得到有限正 `mbh`；首个失败点 snapshot 2 得到
+\(M_{\rm BH}=8.0365833177\)，其 bracket 为
+\([0.00159787288,0.00349827950]\,\mathrm{Gyr}\)。该 snapshot 的 Rh 8x8 产品满足
+\(Y=B+C\)，HDF5 round-trip 保留 `linear_interpolation_empty_window` provenance。

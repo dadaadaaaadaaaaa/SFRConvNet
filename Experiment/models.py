@@ -1,6 +1,9 @@
-"""
-基于pytorch的深度学习神经网络
-终极目的：输入一张代表星系中心气体状态的多通道 2D 物理特征图（如密度场、温度场），再加上一个额外的标量条件（如用于残差预测的物理基准 SFR），让模型预测出一个精确真实的吸积率或恒星形成率 (SFR) y。
+"""MACNet 的 PyTorch 网络结构库。
+
+本模块定义旧版黑洞质量条件残差网络、Transformer 与当前 SFRConvNet。
+模型共同处理多通道二维气体场和网格坐标，并可按 cache 契约接收全局条件标量；
+输出既可表示直接 SFR，也可表示 signed closure，但物理反变换与 ``B+C_hat``
+组合由训练和分析模块负责。
 """
 import math
 import torch
@@ -639,7 +642,7 @@ class SFRConvNet(nn.Module):
         pos_max_freq: float = 64.0, # 傅里叶变换最大频率
         p_drop: float = 0.1, # dropout机制的概率
         se_reduction: int = 4, # SEBlock的通道数缩减率，控制SEBlock中隐藏层的大小，较小的reduction会增加模型容量，但也可能导致过拟合
-        use_film: bool = False, # 若为真，使用 log10(M_filter) 调制特征。
+        use_film: bool = False, # 若为真，使用 cache 声明的活动条件调制特征；当前为 R_m 的 log10(M_filter)。
         prediction_mode: str = "direct_sfr",
     ):
         """
@@ -725,7 +728,7 @@ class SFRConvNet(nn.Module):
         x: torch.Tensor,        # (B, C_in, H, W)
         r: torch.Tensor,        # (B, 1,    H, W)
         theta: torch.Tensor,    # (B, 1,    H, W)
-        log_mass_filter: Optional[torch.Tensor] = None, # (B,) log10(M_filter)
+        conditioning_scalar: Optional[torch.Tensor] = None, # (B,)；物理语义由 cache contract 决定。
     ) -> torch.Tensor:
         # Positional features
         pos = self.posenc(r, theta, normalize=True)  # (B, D_pos, H, W)
@@ -735,8 +738,8 @@ class SFRConvNet(nn.Module):
         feat = self.stem(feat)
 
         # 生成 FiLM 参数
-        if self.use_film and log_mass_filter is not None:
-            gammas, betas = self.film(log_mass_filter)
+        if self.use_film and conditioning_scalar is not None:
+            gammas, betas = self.film(conditioning_scalar)
         else:
             gammas, betas = [None] * len(self.stages), [None] * len(self.stages)
 

@@ -1,8 +1,9 @@
-# Galaxy Data Processing Module
-# This module provides classes and functions to read, process, and manage galaxy simulation data.
-# It includes functionality to read snapshot data, compute derived quantities,
-# rescale data, and manage datasets for machine learning applications.
-# Author: Peng Cheng
+"""MACER snapshot 读取、粗粒化、SFR 监督产品与机器学习数据集的总入口。
+
+本模块从 HDF4 和日志构造 ``GalData``，保存权威网格体积和完整 metadata，
+统一调度 R_h/R_m 算子并生成 ``Y、B、C_true``；``GalDataSet`` 则负责多
+snapshot 加载、通道选择、标准化、分组及划分。作者：Peng Cheng。
+"""
 
 import os
 import warnings
@@ -560,7 +561,7 @@ class GalData:
         self,
         *,
         time_step: float | None = None,
-        context_selection: str = "log_window_mean",
+        context_selection: str | None = None,
     ) -> "GalData":
         """计算两套 MACER SFR 基线，并构造当前样本的 ``Y、B、Y-B``。
 
@@ -616,18 +617,49 @@ class GalData:
                 radial_acceleration=self.snapshot["radial_acceleration"],
             ),
         }
+        selection_code = int(
+            round(float(self._data_log.get("log_context_selection_code", 0)))
+        )
+        selection_names = {
+            0: "window_mean",
+            1: "linear_interpolation_empty_window",
+            2: "nearest_endpoint_outside_log_range",
+        }
+        inferred_selection = selection_names.get(
+            selection_code, f"unknown_code_{selection_code}"
+        )
+        if context_selection is None:
+            context_selection = inferred_selection
+        snapshot_time = float(self.time)
         context = {
             "black_hole_mass": mbh,
             "black_hole_mass_units": "2.5e7_Msun",
-            "black_hole_mass_source": "log_data.mbh",
+            "black_hole_mass_source": f"log_data.mbh:{context_selection}",
             "time_step": time_step,
             "time_step_units": "Gyr",
             "time_step_source": time_step_source,
             "log_context_selection": str(context_selection),
+            "log_context_selection_code": selection_code,
             "log_context_scope_gyr": float(
                 self._data_log.get("log_context_scope", 0.0)
             ),
-            "snapshot_time_gyr": float(self.time),
+            "log_context_window_count": int(
+                round(float(self._data_log.get("log_context_window_count", -1)))
+            ),
+            "log_context_left_time_gyr": float(
+                self._data_log.get("log_context_left_time", snapshot_time)
+            ),
+            "log_context_right_time_gyr": float(
+                self._data_log.get("log_context_right_time", snapshot_time)
+            ),
+            "log_context_bracket_width_gyr": float(
+                self._data_log.get("log_context_bracket_width", 0.0)
+            ),
+            "log_context_interpolation_weight": float(
+                self._data_log.get("log_context_interpolation_weight", 0.0)
+            ),
+            "log_context_fallback_used": selection_code != 0,
+            "snapshot_time_gyr": snapshot_time,
         }
         products = {}
         metadata_operators = {}
@@ -1947,6 +1979,31 @@ class GalDataSet:
                 raise ValueError("All samples are invalid after filtering; check the raw dataset.")
             self.__subset(np.flatnonzero(mask))
         return self
+
+    def exclude_raw_snapshot_indices(self, indices) -> "GalDataSet":
+        """按源 snapshot index 精确排除初始化输出，不误删晚期零 SFR。"""
+
+        self.__verify_data_loaded()
+        excluded = {int(value) for value in indices}
+        if not excluded:
+            return self
+        raw_indices = []
+        for metadata in self._raw_data["sample_metadata"]:
+            source = metadata.get("source", {}) if isinstance(metadata, dict) else {}
+            if "raw_snapshot_index" not in source:
+                raise ValueError(
+                    "按 raw_snapshot_index 排除样本需要完整 source metadata；"
+                    "请重新生成 processed HDF5。"
+                )
+            raw_indices.append(int(source["raw_snapshot_index"]))
+        keep = np.asarray(
+            [value not in excluded for value in raw_indices], dtype=bool
+        )
+        if not np.any(keep):
+            raise ValueError(
+                f"排除 raw_snapshot_index={sorted(excluded)} 后没有剩余样本。"
+            )
+        return self.__subset(np.flatnonzero(keep))
 
     def filter(self, threshold: float) -> "GalDataSet": # 过滤掉y小于一定值的样本，需要输入一个threshold
         """

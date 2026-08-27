@@ -1,3 +1,9 @@
+"""从实验 JSON 配方或代码别名展开训练任务，并调用 ``train.py`` 执行。
+
+本模块支持单实验、批量实验和 Exp2 leave-one-galaxy-out 多折 manifest，
+也允许为固定分辨率 R_h 显式关闭 FiLM。它只负责解析与调度，不生成训练缓存。
+"""
+
 import os
 import argparse
 import copy
@@ -350,7 +356,7 @@ if __name__ == "__main__":
         metavar="BOOL",
         help=(
             "Override the recipe for all selected jobs. Use --use-film=false "
-            "to prevent KS-law SFR from entering SFRConvNet via FiLM."
+            "for fixed-resolution R_h caches; R_m uses log10(M_filter) via FiLM."
         ),
     )
     cli_args = parser.parse_args()

@@ -58,6 +58,32 @@ def _galaxy() -> GalData:
 
 
 class SFRSupervisionProductTests(unittest.TestCase):
+    def test_interpolated_log_context_is_recorded_in_supervision_metadata(self):
+        galaxy = _galaxy()
+        galaxy._data_log.update(
+            {
+                "log_context_selection_code": 1,
+                "log_context_window_count": 0,
+                "log_context_left_time": 0.9,
+                "log_context_right_time": 1.2,
+                "log_context_bracket_width": 0.3,
+                "log_context_interpolation_weight": 1.0 / 3.0,
+                "log_context_scope": 0.05,
+            }
+        )
+        galaxy.compute_macer_sfr_products()
+        context = galaxy.sfr_products["data_compatible"]["context"]
+
+        self.assertEqual(
+            context["log_context_selection"],
+            "linear_interpolation_empty_window",
+        )
+        self.assertTrue(context["log_context_fallback_used"])
+        self.assertEqual(context["log_context_window_count"], 0)
+        self.assertAlmostEqual(context["log_context_left_time_gyr"], 0.9)
+        self.assertAlmostEqual(context["log_context_right_time_gyr"], 1.2)
+        self.assertAlmostEqual(context["log_context_bracket_width_gyr"], 0.3)
+
     def test_hdf_round_trip_and_lr_closure_identity(self):
         fine = _galaxy()
         coarse = fine.coarsen("spatial_block", (2, 2))

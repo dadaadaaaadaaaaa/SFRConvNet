@@ -1,14 +1,8 @@
-"""Analyze one or more leave-one-galaxy-out Exp2 training results.
+"""分析一个或多个 Exp2 leave-one-galaxy-out 训练结果。
 
-This script deliberately separates four evaluation domains:
-  1. cached in-distribution test snapshots (test.pt),
-  2. cached held-out galaxy snapshots (out.pt),
-  3. complete raw trajectories for galaxies used by training,
-  4. complete raw trajectory for the held-out galaxy.
-
-The in-distribution and raw in-domain branches are optional. Disabling either
-branch skips its dataset loading/inference as well as its figures and outputs.
-The two held-out branches are always evaluated.
+脚本严格区分 cached in-distribution test、cached held-out、训练星系完整 raw 轨迹
+和留出星系完整 raw 轨迹四个评估域，并检查 cached/raw 留出预测的数值一致性。
+前两种 in-domain 分支可选择关闭；两个 held-out 分支始终执行。
 """
 
 from __future__ import annotations

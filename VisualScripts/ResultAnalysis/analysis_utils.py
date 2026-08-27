@@ -1,4 +1,9 @@
-# analysis_utils.py
+"""MACNet 训练结果的共享加载、推理、单位换算、指标计算和绘图工具。
+
+本模块兼容版本化 CachePT、processed HDF5、新旧模型 checkpoint 与 direct/closure
+目标契约，并为结果 notebook 和 ``analyze_exp2.py`` 提供统一分析接口。
+"""
+
 import os
 import sys
 import gc
@@ -61,7 +66,11 @@ PROJECT_ROOT = setup_project_env()
 # Project Imports
 try:
     from raw_data_processing.galaxy_data import GalDataSet
-    from Experiment.target_transform import inverse_transform_sfr, transform_sfr
+    from Experiment.target_transform import (
+        inverse_transform_sfr,
+        inverse_transform_signed_closure,
+        transform_sfr,
+    )
     from Experiment.models import (
         MACNetRes_mbh,
         AccretionTransformer,
@@ -168,12 +177,16 @@ def ensure_numpy(arr):
 
 
 def get_baseline_column(df):
+    if "y_macer_baseline" in df.columns:
+        return "y_macer_baseline"
     if "y_baseline" in df.columns:
         return "y_baseline"
     return None
 
 
 def get_baseline_error_column(df):
+    if "macer_baseline_error" in df.columns:
+        return "macer_baseline_error"
     if "baseline_error" in df.columns:
         return "baseline_error"
     return None
@@ -211,16 +224,60 @@ def _physical_sfr(values, metadata):
     return physical
 
 
+def _transformed_sfr_allow_negative_predictions(values, metadata):
+    """只对非负 SFR 做目标变换；非法负预测保留为 NaN 而不是静默裁剪。"""
+
+    metadata = dict(metadata or {})
+    values = np.asarray(values, dtype=float)
+    transformed = np.full(values.shape, np.nan, dtype=float)
+    valid = np.isfinite(values) & (values >= 0)
+    if np.any(valid):
+        transformed[valid] = transform_sfr(
+            values[valid],
+            transform=metadata.get("transform", "log10_floor"),
+            scale=float(metadata.get("scale", 1.0)),
+            floor=float(metadata.get("floor", 1e-9)),
+        )
+    return transformed
+
+
 def get_target_label(df=None):
     metadata = _target_metadata_from(df)
     transform = metadata.get("transform")
+    units = metadata.get("units", "unknown units")
+    units_tex = str(units).replace("_", r"\_")
     if transform == "log10_1p":
         scale = float(metadata.get("scale", 1.0))
-        return rf"$\log_{{10}}[1+\mathrm{{SFR}}/({scale:g}\,M_\odot\,\mathrm{{yr}}^{{-1}})]$"
-    return r"$\log_{10}(\mathrm{SFR}/[M_\odot\,\mathrm{yr}^{-1}])$"
+        return rf"$\log_{{10}}[1+\mathrm{{SFR}}/({scale:g}\;\mathrm{{{units_tex}}})]$"
+    return rf"$\log_{{10}}(\mathrm{{SFR}}/[\mathrm{{{units_tex}}}])$"
+
+
+def get_physical_sfr_label(df=None):
+    units = _target_metadata_from(df).get("units", "unknown units")
+    return f"SFR [{units}]"
+
+
+def _sfr_time_integration_factor(df, explicit_factor=None):
+    """返回把 SFR×Gyr 转成太阳质量的因子，并拒绝未知单位的静默换算。"""
+
+    if explicit_factor is not None:
+        return float(explicit_factor)
+    units = _target_metadata_from(df).get("units")
+    if units == "MACER_mass_code/Gyr":
+        return 2.5e7
+    if units in {"Msun/yr", "M_sun/yr"}:
+        return 1.0e9
+    if units in {"Msun/Gyr", "M_sun/Gyr"}:
+        return 1.0
+    raise ValueError(
+        f"不知道如何把 SFR 单位 {units!r} 与 Gyr 时间积分为太阳质量；"
+        "请显式传入 sfr_unit_scale。"
+    )
 
 
 def get_baseline_label(df=None):
+    if isinstance(df, pd.DataFrame) and "sfr_macer_baseline" in df.columns:
+        return r"Baseline $\mathcal{S}[\mathcal{R}_\alpha(U_{\rm HR})]$"
     return "Baseline (KS)"
 
 
@@ -297,6 +354,15 @@ class CachedPTDataset:
         self.type = "cached"
         self.sample_uid = None
         self.parent_hr_uid = None
+        self.objective_mode = "direct_sfr"
+        self.closure_transform = None
+        self.closure_scale = None
+        self.target_sfr_physical = None
+        self.macer_sfr_baseline = None
+        self.closure_true_physical = None
+        self.closure_true_transformed = None
+        self.conditioning_active = None
+        self.conditioning_contract = None
         conditioning_value = None
         payload_conditioning_variable = None
         channel_metadata = load_cache_metadata(pt_path)
@@ -310,23 +376,50 @@ class CachedPTDataset:
         if "includes_zero_targets" in channel_metadata:
             self.target_metadata["includes_zero_targets"] = bool(channel_metadata["includes_zero_targets"])
 
-        # Version-3 缓存把 KS baseline 与 log10(M_filter) 条件明确分开。
+        # 版本化缓存把 KS baseline、物理 baseline 与模型条件明确分开。
         if isinstance(loaded, dict):
             schema = loaded.get("schema", {})
-            if schema.get("name") != "macnet_sfr_cache" or int(schema.get("version", -1)) != 3:
+            schema_version = int(schema.get("version", -1))
+            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4, 5}:
                 raise RuntimeError(f"Unsupported cache schema in '{pt_path}': {schema!r}")
             tensors = loaded["tensors"]
             self.x = tensors["x"]
             self.coord = tensors["coord"]
             self.y = tensors["target_sfr"]
             self.y_baseline = tensors["sfr_ks_baseline"]
-            conditioning_value = tensors["log_mass_filter"]
+            self.sfr_ks_transformed = tensors["sfr_ks_baseline"]
+            if schema_version >= 5:
+                conditioning_value = tensors["conditioning_scalar"]
+                conditioning_contract = loaded.get("model_input_contract", {}).get(
+                    "conditioning", {}
+                )
+                self.conditioning_contract = dict(conditioning_contract)
+                payload_conditioning_variable = conditioning_contract.get("name")
+                self.conditioning_active = bool(
+                    conditioning_contract.get("active", False)
+                )
+            else:
+                conditioning_value = tensors["log_mass_filter"]
+                payload_conditioning_variable = "log_mass_filter"
+                self.conditioning_active = True
             self.groups = tensors["groups"]
             self.time = tensors["time"]
+            self.target_sfr_physical = tensors.get("target_sfr_physical")
+            self.macer_sfr_baseline = tensors.get("macer_sfr_baseline")
+            self.closure_true_physical = tensors.get("closure_true_physical")
+            self.closure_true_transformed = tensors.get("closure_true")
+            learning_contract = loaded.get("learning_contract", {})
+            self.objective_mode = learning_contract.get(
+                "prepared_objective", learning_contract.get("objective_mode", "direct_sfr")
+            )
+            self.closure_transform = learning_contract.get("closure_transform")
+            raw_closure_scale = learning_contract.get("closure_scale")
+            self.closure_scale = (
+                float(raw_closure_scale) if raw_closure_scale is not None else None
+            )
             identity = loaded.get("sample_identity", {})
             self.sample_uid = np.asarray(identity.get("sample_uid", ()), dtype=str)
             self.parent_hr_uid = np.asarray(identity.get("parent_hr_uid", ()), dtype=str)
-            payload_conditioning_variable = "log_mass_filter"
             self.kind = "vit"
         # Legacy SFR cache format:
         # (x, coord, target_sfr, transformed_ks_sfr, groups, n_groups, time)
@@ -371,7 +464,51 @@ class CachedPTDataset:
                 self.conditioning_variable = "unknown"
         if self.conditioning_variable == "sfr_ks":
             self.sfr_ks_transformed = self.conditioning_scalar
+        if self.conditioning_active is False and torch.count_nonzero(
+            self.conditioning_scalar
+        ).item() != 0:
+            raise RuntimeError(
+                f"Cache '{pt_path}' 声明 inactive conditioning，但占位张量并非全零。"
+            )
         self.time = ensure_tensor(self.time) if self.time is not None else None
+
+        for field_name in (
+            "target_sfr_physical",
+            "macer_sfr_baseline",
+            "closure_true_physical",
+            "closure_true_transformed",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                tensor_value = ensure_tensor(value).view(-1, 1)
+                # 早期 v3 cache 用全 NaN 作为“尚无该物理产品”的占位，不能误判为
+                # 一个不完整的 signed-closure 契约。
+                if field_name != "target_sfr_physical" and torch.isnan(tensor_value).all():
+                    tensor_value = None
+                setattr(self, field_name, tensor_value)
+        closure_product_fields = (
+            self.macer_sfr_baseline,
+            self.closure_true_physical,
+            self.closure_true_transformed,
+        )
+        if any(value is not None for value in closure_product_fields):
+            if self.target_sfr_physical is None or not all(
+                value is not None for value in closure_product_fields
+            ):
+                raise RuntimeError(f"Cache '{pt_path}' 的 closure payload 不完整。")
+            reconstructed = self.macer_sfr_baseline + self.closure_true_physical
+            if not torch.allclose(
+                reconstructed, self.target_sfr_physical, rtol=1e-5, atol=1e-7
+            ):
+                raise RuntimeError(f"Cache '{pt_path}' 不满足 Y=B+C。")
+            if self.closure_transform not in {"signed_asinh", "identity"}:
+                raise RuntimeError(
+                    f"Cache '{pt_path}' 的 closure transform 非法：{self.closure_transform!r}。"
+                )
+            if self.closure_scale is None or not np.isfinite(self.closure_scale) or self.closure_scale <= 0:
+                raise RuntimeError(
+                    f"Cache '{pt_path}' 的 closure scale 非法：{self.closure_scale!r}。"
+                )
 
         if self.groups is not None:
             self.group_names = None
@@ -438,6 +575,7 @@ class HDF5Dataset:
         exclude_channels=None,
         reference_dataset=None,
         target_metadata=None,
+        exclude_raw_snapshot_indices=None,
     ):
         if isinstance(hdf5_conf, (list, tuple)):
             self.folder_path = hdf5_conf[0]
@@ -448,6 +586,8 @@ class HDF5Dataset:
 
         loaded = GalDataSet().load_data((self.folder_path, 0))
         loaded.drop_invalid(require_positive_targets=False, require_positive_ks=False)
+        if exclude_raw_snapshot_indices:
+            loaded.exclude_raw_snapshot_indices(exclude_raw_snapshot_indices)
 
         if reference_dataset is not None:
             if input_channels is None:
@@ -521,13 +661,54 @@ class HDF5Dataset:
             "floor": float(self.target_metadata["floor"]),
         }
         self.y = transform_sfr(loaded.sfr_target, **transform_options)
-        # This is the transformed KS-law SFR conditioner used by SFRConvNet
-        # when use_film=True; it is not black-hole mass.
+        self.target_sfr_physical = np.asarray(loaded.sfr_target, dtype=np.float64)
+        self.macer_sfr_baseline = np.asarray(
+            loaded.sfr_macer_baseline, dtype=np.float64
+        )
+        self.closure_true_physical = np.asarray(
+            loaded.sfr_closure_true, dtype=np.float64
+        )
+        reference_objective = getattr(reference_dataset, "objective_mode", "direct_sfr")
+        self.objective_mode = reference_objective
+        self.closure_transform = getattr(reference_dataset, "closure_transform", None)
+        self.closure_scale = getattr(reference_dataset, "closure_scale", None)
+        if reference_objective == "signed_closure":
+            if not np.all(np.isfinite(self.macer_sfr_baseline)) or not np.all(
+                np.isfinite(self.closure_true_physical)
+            ):
+                raise RuntimeError(
+                    "signed-closure 分析要求所有 processed HDF5 都保存 MACER baseline 与 closure。"
+                )
+            if not np.allclose(
+                self.macer_sfr_baseline + self.closure_true_physical,
+                self.target_sfr_physical,
+                rtol=1e-8,
+                atol=1e-10,
+            ):
+                raise RuntimeError("Processed HDF5 不满足 Y=B+C。")
+
+        # KS 经验基线始终作为独立对照保存，不能冒充 MACER-LR 物理基线。
         self.y_baseline = transform_sfr(loaded.sfr_ks, **transform_options)
         self.baseline = self.y_baseline
-        self.conditioning_scalar = self.y_baseline
-        self.conditioning_variable = "sfr_ks"
         self.sfr_ks_transformed = self.y_baseline
+        reference_conditioning = getattr(reference_dataset, "conditioning_contract", None)
+        if reference_conditioning and not bool(reference_conditioning.get("active", False)):
+            self.conditioning_scalar = np.zeros(len(self.y), dtype=np.float32)
+            self.conditioning_variable = "none"
+            self.conditioning_active = False
+            self.conditioning_contract = dict(reference_conditioning)
+        else:
+            # 旧 SFR 模型继续使用变换后的 KS 标量作为 FiLM 条件。
+            self.conditioning_scalar = self.y_baseline
+            self.conditioning_variable = "sfr_ks"
+            self.conditioning_active = True
+            self.conditioning_contract = {
+                "name": "sfr_ks",
+                "active": True,
+                "transform": self.target_metadata["transform"],
+                "source": "legacy_sfr_conditioning",
+                "dimension": 1,
+            }
         self.time = loaded.time
         self.mdot_edd = np.array(loaded._raw_data["mdot_edd"]) if "mdot_edd" in loaded._raw_data else None
         self.sfr_target = loaded.sfr_target
@@ -560,6 +741,31 @@ def load_analysis_model(model_path, device, datasets_dict=None):
     conditioning_variable = (
         state.get("conditioning_variable") if isinstance(state, dict) else None
     ) or loaded_params.get("conditioning_variable")
+    objective_mode = (
+        state.get("objective_mode") if isinstance(state, dict) else None
+    ) or loaded_params.get("objective_mode", "direct_sfr")
+    closure_transform = (
+        state.get("closure_transform") if isinstance(state, dict) else None
+    ) or loaded_params.get("closure_transform")
+    closure_scale = (
+        state.get("closure_scale") if isinstance(state, dict) else None
+    )
+    if closure_scale is None:
+        closure_scale = loaded_params.get("closure_scale")
+    if objective_mode not in {"direct_sfr", "signed_closure"}:
+        raise RuntimeError(
+            f"Checkpoint 声明了未知 objective_mode={objective_mode!r}。"
+        )
+    if objective_mode == "signed_closure":
+        if closure_transform not in {"signed_asinh", "identity"}:
+            raise RuntimeError(
+                f"Signed-closure checkpoint 的 transform 非法：{closure_transform!r}。"
+            )
+        if closure_scale is None or not np.isfinite(float(closure_scale)) or float(closure_scale) <= 0:
+            raise RuntimeError(
+                f"Signed-closure checkpoint 的 scale 非法：{closure_scale!r}。"
+            )
+        closure_scale = float(closure_scale)
     if conditioning_variable is None and loaded_params.get("target_quantity") == "instantaneous_sfr":
         # Compatibility with SFR checkpoints created before this metadata was
         # saved explicitly. Their PT fourth field is transformed KS-law SFR.
@@ -621,6 +827,18 @@ def load_analysis_model(model_path, device, datasets_dict=None):
                             f"Model target {key}={checkpoint_target_metadata.get(key)!r} does not match "
                             f"dataset target {dataset_target_metadata.get(key)!r}."
                         )
+            dataset_objective = getattr(ref_ds, "objective_mode", "direct_sfr")
+            if objective_mode == "signed_closure" and dataset_objective != "signed_closure":
+                raise ValueError(
+                    "Signed-closure checkpoint 必须配合包含 B、C 的 signed-closure cache。"
+                )
+            if objective_mode == "signed_closure":
+                if getattr(ref_ds, "closure_transform", None) != closure_transform or not np.isclose(
+                    float(getattr(ref_ds, "closure_scale", np.nan)), closure_scale
+                ):
+                    raise ValueError(
+                        "Checkpoint 与分析 cache 的 closure transform/scale 不一致。"
+                    )
 
     # Initialize
     model = None
@@ -691,10 +909,10 @@ def load_analysis_model(model_path, device, datasets_dict=None):
             se_reduction = loaded_params.get("se_reduction", se_reduction)
             use_film = loaded_params.get("use_film", use_film)
 
-        if use_film and conditioning_variable != "sfr_ks":
+        if use_film and conditioning_variable not in {"sfr_ks", "log_mass_filter"}:
             raise RuntimeError(
-                "SFRConvNet checkpoint enables FiLM but does not declare the expected "
-                f"conditioning_variable='sfr_ks' (got {conditioning_variable!r})."
+                "SFRConvNet checkpoint 启用了 FiLM，但没有声明活动的 KS 或 "
+                f"R_m 分辨率条件（得到 {conditioning_variable!r}）。"
             )
 
         model = SFRConvNet(
@@ -706,6 +924,7 @@ def load_analysis_model(model_path, device, datasets_dict=None):
             p_drop=p_drop,
             se_reduction=se_reduction,
             use_film=use_film,
+            prediction_mode=objective_mode,
         ).to(device)
 
     elif model_type == "resfilm":
@@ -732,6 +951,10 @@ def load_analysis_model(model_path, device, datasets_dict=None):
 
     model.eval()
     model.conditioning_variable = conditioning_variable or "unknown"
+    model.objective_mode = objective_mode
+    model.prediction_mode = objective_mode
+    model.closure_transform = closure_transform
+    model.closure_scale = closure_scale
     model.input_channels = checkpoint_channels or dataset_channels
     model.target_metadata = checkpoint_target_metadata
     return model, model_type
@@ -821,9 +1044,9 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
         if hook_handle:
             hook_handle.remove()
 
-    y_pred = torch.cat(preds).numpy()
+    model_output = torch.cat(preds).numpy()
     y_true = ensure_tensor(ds.y).view(-1).numpy()
-    if not np.all(np.isfinite(y_pred)):
+    if not np.all(np.isfinite(model_output)):
         raise RuntimeError("Model predictions contain NaN or Inf.")
     feats = torch.cat(feats_list, dim=0).numpy() if feats_list else None
 
@@ -831,17 +1054,80 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
     model_target_metadata = _target_metadata_from(model)
     if model_target_metadata and target_metadata and model_target_metadata != target_metadata:
         raise ValueError("Model and dataset target metadata differ; refusing to mix target definitions.")
-    df = pd.DataFrame({"y_true": y_true, "y_pred": y_pred})
-    df.attrs["target_metadata"] = target_metadata
-    df["sfr_true"] = _physical_sfr(y_true, target_metadata)
-    df["sfr_pred"] = _physical_sfr(y_pred, target_metadata)
+    objective_mode = getattr(model, "objective_mode", "direct_sfr")
+    target_physical_data = getattr(ds, "target_sfr_physical", None)
+    sfr_true = (
+        ensure_numpy(target_physical_data).reshape(-1)
+        if target_physical_data is not None
+        else _physical_sfr(y_true, target_metadata)
+    )
+    if objective_mode == "signed_closure":
+        baseline_data = getattr(ds, "macer_sfr_baseline", None)
+        if baseline_data is None:
+            raise RuntimeError(
+                "Signed-closure 推理缺少 macer_sfr_baseline，无法构造 B+C_hat。"
+            )
+        macer_baseline = ensure_numpy(baseline_data).reshape(-1)
+        closure_transform = getattr(model, "closure_transform", None)
+        closure_scale = getattr(model, "closure_scale", None)
+        closure_pred = inverse_transform_signed_closure(
+            model_output,
+            transform=closure_transform,
+            scale=float(closure_scale),
+        )
+        sfr_pred = macer_baseline + closure_pred
+        # 负最终 SFR 是模型诊断信号，不能通过 clamp 篡改；目标变换坐标中记为 NaN。
+        y_pred = _transformed_sfr_allow_negative_predictions(sfr_pred, target_metadata)
+    else:
+        closure_pred = None
+        sfr_pred = _physical_sfr(model_output, target_metadata)
+        y_pred = model_output
 
-    baseline_data = getattr(ds, "y_baseline", None)
-    if baseline_data is not None:
-        df["y_baseline"] = ensure_tensor(baseline_data).view(-1).numpy()
-        df.loc[np.isclose(df["y_baseline"], -100), "y_baseline"] = np.nan
-        df["baseline_error"] = df["y_baseline"] - df["y_true"]
-        df["sfr_baseline"] = _physical_sfr(df["y_baseline"].to_numpy(), target_metadata)
+    df = pd.DataFrame(
+        {
+            "y_true": y_true,
+            "y_pred": y_pred,
+            "model_output_raw": model_output,
+            "sfr_true": sfr_true,
+            "sfr_pred": sfr_pred,
+        }
+    )
+    df.attrs["target_metadata"] = target_metadata
+    df.attrs["objective_mode"] = objective_mode
+    df.attrs["closure_transform"] = getattr(model, "closure_transform", None)
+    df.attrs["closure_scale"] = getattr(model, "closure_scale", None)
+
+    if objective_mode == "signed_closure":
+        df["closure_pred_physical"] = closure_pred
+        closure_true_data = getattr(ds, "closure_true_physical", None)
+        if closure_true_data is None:
+            raise RuntimeError("Signed-closure 分析缺少 closure_true_physical。")
+        df["closure_true_physical"] = ensure_numpy(closure_true_data).reshape(-1)
+
+    macer_data = getattr(ds, "macer_sfr_baseline", None)
+    if macer_data is not None:
+        df["sfr_macer_baseline"] = ensure_numpy(macer_data).reshape(-1)
+        df["y_macer_baseline"] = _transformed_sfr_allow_negative_predictions(
+            df["sfr_macer_baseline"].to_numpy(), target_metadata
+        )
+        df["macer_baseline_error"] = df["y_macer_baseline"] - df["y_true"]
+        # 兼容旧绘图接口，但语义明确指向 MACER-LR baseline。
+        df["sfr_baseline"] = df["sfr_macer_baseline"]
+        df["y_baseline"] = df["y_macer_baseline"]
+        df["baseline_error"] = df["macer_baseline_error"]
+
+    ks_data = getattr(ds, "y_baseline", None)
+    if ks_data is not None:
+        df["y_ks_baseline"] = ensure_tensor(ks_data).view(-1).numpy()
+        df.loc[np.isclose(df["y_ks_baseline"], -100), "y_ks_baseline"] = np.nan
+        df["ks_baseline_error"] = df["y_ks_baseline"] - df["y_true"]
+        df["sfr_ks_baseline"] = _physical_sfr(
+            df["y_ks_baseline"].to_numpy(), target_metadata
+        )
+        if "y_baseline" not in df.columns:
+            df["y_baseline"] = df["y_ks_baseline"]
+            df["baseline_error"] = df["ks_baseline_error"]
+            df["sfr_baseline"] = df["sfr_ks_baseline"]
 
     if hasattr(ds, "time") and ds.time is not None:
         df["time"] = ensure_numpy(ds.time).reshape(-1)
@@ -849,6 +1135,7 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
         df["mdot_edd"] = ensure_numpy(ds.mdot_edd).reshape(-1)
 
     df["error"] = df["y_pred"] - df["y_true"]
+    df["sfr_error"] = df["sfr_pred"] - df["sfr_true"]
 
     if hasattr(ds, "group_names") and ds.group_names is not None and len(ds.group_names) == len(df):
         df["type"] = ds.group_names
@@ -872,12 +1159,26 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
 def save_to_h5(path, df, feats, x_data, ds_type):
     with h5py.File(path, "w") as f:
         f.attrs["dataset_type"] = ds_type
+        f.attrs["objective_mode"] = df.attrs.get("objective_mode", "direct_sfr")
+        if df.attrs.get("closure_transform") is not None:
+            f.attrs["closure_transform"] = df.attrs["closure_transform"]
+        if df.attrs.get("closure_scale") is not None:
+            f.attrs["closure_scale"] = float(df.attrs["closure_scale"])
         for key, value in _target_metadata_from(df).items():
             f.attrs[f"target_{key}"] = value
         f.create_dataset("x", data=x_data, compression="gzip")
         f.create_dataset("y_true", data=df["y_true"].values)
         f.create_dataset("y_pred", data=df["y_pred"].values)
-        for column in ("sfr_true", "sfr_pred", "sfr_baseline"):
+        for column in (
+            "model_output_raw",
+            "sfr_true",
+            "sfr_pred",
+            "sfr_baseline",
+            "sfr_macer_baseline",
+            "sfr_ks_baseline",
+            "closure_true_physical",
+            "closure_pred_physical",
+        ):
             if column in df.columns:
                 f.create_dataset(column, data=df[column].values)
         if "type" in df.columns:
@@ -887,6 +1188,9 @@ def save_to_h5(path, df, feats, x_data, ds_type):
             f.create_dataset("latent", data=feats)
         if "y_baseline" in df.columns:
             f.create_dataset("y_baseline", data=df["y_baseline"].values)
+        for column in ("y_macer_baseline", "y_ks_baseline"):
+            if column in df.columns:
+                f.create_dataset(column, data=df[column].values)
         if "time" in df.columns:
             f.create_dataset("time", data=df["time"].values)
         if "mdot_edd" in df.columns:
@@ -990,7 +1294,9 @@ def plot_error_dist(df, title, fig_dir, model_label="Model"):
         tmp2["Method"] = get_baseline_label(df).replace("Baseline ", "")
         tmp2.rename(columns={baseline_error_col: "Error"}, inplace=True)
         plot_data.append(tmp2)
-    final_df = pd.concat(plot_data)
+    # 模型与 baseline 都沿用原 DataFrame 的样本索引；纵向拼接后必须重建唯一索引，
+    # 否则新版 seaborn 在内部 reindex 时会因重复标签报错。
+    final_df = pd.concat(plot_data, ignore_index=True)
     split = final_df["Method"].nunique() == 2
     sns.violinplot(data=final_df, x="type", y="Error", hue="Method", split=split, inner="quartile", palette="muted")
     plt.axhline(0, color="r", linestyle="--", alpha=0.5)
@@ -1018,6 +1324,75 @@ def plot_kde_contour(df, title, fig_dir):
     plt.plot([vmin, vmax], [vmin, vmax], "r--", lw=1)
     plt.title(f"Density: {title}")
     save_plot(plt, f"kde_{title.replace(' ', '_').lower()}", fig_dir)
+    plt.show()
+
+
+def plot_physical_sfr_scatter(df, title, fig_dir):
+    """比较最终物理 SFR；signed-closure 的负预测不会被裁剪。"""
+
+    required = {"sfr_true", "sfr_pred"}
+    if not required.issubset(df.columns):
+        return
+    true = df["sfr_true"].to_numpy(dtype=float)
+    pred = df["sfr_pred"].to_numpy(dtype=float)
+    valid = np.isfinite(true) & np.isfinite(pred)
+    if not np.any(valid):
+        return
+    values = np.concatenate([true[valid], pred[valid]])
+    max_abs = max(float(np.max(np.abs(values))), 1.0)
+    positive = np.abs(values[np.nonzero(values)])
+    linthresh = max(float(np.quantile(positive, 0.01)) if positive.size else 1e-6, 1e-9)
+
+    plt.figure(figsize=(6.5, 6), dpi=120)
+    plt.scatter(true[valid], pred[valid], s=7, alpha=0.55, edgecolors="none")
+    plt.plot([-max_abs, max_abs], [-max_abs, max_abs], "r--", lw=1.2, label="Ideal")
+    baseline_col = "sfr_macer_baseline" if "sfr_macer_baseline" in df.columns else None
+    if baseline_col is not None:
+        base = df[baseline_col].to_numpy(dtype=float)
+        base_valid = np.isfinite(true) & np.isfinite(base)
+        plt.scatter(
+            true[base_valid], base[base_valid], s=10, marker="x", alpha=0.3,
+            color="gray", label=get_baseline_label(df)
+        )
+    plt.xscale("symlog", linthresh=linthresh)
+    plt.yscale("symlog", linthresh=linthresh)
+    plt.xlabel("True physical SFR [MACER mass code / Gyr]")
+    plt.ylabel("Predicted physical SFR [MACER mass code / Gyr]")
+    plt.title(f"Physical SFR: {title}")
+    plt.grid(True, linestyle=":", alpha=0.3)
+    plt.legend()
+    save_plot(plt, f"physical_sfr_{title.replace(' ', '_').lower()}", fig_dir)
+    plt.show()
+
+
+def plot_closure_scatter(df, title, fig_dir):
+    """绘制 signed closure 的物理真值与预测值。"""
+
+    required = {"closure_true_physical", "closure_pred_physical"}
+    if not required.issubset(df.columns):
+        return
+    true = df["closure_true_physical"].to_numpy(dtype=float)
+    pred = df["closure_pred_physical"].to_numpy(dtype=float)
+    valid = np.isfinite(true) & np.isfinite(pred)
+    if not np.any(valid):
+        return
+    values = np.concatenate([true[valid], pred[valid]])
+    bound = max(float(np.max(np.abs(values))), 1.0)
+    nonzero = np.abs(values[np.nonzero(values)])
+    linthresh = max(float(np.quantile(nonzero, 0.01)) if nonzero.size else 1e-6, 1e-9)
+
+    plt.figure(figsize=(6.5, 6), dpi=120)
+    plt.scatter(true[valid], pred[valid], s=7, alpha=0.55, edgecolors="none")
+    plt.plot([-bound, bound], [-bound, bound], "r--", lw=1.2)
+    plt.xscale("symlog", linthresh=linthresh)
+    plt.yscale("symlog", linthresh=linthresh)
+    plt.xlim(-bound, bound)
+    plt.ylim(-bound, bound)
+    plt.xlabel(r"True closure $C_\alpha$")
+    plt.ylabel(r"Predicted closure $\widehat C_\alpha$")
+    plt.title(f"Signed closure: {title}")
+    plt.grid(True, linestyle=":", alpha=0.3)
+    save_plot(plt, f"closure_{title.replace(' ', '_').lower()}", fig_dir)
     plt.show()
 
 
@@ -1050,23 +1425,26 @@ def _cumulative_trapezoid(values, times, time_unit_to_years):
     return np.concatenate(([0.0], np.cumsum(increments)))
 
 
-def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=1e9):
+def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=None):
     """
     Plot cumulative stellar mass formed from the reconstructed SFR history.
 
     True/prediction/KS are instantaneous SFR. The plotted cumulative mass is
     derived with trapezoidal time integration; it is not a separately trained target.
-    `time` is assumed to be in Gyr, hence the default 1e9 yr/Gyr factor.
+    `time` 必须以 Gyr 表示；SFR 单位到太阳质量的换算由 target metadata 决定。
     """
     if "time" not in df.columns:
         return
 
     df_plot = df.sort_values("time").copy()
     times = df_plot["time"].values
+    integration_factor = _sfr_time_integration_factor(
+        df_plot, explicit_factor=sfr_unit_scale
+    )
     sfr_true = _sfr_series(df_plot, "sfr_true", "y_true")
     sfr_pred = _sfr_series(df_plot, "sfr_pred", "y_pred")
-    mass_true = _cumulative_trapezoid(sfr_true, times, sfr_unit_scale)
-    mass_pred = _cumulative_trapezoid(sfr_pred, times, sfr_unit_scale)
+    mass_true = _cumulative_trapezoid(sfr_true, times, integration_factor)
+    mass_pred = _cumulative_trapezoid(sfr_pred, times, integration_factor)
 
     plt.figure(figsize=(10, 5), dpi=120)
     plt.plot(times, mass_true, "k-", lw=2, label="True", alpha=0.8)
@@ -1075,7 +1453,7 @@ def plot_cumulative_sfr(df, title, fig_dir, model_label="Model", sfr_unit_scale=
     baseline_col = get_baseline_column(df_plot)
     if baseline_col is not None:
         sfr_baseline = _sfr_series(df_plot, "sfr_baseline", baseline_col)
-        mass_baseline = _cumulative_trapezoid(sfr_baseline, times, sfr_unit_scale)
+        mass_baseline = _cumulative_trapezoid(sfr_baseline, times, integration_factor)
         plt.plot(times, mass_baseline, "g:", lw=1.5, label=get_baseline_label(df_plot), alpha=0.7)
 
     plt.yscale("log")
@@ -1117,7 +1495,7 @@ def plot_sfr_history(df, title, fig_dir, model_label="Model"):
     plt.yscale("symlog", linthresh=linthresh)
     plt.title(f"SFR History: {title}")
     plt.xlabel("Time (Gyr)")
-    plt.ylabel(r"$\mathrm{SFR}$ [$M_{\odot}\,\mathrm{yr}^{-1}$]")
+    plt.ylabel(get_physical_sfr_label(df_plot))
     plt.legend()
     save_plot(plt, f"sfr_history_{title.replace(' ', '_').lower()}", fig_dir)
     plt.show()
@@ -1135,6 +1513,20 @@ def get_metrics_summary(y_true, y_pred, name=""):
                 return 1.0 if residual == 0 else 0.0
             return 1 - residual / total
 
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.any(valid):
+        return {
+            "Dataset": name,
+            "RMSE": np.nan,
+            "MAE": np.nan,
+            "R2": np.nan,
+            "OutlierFrac (|target error|>1)": np.nan,
+            "N_valid": 0,
+        }
+    y_true = y_true[valid]
+    y_pred = y_pred[valid]
     d = y_true - y_pred
     return {
         "Dataset": name,
@@ -1142,4 +1534,55 @@ def get_metrics_summary(y_true, y_pred, name=""):
         "MAE": np.mean(np.abs(d)),
         "R2": r2_score(y_true, y_pred),
         "OutlierFrac (|target error|>1)": np.mean(np.abs(d) > 1.0),
+        "N_valid": int(valid.sum()),
+    }
+
+
+def get_physical_sfr_metrics(df, prediction_column="sfr_pred", name="Model"):
+    """在物理 SFR 空间计算指标，并保留负最终预测的诊断比例。"""
+
+    if "sfr_true" not in df.columns or prediction_column not in df.columns:
+        raise KeyError(
+            f"Physical metrics require 'sfr_true' and {prediction_column!r}."
+        )
+    true = df["sfr_true"].to_numpy(dtype=float)
+    pred = df[prediction_column].to_numpy(dtype=float)
+    valid = np.isfinite(true) & np.isfinite(pred)
+    if not np.any(valid):
+        return {
+            "Dataset": name,
+            "Physical_RMSE": np.nan,
+            "Physical_MAE": np.nan,
+            "Physical_R2": np.nan,
+            "NegativePredFrac": np.nan,
+            "N_valid": 0,
+        }
+    true_valid = true[valid]
+    pred_valid = pred[valid]
+    try:
+        from sklearn.metrics import r2_score
+        r2 = r2_score(true_valid, pred_valid)
+    except Exception:
+        residual = np.sum((true_valid - pred_valid) ** 2)
+        total = np.sum((true_valid - np.mean(true_valid)) ** 2)
+        r2 = 1.0 - residual / total if total > 0 else float(residual == 0)
+    error = pred_valid - true_valid
+    nonzero_true = np.abs(true_valid) > 0
+    median_relative = (
+        float(
+            np.median(
+                np.abs(error[nonzero_true]) / np.abs(true_valid[nonzero_true])
+            )
+        )
+        if np.any(nonzero_true)
+        else np.nan
+    )
+    return {
+        "Dataset": name,
+        "Physical_RMSE": float(np.sqrt(np.mean(error**2))),
+        "Physical_MAE": float(np.mean(np.abs(error))),
+        "Physical_R2": float(r2),
+        "MedianAbsRelativeError_nonzero": median_relative,
+        "NegativePredFrac": float(np.mean(pred_valid < 0)),
+        "N_valid": int(valid.sum()),
     }

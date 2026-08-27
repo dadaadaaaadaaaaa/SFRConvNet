@@ -79,6 +79,24 @@ def _fine_with_metadata(raw_snapshot_index: int = 7) -> GalData:
 
 
 class MetadataContractTests(unittest.TestCase):
+    def test_exact_initial_snapshot_exclusion_keeps_late_zero_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory) / "coarse"
+            folder.mkdir()
+            _fine_with_metadata(0).rescale((2, 2)).save_h5(folder / "00000.h5")
+            _fine_with_metadata(9).rescale((2, 2)).save_h5(folder / "00009.h5")
+            cache = CachePt().load(
+                [[str(folder), "synthetic"]],
+                exclude_raw_snapshot_indices=(0,),
+                include_zero_targets=True,
+            )
+
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(
+            cache.dataset.raw_data["sample_metadata"][0]["source"]["raw_snapshot_index"],
+            9,
+        )
+
     def test_tampered_uid_is_rejected(self):
         fine = _fine_with_metadata()
         tampered = deepcopy(fine.metadata)

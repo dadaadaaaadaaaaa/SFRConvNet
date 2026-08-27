@@ -1,3 +1,5 @@
+"""读取单个 processed HDF5，打印层级、数据形状与属性以便人工检查。"""
+
 import h5py
 import numpy as np
 from pathlib import Path

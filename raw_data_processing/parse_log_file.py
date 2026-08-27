@@ -158,6 +158,101 @@ def mean_around_time(df: pd.DataFrame, time: float, scope: float, time_col: str 
     return avg
 
 
+LOG_CONTEXT_WINDOW_MEAN = 0
+LOG_CONTEXT_LINEAR_INTERPOLATION = 1
+LOG_CONTEXT_NEAREST_ENDPOINT = 2
+
+
+def mean_around_time_with_linear_fallback(
+    df: pd.DataFrame,
+    time: float,
+    scope: float,
+    time_col: str = "time",
+) -> pd.Series:
+    """窗口非空时取均值，空窗口时对双侧日志做线性插值。
+
+    该函数不会扩大物理时间窗口。只有目标时间落在日志范围以外时，才退化为
+    最近端点；选择方式和时间支撑以纯数值诊断字段随结果返回，便于 HDF5 和
+    supervision metadata 无损持久化。
+    """
+
+    if time_col not in df.columns:
+        raise KeyError(f"Missing required column '{time_col}'")
+    time = float(time)
+    scope = float(scope)
+    if not np.isfinite(time) or not np.isfinite(scope) or scope < 0:
+        raise ValueError("time and scope must be finite, with scope >= 0.")
+
+    log_time = pd.to_numeric(df[time_col], errors="coerce")
+    finite_time = np.isfinite(log_time.to_numpy(dtype=np.float64))
+    if not np.any(finite_time):
+        raise ValueError("Log data contains no finite time values.")
+    valid = df.loc[finite_time].copy()
+    valid[time_col] = log_time.loc[finite_time].to_numpy(dtype=np.float64)
+
+    mask = (valid[time_col] >= time - scope) & (valid[time_col] <= time + scope)
+    window = valid.loc[mask]
+    if not window.empty:
+        result = window.mean(numeric_only=True)
+        selected_time = window[time_col].to_numpy(dtype=np.float64)
+        result[time_col] = time
+        result["log_context_selection_code"] = LOG_CONTEXT_WINDOW_MEAN
+        result["log_context_window_count"] = int(len(window))
+        result["log_context_left_time"] = float(np.min(selected_time))
+        result["log_context_right_time"] = float(np.max(selected_time))
+        result["log_context_bracket_width"] = float(
+            np.max(selected_time) - np.min(selected_time)
+        )
+        result["log_context_interpolation_weight"] = 0.0
+        return result
+
+    # 同一时刻可能有多条日志。空窗口回退只需要连续数值上下文，因此先按时间
+    # 聚合重复记录，避免零宽 bracket 和不确定的左右行选择。
+    numeric_columns = list(valid.select_dtypes(include=[np.number]).columns)
+    if time_col not in numeric_columns:
+        numeric_columns.append(time_col)
+    timeline = (
+        valid[numeric_columns]
+        .groupby(time_col, as_index=False, sort=True)
+        .mean(numeric_only=True)
+        .sort_values(time_col, kind="mergesort")
+        .reset_index(drop=True)
+    )
+    times = timeline[time_col].to_numpy(dtype=np.float64)
+    right_index = int(np.searchsorted(times, time, side="left"))
+
+    if 0 < right_index < len(timeline):
+        left = timeline.iloc[right_index - 1]
+        right = timeline.iloc[right_index]
+        left_time = float(left[time_col])
+        right_time = float(right[time_col])
+        width = right_time - left_time
+        if not np.isfinite(width) or width <= 0:
+            raise ValueError("Cannot interpolate log context across a non-positive time bracket.")
+        weight = (time - left_time) / width
+        result = left + weight * (right - left)
+        result[time_col] = time
+        result["log_context_selection_code"] = LOG_CONTEXT_LINEAR_INTERPOLATION
+        result["log_context_window_count"] = 0
+        result["log_context_left_time"] = left_time
+        result["log_context_right_time"] = right_time
+        result["log_context_bracket_width"] = width
+        result["log_context_interpolation_weight"] = float(weight)
+        return result
+
+    endpoint_index = 0 if right_index <= 0 else len(timeline) - 1
+    endpoint = timeline.iloc[endpoint_index].copy()
+    endpoint_time = float(endpoint[time_col])
+    endpoint[time_col] = time
+    endpoint["log_context_selection_code"] = LOG_CONTEXT_NEAREST_ENDPOINT
+    endpoint["log_context_window_count"] = 0
+    endpoint["log_context_left_time"] = endpoint_time
+    endpoint["log_context_right_time"] = endpoint_time
+    endpoint["log_context_bracket_width"] = 0.0
+    endpoint["log_context_interpolation_weight"] = 0.0
+    return endpoint
+
+
 def _require_columns(data: pd.Series | pd.DataFrame, cols: Iterable[str]):
     missing = [c for c in cols if c not in data]
     if missing:
@@ -205,7 +300,7 @@ def ll_eg(path: str, time: float, scope: float) -> pd.Series: # 读取日志文�
 
 def ll_dg(path: str, time: float, scope: float) -> pd.Series: 
     df = pd.read_parquet(path)
-    avg = mean_around_time(df, time, scope)
+    avg = mean_around_time_with_linear_fallback(df, time, scope)
     _require_columns(avg, ["NEWstar", "mbh"])
     # NEWstar is the cumulative newly formed stellar mass, not an
     # instantaneous SFR. Keep it for diagnostics, while the training target is

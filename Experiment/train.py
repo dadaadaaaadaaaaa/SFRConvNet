@@ -1,3 +1,10 @@
+"""MACNet 单次训练、验证和测试的核心程序。
+
+本模块加载版本化 CachePT，校验输入通道与条件契约，构造所选神经网络，
+并支持直接预测 SFR 或预测 signed closure 后显式计算 ``B+C_hat``。
+训练流程包含目标加权、warmup-cosine 学习率、AMP、early stopping 和 checkpoint 保存。
+"""
+
 import math
 import os
 import random
@@ -32,11 +39,34 @@ from Experiment.models import AccretionTransformer, SFRConvNet, MACNetRes_mbh, M
 MBH_CONDITIONED_MODELS = (MACNetRes_mbh, MACNetFiLM)
 
 
+def validate_convnet_conditioning(
+    conditioning_variable: str,
+    conditioning_active: bool,
+    *,
+    use_film: bool,
+) -> None:
+    """验证 SFRConvNet 的条件变量与 FiLM 开关是否具有一致物理语义。"""
+
+    if use_film and not conditioning_active:
+        raise RuntimeError(
+            "SFRConvNet FiLM 已启用，但当前固定 R_h cache 没有活动条件变量。"
+        )
+    if use_film and conditioning_variable != "log_mass_filter":
+        raise RuntimeError(
+            "SFRConvNet FiLM requires conditioning_variable='log_mass_filter'; "
+            f"got {conditioning_variable!r}."
+        )
+    if conditioning_variable == "log_mass_filter" and not use_film:
+        raise RuntimeError(
+            "R_m SFR caches require --use_film so log_mass_filter actually enters the model."
+        )
+
+
 def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, conditioning_scalar: torch.Tensor) -> torch.Tensor:
     """Run one batch with the conditioning scalar required by the model family.
 
-    新 SFR 缓存使用 log10(M_filter)；legacy ``*_mbh`` 模型仍要求显式黑洞质量，
-    二者不得静默混用。
+    R_m 缓存使用 log10(M_filter)，固定 R_h 缓存使用 inactive 零占位；
+    legacy ``*_mbh`` 模型仍要求显式黑洞质量，三者不得静默混用。
     """
     if isinstance(model, MBH_CONDITIONED_MODELS):
         conditioning_variable = getattr(model, "conditioning_variable", "unknown")
@@ -48,7 +78,7 @@ def predict_batch(model, x: torch.Tensor, coord: torch.Tensor, conditioning_scal
         return model(x, conditioning_scalar)
     r = coord[:, 0:1]
     theta = coord[:, 1:2]
-    # 新 SFR 流程把该标量定义为 log10(M_filter)。
+    # 条件标量的具体语义由 cache conditioning contract 决定。
     return model(x, r, theta, conditioning_scalar)
 
 
@@ -284,43 +314,56 @@ class GalPTDataset(Dataset):
         self.closure_true_physical = None
         self.closure_transform = None
         self.closure_scale = None
+        self.conditioning_active = None
+        self.conditioning_contract = None
         if isinstance(loaded, dict):
             schema = loaded.get("schema", {})
             schema_version = int(schema.get("version", -1))
-            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4}:
+            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4, 5}:
                 raise RuntimeError(
                     f"Unsupported cache schema in '{pt_path}': {schema!r}"
                 )
             tensors = loaded.get("tensors", {})
             required = {
                 "x", "coord", "target_sfr", "sfr_ks_baseline",
-                "log_mass_filter", "groups", "time",
+                "groups", "time",
             }
+            required.add(
+                "conditioning_scalar" if schema_version >= 5 else "log_mass_filter"
+            )
             missing = sorted(required.difference(tensors))
             if missing:
                 raise RuntimeError(f"Cache '{pt_path}' is missing tensor fields: {missing}")
             self.x = tensors["x"]
             self.coord = tensors["coord"]
             self.y = tensors["target_sfr"]
-            self.conditioning_scalar = tensors["log_mass_filter"]
+            self.conditioning_scalar = tensors[
+                "conditioning_scalar" if schema_version >= 5 else "log_mass_filter"
+            ]
             self.groups = tensors["groups"]
             self.n_groups = None
             self.time = tensors["time"]
             self.sfr_ks_transformed = tensors["sfr_ks_baseline"]
             self.h_eff_reserved = tensors.get("h_eff")
             self.n_eff_reserved = tensors.get("n_eff")
-            if schema_version >= 4:
-                closure_required = {
-                    "target_sfr_physical",
-                    "macer_sfr_baseline",
-                    "closure_true",
-                    "closure_true_physical",
-                }
+            closure_required = {
+                "target_sfr_physical",
+                "macer_sfr_baseline",
+                "closure_true",
+                "closure_true_physical",
+            }
+            closure_present = closure_required.intersection(tensors)
+            if closure_present and closure_present != closure_required:
                 closure_missing = sorted(closure_required.difference(tensors))
-                if closure_missing:
-                    raise RuntimeError(
-                        f"Version-4 cache '{pt_path}' is missing closure fields: {closure_missing}"
-                    )
+                raise RuntimeError(
+                    f"Cache '{pt_path}' has an incomplete closure payload; missing {closure_missing}."
+                )
+            if schema_version == 4 and closure_present != closure_required:
+                closure_missing = sorted(closure_required.difference(tensors))
+                raise RuntimeError(
+                    f"Version-4 cache '{pt_path}' is missing closure fields: {closure_missing}"
+                )
+            if closure_present == closure_required:
                 self.target_sfr_physical = tensors["target_sfr_physical"]
                 self.macer_sfr_baseline = tensors["macer_sfr_baseline"]
                 self.closure_true_transformed = tensors["closure_true"]
@@ -328,22 +371,22 @@ class GalPTDataset(Dataset):
                 learning_contract = loaded.get("learning_contract", {})
                 if "signed_closure" not in learning_contract.get("available_objectives", ()):
                     raise RuntimeError(
-                        f"Version-4 cache '{pt_path}' does not declare signed_closure support."
+                        f"Cache '{pt_path}' does not declare signed_closure support."
                     )
                 self.closure_transform = learning_contract.get("closure_transform")
                 self.closure_scale = float(learning_contract.get("closure_scale", 0.0))
                 if self.closure_transform not in {"signed_asinh", "identity"}:
                     raise RuntimeError(
-                        f"Version-4 cache '{pt_path}' has invalid closure transform "
+                        f"Cache '{pt_path}' has invalid closure transform "
                         f"{self.closure_transform!r}."
                     )
                 if not math.isfinite(self.closure_scale) or self.closure_scale <= 0:
                     raise RuntimeError(
-                        f"Version-4 cache '{pt_path}' has invalid closure scale {self.closure_scale}."
+                        f"Cache '{pt_path}' has invalid closure scale {self.closure_scale}."
                     )
             elif objective_mode == "signed_closure":
                 raise RuntimeError(
-                    "signed_closure requires a version-4 cache containing Y_alpha, "
+                    "signed_closure requires a version-4 cache or version-5 cache containing Y_alpha, "
                     "B_alpha and C_alpha. Version-3/legacy caches remain direct_sfr-only."
                 )
             identity = loaded.get("sample_identity", {})
@@ -354,20 +397,50 @@ class GalPTDataset(Dataset):
                     f"Cache '{pt_path}' has identity arrays that do not match its sample count."
                 )
             contract = loaded.get("model_input_contract", {})
-            if contract.get("resolution_features") != ["log_mass_filter"]:
-                raise RuntimeError(
-                    f"Cache '{pt_path}' does not use the expected log_mass_filter contract."
-                )
+            if schema_version >= 5:
+                conditioning_contract = contract.get("conditioning")
+                if not isinstance(conditioning_contract, dict):
+                    raise RuntimeError(
+                        f"Version-5 cache '{pt_path}' has no structured conditioning contract."
+                    )
+                if conditioning_contract.get("name") != "none" or bool(
+                    conditioning_contract.get("active", True)
+                ):
+                    raise RuntimeError(
+                        "当前 version-5 固定 R_h cache 必须声明 inactive conditioning='none'."
+                    )
+                if contract.get("resolution_features") != []:
+                    raise RuntimeError(
+                        f"固定 R_h cache '{pt_path}' 不应声明活动分辨率特征。"
+                    )
+                self.conditioning_contract = dict(conditioning_contract)
+                self.conditioning_active = False
+                payload_conditioning_variable = "none"
+            else:
+                if contract.get("resolution_features") != ["log_mass_filter"]:
+                    raise RuntimeError(
+                        f"Cache '{pt_path}' does not use the expected log_mass_filter contract."
+                    )
+                self.conditioning_contract = {
+                    "name": "log_mass_filter",
+                    "active": True,
+                    "transform": "log10",
+                    "source": "legacy_cache_v3_v4",
+                    "dimension": 1,
+                }
+                self.conditioning_active = True
+                payload_conditioning_variable = "log_mass_filter"
             if schema_version >= 4:
                 if contract.get("baseline_is_model_input") is not False:
                     raise RuntimeError(
-                        f"Version-4 cache '{pt_path}' must keep B_alpha out of CNN inputs."
+                        f"Cache '{pt_path}' must keep B_alpha out of CNN inputs."
                     )
-                if contract.get("baseline_is_output_composition") is not True:
+                expected_composition = closure_present == closure_required
+                if contract.get("baseline_is_output_composition") is not expected_composition:
                     raise RuntimeError(
-                        f"Version-4 cache '{pt_path}' must declare B_alpha+C_hat composition."
+                        f"Cache '{pt_path}' baseline composition flag is inconsistent "
+                        "with its physical closure payload."
                     )
-            payload_conditioning_variable = "log_mass_filter"
         elif isinstance(loaded, (list, tuple)):
             if objective_mode == "signed_closure":
                 raise RuntimeError(
@@ -429,6 +502,27 @@ class GalPTDataset(Dataset):
                 self.conditioning_variable = "sfr_ks"
             else:
                 self.conditioning_variable = "unknown"
+        if self.conditioning_active is None:
+            self.conditioning_active = self.conditioning_variable not in {"none", "unknown"}
+        if self.conditioning_contract is None:
+            self.conditioning_contract = {
+                "name": self.conditioning_variable,
+                "active": bool(self.conditioning_active),
+                "transform": channel_metadata.get("conditioning_transform", "unknown"),
+                "source": "legacy_tuple_or_sidecar",
+                "dimension": 1,
+            }
+        sidecar_active = channel_metadata.get("conditioning_active")
+        if sidecar_active is not None and bool(sidecar_active) != bool(self.conditioning_active):
+            raise RuntimeError(
+                f"Cache '{pt_path}' payload and sidecar disagree on conditioning_active."
+            )
+        if not self.conditioning_active and not torch.count_nonzero(
+            self.conditioning_scalar
+        ).eq(0):
+            raise RuntimeError(
+                f"Cache '{pt_path}' 的 inactive conditioning 必须使用全零占位。"
+            )
         if self.conditioning_variable == "sfr_ks" and self.sfr_ks_transformed is None:
             self.sfr_ks_transformed = self.conditioning_scalar
         # 新缓存的 baseline 与 resolution conditioning 明确分离；旧缓存保留兼容行为。
@@ -1389,27 +1483,31 @@ def main(args=None):
             f"{sorted(conditioning_variables)}"
         )
     conditioning_variable = next(iter(conditioning_variables))
+    conditioning_contracts = {
+        json.dumps(ds.conditioning_contract, sort_keys=True)
+        for ds in (train_ds, val_ds, test_ds)
+    }
+    if len(conditioning_contracts) != 1:
+        raise RuntimeError(
+            "Train/validation/test caches use inconsistent conditioning contracts."
+        )
+    conditioning_contract = dict(train_ds.conditioning_contract)
+    conditioning_active = bool(conditioning_contract.get("active", False))
     if args.model_type in {"resnet", "resfilm"} and conditioning_variable != "mbh":
         raise RuntimeError(
             f"Model type {args.model_type!r} is a legacy BH-mass-conditioned model, "
             f"but cache {data_exp!r} provides {conditioning_variable!r}."
         )
-    if args.model_type == "convnet" and args.use_film and conditioning_variable != "log_mass_filter":
-        raise RuntimeError(
-            "SFRConvNet FiLM requires conditioning_variable='log_mass_filter'; "
-            f"got {conditioning_variable!r}."
-        )
-    if (
-        args.model_type == "convnet"
-        and conditioning_variable == "log_mass_filter"
-        and not args.use_film
-    ):
-        raise RuntimeError(
-            "Version-3 SFR caches require --use_film so log_mass_filter actually enters the model."
+    if args.model_type == "convnet":
+        validate_convnet_conditioning(
+            conditioning_variable,
+            conditioning_active,
+            use_film=args.use_film,
         )
     print(
         "Conditioning: "
         f"variable={conditioning_variable}, "
+        f"active={conditioning_active}, "
         f"FiLM={'enabled' if args.use_film else 'disabled'}"
     )
     if train_ds.input_channels:
@@ -1592,6 +1690,7 @@ def main(args=None):
                 "excluded_channels": list(train_ds.excluded_channels),
                 "target_metadata": train_ds.target_metadata,
                 "conditioning_variable": conditioning_variable,
+                "conditioning_contract": conditioning_contract,
                 "objective_mode": args.objective_mode,
                 "closure_transform": closure_transform,
                 "closure_scale": closure_scale,
@@ -1670,6 +1769,7 @@ def main(args=None):
                         "excluded_channels": list(train_ds.excluded_channels),
                         "target_metadata": train_ds.target_metadata,
                         "conditioning_variable": conditioning_variable,
+                        "conditioning_contract": conditioning_contract,
                         "objective_mode": args.objective_mode,
                         "closure_transform": closure_transform,
                         "closure_scale": closure_scale,

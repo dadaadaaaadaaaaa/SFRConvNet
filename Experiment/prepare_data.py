@@ -1,7 +1,10 @@
-'''
-1. CachePt数据预处理，整合raw_data_processing中的功能对数据进行预处理
-2. 设计了4个实验，盘状星系、剔除一个星系的盘状，剔除低分辨率的盘状、同时剔除低分辨率和一个星系的盘状，测试模型的泛化能力
-'''
+"""把 processed MACER HDF5 转换为版本化 PyTorch 训练缓存。
+
+本模块负责输入通道选择、无效/初始化样本排除、分组划分、训练组平衡、
+训练集标准化，以及 direct-SFR 或 signed-closure 监督量和完整 metadata 的保存。
+固定分辨率 R_h 使用无活动条件标量，R_m 使用 ``log10(M_filter)``，两种语义
+不得在同一 cache 中静默混合。
+"""
 
 import argparse
 import json
@@ -40,10 +43,94 @@ def _optional_sample_array(data, names):
     return None
 
 
+_RH_OPERATOR_IDS = {"spatial_block", "identity_fine"}
+_RM_OPERATOR_IDS = {
+    "adaptive_mass_axisymmetric_v0",
+    "adaptive_mass_axisymmetric_v1",
+    "axisymmetric_rm_v0",
+    "axisymmetric_rm_v1",
+}
+
+
+def _resolve_conditioning_contract(data):
+    """按粗粒化算子的物理语义构造统一条件标量。
+
+    固定分辨率 R_h 不需要逐样本分辨率条件，因此使用 inactive 的零占位；
+    R_m 保持原有 ``log10(M_filter)`` 数值和字段语义。不同算子不得在同一
+    cache 中静默共享一个含义不一致的标量。
+    """
+
+    n_samples = int(np.asarray(data.sfr_target).reshape(-1).size)
+    raw_data = getattr(data, "raw_data", {})
+    operator_values = raw_data.get("operator_id")
+    if operator_values is not None:
+        operator_ids = tuple(
+            sorted({str(value) for value in np.asarray(operator_values).reshape(-1)})
+        )
+    else:
+        operator_ids = ()
+
+    if operator_ids and set(operator_ids).issubset(_RH_OPERATOR_IDS):
+        return np.zeros(n_samples, dtype=np.float32), {
+            "name": "none",
+            "active": False,
+            "transform": "identity",
+            "units": "dimensionless",
+            "source": "fixed_rh_resolution",
+            "dimension": 1,
+            "operator_ids": list(operator_ids),
+        }
+
+    if operator_ids and set(operator_ids).issubset(_RM_OPERATOR_IDS):
+        log_mass_filter = np.asarray(data.log_mass_filter, dtype=np.float32)
+        return log_mass_filter, {
+            "name": "log_mass_filter",
+            "active": True,
+            "transform": "log10",
+            "units": "MACER_mass_code",
+            "source": "coarsening.mass_filter",
+            "dimension": 1,
+            "operator_ids": list(operator_ids),
+        }
+
+    if len(operator_ids) > 1:
+        raise ValueError(
+            "一个 CachePT 暂不允许混合具有不同条件语义的 R_h/R_m 算子；"
+            f"检测到 operator_id={list(operator_ids)}。请分别生成 cache。"
+        )
+
+    # 兼容不含 operator_id 的旧测试夹具和外部 GalDataSet 实现。只有在其
+    # 明确提供合法 log_mass_filter 时，才按旧 R_m 契约处理。
+    try:
+        log_mass_filter = np.asarray(data.log_mass_filter, dtype=np.float32)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        log_mass_filter = None
+    if (
+        log_mass_filter is not None
+        and log_mass_filter.shape == (n_samples,)
+        and np.all(np.isfinite(log_mass_filter))
+    ):
+        return log_mass_filter, {
+            "name": "log_mass_filter",
+            "active": True,
+            "transform": "log10",
+            "units": "MACER_mass_code",
+            "source": "legacy_explicit_log_mass_filter",
+            "dimension": 1,
+            "operator_ids": list(operator_ids),
+        }
+
+    raise ValueError(
+        "无法确定训练条件语义。新 processed HDF5 必须提供一致的 operator_id；"
+        "固定 R_h 使用 spatial_block，R_m 必须同时提供正有限 mass_filter。"
+    )
+
+
 class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、计算均值和方差、归一化、保存为.pt文件
     def __init__(self, dataset: GalDataSet = None):
         self._dataset = dataset
         self._last_cache_schema_version = None
+        self._last_conditioning_contract = None
 
     # ------------ Properties -----------
 
@@ -58,6 +145,12 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
     @property
     def last_cache_schema_version(self):
         return self._last_cache_schema_version
+
+    @property
+    def last_conditioning_contract(self):
+        if self._last_conditioning_contract is None:
+            return None
+        return dict(self._last_conditioning_contract)
 
     # ------------ Dunder Methods ------------
 
@@ -82,6 +175,7 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         require_target_quantity: str | None = "instantaneous_sfr",
         allow_mixed_coarsening: bool = False,
         require_complete_metadata: bool = False,
+        exclude_raw_snapshot_indices=(),
     ):
         self._dataset = GalDataSet().load_data(
             path,
@@ -94,6 +188,7 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                 f"Processed data target is {target_quantity!r}, expected {require_target_quantity!r}. "
                 "Regenerate fine/coarse HDF5 files from the raw hdfra snapshots before preparing caches."
             )
+        self._dataset.exclude_raw_snapshot_indices(exclude_raw_snapshot_indices)
         self._dataset.select_input_channels(include=include_channels, exclude=exclude_channels)
         self._dataset.drop_invalid(
             require_positive_targets=not include_zero_targets,
@@ -162,8 +257,8 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
             scale=target_scale,
             floor=target_floor,
         )
-        # 第一阶段只把 log10(M_filter) 作为分辨率条件；H_eff/N_eff 仅预留。
-        log_mass_filter = data.log_mass_filter.astype(np.float32)
+        conditioning_scalar, conditioning_contract = _resolve_conditioning_contract(data)
+        is_legacy_rm_contract = conditioning_contract["name"] == "log_mass_filter"
         baseline_physical = _optional_sample_array(
             data,
             ("sfr_macer_baseline", "sfr_baseline", "macer_sfr_baseline", "baseline_sfr"),
@@ -199,12 +294,16 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
             "target_sfr": y,
             "target_sfr_physical": target_sfr_physical.astype(np.float64),
             "sfr_ks_baseline": sfr_ks_transformed,
-            "log_mass_filter": log_mass_filter,
             "h_eff": data.h_eff,
             "n_eff": data.n_eff,
             "groups": data.groups,
             "time": data.time,
         }
+        if is_legacy_rm_contract:
+            # 保持既有 R_m schema v3/v4 的字段和值完全不变。
+            tensors["log_mass_filter"] = conditioning_scalar
+        else:
+            tensors["conditioning_scalar"] = conditioning_scalar
         cache_version = 3
         if baseline_physical is not None:
             if baseline_physical.shape != target_sfr_physical.shape:
@@ -236,7 +335,16 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                 }
             )
             cache_version = 4
+        if not is_legacy_rm_contract:
+            # v3/v4 的 conditioning 语义已经固定为 log_mass_filter；R_h 使用
+            # v5，避免在不提升版本的情况下改变历史 schema 含义。
+            cache_version = 5
+        has_closure_payload = baseline_physical is not None
         self._last_cache_schema_version = cache_version
+        self._last_conditioning_contract = dict(conditioning_contract)
+        resolution_features = (
+            ["log_mass_filter"] if is_legacy_rm_contract else []
+        )
         torch.save(
             {
                 "schema": {"name": "macnet_sfr_cache", "version": cache_version},
@@ -247,21 +355,27 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                 },
                 "model_input_contract": {
                     "physical_fields": "x",
-                    "resolution_features": ["log_mass_filter"],
+                    "conditioning": conditioning_contract,
+                    "resolution_features": resolution_features,
                     "reserved_resolution_features": ["h_eff", "n_eff"],
                     "baseline_is_model_input": False,
-                    "baseline_is_output_composition": cache_version >= 4,
+                    "baseline_is_output_composition": has_closure_payload,
                 },
                 "learning_contract": {
                     "available_objectives": (
                         ["direct_sfr", "signed_closure"]
-                        if cache_version >= 4
+                        if has_closure_payload
                         else ["direct_sfr"]
                     ),
                     "prepared_objective": objective_mode,
-                    "final_prediction": "macer_sfr_baseline + closure_hat_physical",
+                    "final_prediction": (
+                        "macer_sfr_baseline + closure_hat_physical"
+                        if has_closure_payload
+                        else "direct_sfr_prediction"
+                    ),
                     "closure_transform": closure_transform,
                     "closure_scale": float(closure_scale),
+                    "conditioning": conditioning_contract,
                 },
             },
             save_path,
@@ -284,6 +398,7 @@ def _save_norm_stats(
     closure_transform="signed_asinh",
     closure_scale=1.0,
     cache_schema_version=None,
+    conditioning_contract=None,
     includes_zero_targets=True,
     oversample_groups=True,
     split_metadata=None,
@@ -296,6 +411,28 @@ def _save_norm_stats(
         cache_schema_version
         if cache_schema_version is not None
         else (4 if objective_mode == "signed_closure" else 3)
+    )
+    if conditioning_contract is None:
+        conditioning_contract = {
+            "name": "log_mass_filter",
+            "active": True,
+            "transform": "log10",
+            "units": "MACER_mass_code",
+            "source": "legacy_cache",
+            "dimension": 1,
+            "operator_ids": [],
+        }
+    else:
+        conditioning_contract = dict(conditioning_contract)
+    conditioning_name = str(conditioning_contract.get("name", "unknown"))
+    conditioning_active = bool(conditioning_contract.get("active", False))
+    conditioning_transform = str(
+        conditioning_contract.get("transform", "identity")
+    )
+    resolution_features = (
+        [conditioning_name]
+        if conditioning_active and conditioning_name != "none"
+        else []
     )
     metadata = {
         "format_version": 2,
@@ -325,11 +462,13 @@ def _save_norm_stats(
         "closure_scale": float(closure_scale),
         "closure_definition": "target_sfr_physical-macer_sfr_baseline",
         "final_prediction": "macer_sfr_baseline+closure_hat_physical",
-        "conditioning_variable": "log_mass_filter",
-        "conditioning_transform": "log10",
+        "conditioning_variable": conditioning_name,
+        "conditioning_active": conditioning_active,
+        "conditioning_transform": conditioning_transform,
+        "conditioning_contract": conditioning_contract,
         "baseline_variable": "sfr_ks",
         "baseline_transform": target_transform,
-        "resolution_features": ["log_mass_filter"],
+        "resolution_features": resolution_features,
         "reserved_resolution_features": ["h_eff", "n_eff"],
     }
     if split_metadata:
@@ -360,6 +499,7 @@ def _save_norm_stats(
         oversample_groups=np.asarray(metadata["oversample_groups"]),
         group_balance=np.asarray(metadata["group_balance"]),
         conditioning_variable=np.asarray(metadata["conditioning_variable"]),
+        conditioning_active=np.asarray(metadata["conditioning_active"]),
         conditioning_transform=np.asarray(metadata["conditioning_transform"]),
         objective_mode=np.asarray(metadata["objective_mode"]),
         closure_transform=np.asarray(metadata["closure_transform"]),
@@ -506,6 +646,14 @@ def _parse_args():
         help="Tag inserted in cache prefixes. Use InstantSFR with an empty exclusion list for the retained-channel control.",
     )
     parser.add_argument(
+        "--resolution-dirname",
+        default="coarse",
+        help=(
+            "每个 galaxy 数据目录下要读取的 processed HDF5 子目录。"
+            "例如固定 8x8 R_h 可使用 coarse_rh_8x8_sfr_v6，默认保持 coarse。"
+        ),
+    )
+    parser.add_argument(
         "--target-transform",
         choices=SUPPORTED_TARGET_TRANSFORMS,
         default="log10_1p",
@@ -548,6 +696,17 @@ def _parse_args():
         "--drop-zero-targets",
         action="store_true",
         help="Drop zero-SFR samples. By default zero-SFR snapshots are retained.",
+    )
+    parser.add_argument(
+        "--exclude-raw-snapshot-index",
+        action="append",
+        type=int,
+        default=[],
+        metavar="INDEX",
+        help=(
+            "精确排除指定的原始 snapshot index，可重复。盘星系初始化输出通常使用 "
+            "--exclude-raw-snapshot-index 0；这不会误删晚期物理零 SFR。"
+        ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed used for dataset splitting.")
     parser.add_argument(
@@ -681,6 +840,7 @@ def _prepare_random_snapshot_experiment(
         includes_zero_targets=not args.drop_zero_targets,
         oversample_groups=args.oversample,
         cache_schema_version=train_cache.last_cache_schema_version,
+        conditioning_contract=train_cache.last_conditioning_contract,
         split_metadata={
             "experiment": f"exp{experiment_number}",
             "split_strategy": split_label,
@@ -813,6 +973,7 @@ def _prepare_exp2_logo_folds(
             includes_zero_targets=not args.drop_zero_targets,
             oversample_groups=args.oversample,
             cache_schema_version=train_cache.last_cache_schema_version,
+            conditioning_contract=train_cache.last_conditioning_contract,
             split_metadata=split_metadata,
             **transform_options,
         )
@@ -865,6 +1026,7 @@ if __name__ == "__main__":
         "exclude_channels": excluded_channels,
         "include_zero_targets": include_zero_targets,
         "require_target_quantity": "instantaneous_sfr",
+        "exclude_raw_snapshot_indices": tuple(args.exclude_raw_snapshot_index),
     }
     transform_options = {
         "target_transform": args.target_transform,
@@ -877,12 +1039,16 @@ if __name__ == "__main__":
     train_balance = "oversample" if args.oversample else None
     np.random.seed(args.seed)
     os.makedirs(".cache", exist_ok=True)
-    resolution = "coarse"
+    resolution = args.resolution_dirname
     configs_dir = ".config"
 
-    # Use the global variables (renamed to match notebook import expectation)
-    exp_eg_folder_paths = Exp_eg_folder_paths # 特定分辨率的椭圆星系的路径
-    exp_dg_folder_paths = Exp_dg_folder_paths # 特定分辨率的盘状星系的路径
+    # 命令行可选择独立 processed 子目录；模块级默认路径仅保留给旧 notebook。
+    exp_eg_folder_paths = get_folder_paths(
+        configs_dir, "elliptical_galaxy", resolution
+    )
+    exp_dg_folder_paths = get_folder_paths(
+        configs_dir, "disk_galaxy", resolution
+    )
 
     print(f"Requested experiments: {', '.join(args.experiments)}")
 
@@ -974,6 +1140,7 @@ if __name__ == "__main__":
             includes_zero_targets=include_zero_targets,
             oversample_groups=args.oversample,
             cache_schema_version=train_cache.last_cache_schema_version,
+            conditioning_contract=train_cache.last_conditioning_contract,
             split_metadata={
                 "experiment": "exp4",
                 "split_strategy": "legacy_single_group_holdout",

@@ -1,4 +1,4 @@
-"""Shared, invertible transforms for physical SFR targets and baselines."""
+"""物理 SFR、baseline 与可正可负 closure 的共享可逆数值变换。"""
 
 from __future__ import annotations
 
