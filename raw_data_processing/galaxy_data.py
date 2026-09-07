@@ -1425,9 +1425,18 @@ class GalData:
                 "Loading processed HDF5 files does not."
             )
         self.time = time
-        # Convert path to relative path to avoid pyhdf C-library issues with Chinese chars on Windows
-        rel_path = os.path.relpath(path)
-        self._data_hdfra = SD(rel_path)
+        # pyhdf 的 HDF4 C 库在 Windows 上可能无法打开含中文字符的路径；而直接
+        # os.path.relpath 在 workspace 与 RawData 跨盘符时又会抛 ValueError。
+        # 因此由 Python 临时进入源目录，仅把通常为 ASCII 的 hdfra.<index> basename
+        # 交给 C 库。SD() 在返回前已经打开文件句柄，随后恢复 cwd 不影响后续 select。
+        absolute_path = os.path.abspath(path)
+        source_directory, source_name = os.path.split(absolute_path)
+        previous_directory = os.getcwd()
+        try:
+            os.chdir(source_directory)
+            self._data_hdfra = SD(source_name)
+        finally:
+            os.chdir(previous_directory)
         return self
 
     def _load_log(self, path: str, f: Callable, scope: float) -> "GalData":
@@ -1756,6 +1765,7 @@ class GalDataSet:
         *,
         allow_mixed_coarsening: bool = False,
         require_complete_metadata: bool = False,
+        show_progress: bool = False,
     ) -> "GalDataSet":
         """
         整个数据集的入口。它接收一个或多个文件夹路径，遍历里面所有的 HDF5 数据文件。
@@ -1766,6 +1776,7 @@ class GalDataSet:
         Loads data from the specified folder path(s).
         Args:
             folder_path (str | list[str]): Path to the folder(s) containing the data files.
+            show_progress (bool): 是否显示跨输入目录的逐 snapshot 加载进度，默认关闭。
         """
         # Handle folder paths
         folder_path = folder_path if isinstance(folder_path, list) else [folder_path]
@@ -1842,15 +1853,41 @@ class GalDataSet:
         )
         self._raw_data = {k: [] for k in keys}
 
-        # Load data from all specified folder paths
+        # 预先建立确定性的文件清单；prepare_data 可据此显示跨星系的全局进度，
+        # 同时保持默认库调用安静，避免单元测试和 notebook 被强制输出进度条。
+        file_entries = []
         for fp_info in valid_folder_path:
             # 安全地解包 fp 和 group_idx
             fp = fp_info[0] if isinstance(fp_info, (list, tuple)) else fp_info
             group_idx = fp_info[1] if isinstance(fp_info, (list, tuple)) and len(fp_info) > 1 else None
-            
-            for file_name in sorted(os.listdir(fp)):
-                if not file_name.endswith('.h5'):
-                    continue
+            for file_name in sorted(
+                name for name in os.listdir(fp) if name.endswith(".h5")
+            ):
+                file_entries.append((fp, group_idx, file_name))
+
+        entries = file_entries
+        if show_progress:
+            try:
+                from tqdm.auto import tqdm
+            except ModuleNotFoundError as exc:
+                raise ImportError(
+                    "显示 HDF5 加载进度需要 tqdm；请安装 tqdm 或设置 show_progress=False。"
+                ) from exc
+            entries = tqdm(
+                file_entries,
+                total=len(file_entries),
+                desc="加载 processed HDF5",
+                unit="snapshot",
+                dynamic_ncols=True,
+                mininterval=0.2,
+            )
+
+        # Load data from all specified folder paths
+        for entry_index, (fp, group_idx, file_name) in enumerate(entries):
+                if show_progress and entry_index % 50 == 0:
+                    entries.set_postfix_str(
+                        f"{group_idx or '未分组'} / {file_name}", refresh=False
+                    )
                 file_path = os.path.join(fp, file_name)
                 data = GalData().load_h5(file_path)
                 if require_complete_metadata:

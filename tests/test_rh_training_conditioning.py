@@ -1,3 +1,4 @@
+import argparse
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +6,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from Experiment.prepare_data import CachePt
+from Experiment.prepare_data import (
+    CachePt,
+    _estimate_closure_scale_from_pt,
+    _parse_closure_scale,
+    _write_train_cache_with_resolved_closure_scale,
+)
 from Experiment.train import GalPTDataset, validate_convnet_conditioning
 
 
@@ -47,6 +53,64 @@ class _SyntheticConditioningDataset:
 
 
 class RhTrainingConditioningTests(unittest.TestCase):
+    def test_auto_closure_scale_uses_temporary_training_cache_only(self):
+        dataset = _SyntheticConditioningDataset(["spatial_block", "spatial_block"])
+        with tempfile.TemporaryDirectory() as directory:
+            save_prefix = str(Path(directory) / "ExpAuto_")
+            mean, std, options, selection = (
+                _write_train_cache_with_resolved_closure_scale(
+                    CachePt(dataset),
+                    save_prefix,
+                    {
+                        "objective_mode": "signed_closure",
+                        "closure_transform": "signed_asinh",
+                        "closure_scale": "auto",
+                    },
+                )
+            )
+            final_path = Path(f"{save_prefix}train.pt")
+            temporary_path = Path(f"{save_prefix}train.auto_scale_tmp.pt")
+            payload = torch.load(final_path, weights_only=False)
+            temporary_exists_after_write = temporary_path.exists()
+
+        self.assertFalse(temporary_exists_after_write)
+        self.assertAlmostEqual(options["closure_scale"], 1.5)
+        self.assertEqual(selection["source_split"], "train")
+        self.assertEqual(selection["source_tensor"], "closure_true_physical")
+        self.assertEqual(selection["method"], "median_abs")
+        self.assertAlmostEqual(
+            payload["learning_contract"]["closure_scale"], 1.5
+        )
+        np.testing.assert_allclose(
+            payload["tensors"]["closure_true"],
+            np.arcsinh(np.asarray([-1.0, 2.0]) / 1.5),
+        )
+        np.testing.assert_array_equal(mean, np.zeros(2))
+        np.testing.assert_array_equal(std, np.ones(2))
+
+    def test_auto_closure_scale_zero_median_uses_nonzero_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "temporary_train.pt"
+            torch.save(
+                {
+                    "tensors": {
+                        "closure_true_physical": np.asarray([0.0, 0.0, -4.0])
+                    }
+                },
+                path,
+            )
+            scale, selection = _estimate_closure_scale_from_pt(path)
+
+        self.assertEqual(scale, 4.0)
+        self.assertEqual(selection["method"], "median_nonzero_abs_fallback")
+        self.assertEqual(selection["zero_count"], 2)
+
+    def test_closure_scale_parser_accepts_auto_and_rejects_nonpositive(self):
+        self.assertEqual(_parse_closure_scale("AUTO"), "auto")
+        self.assertEqual(_parse_closure_scale("250"), 250.0)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            _parse_closure_scale("0")
+
     def test_fixed_rh_writes_v5_inactive_conditioning_and_supports_both_objectives(self):
         dataset = _SyntheticConditioningDataset(["spatial_block", "spatial_block"])
         with tempfile.TemporaryDirectory() as directory:

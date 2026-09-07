@@ -2,15 +2,14 @@
 
 ## 1. 功能概述
 
-`run_optuna.py` 使用 Optuna 搜索 SFRConvNet 超参数。每个 trial 会：
+`run_optuna.py` 使用 Optuna 搜索 SFRConvNet 超参数。每个 study 会：
 
-1. 清理 Python 和 CUDA 缓存；
-2. 调用 `train.parse_args([])` 获得训练默认参数；
-3. 从预定义搜索空间采样；
-4. 将训练轮数和部分系统参数设为 HPO 固定值；
-5. 调用 `train.main(args)`；
-6. 以最佳验证损失作为最小化目标；
-7. 将 study 持久化到 SQLite，可中断后继续。
+1. 检查 train/val/test cache 和 `metadata.json` 是否完整；
+2. 验证可用训练目标和条件变量契约；
+3. 默认从 `prepared_objective` 自动解析训练目标，也允许显式指定；
+4. 从搜索空间为每个 trial 采样配置；
+5. 只用训练集训练、用验证集选择超参数，不在 HPO 阶段评估测试集；
+6. 将 study 持久化到包含训练目标名称的 SQLite 数据库。
 
 ## 2. 当前搜索空间
 
@@ -25,45 +24,56 @@
 | `weight_decay` | 对数均匀 | `1e-6` 至 `1e-3` |
 | `batch_size` | categorical | `64`、`128`、`256`、`512`、`1024` |
 
-代码中被注释掉的 Transformer、`use_film` 和增强搜索项不会参与优化。
+主损失函数、训练目标、负 SFR 惩罚系数和是否启用 FiLM 是固定实验条件，
+不是同一 study 内的待搜索变量。
 
 ## 3. 每个 trial 的固定参数
 
-| 参数 | 固定值 | 含义 |
+| 参数 | 默认值 | 含义 |
 |---|---:|---|
 | `epochs` | `90` | HPO 最大训练轮数 |
 | `patience` | `15` | early stopping |
-| `num_workers` | `0` | Windows 安全设置 |
-| `log_dir` | `runs/HPO` | TensorBoard 目录 |
+| `num_workers` | `0` | 可通过命令行修改 |
+| `log_dir` | `runs/HPO/<objective>` | TensorBoard 目录 |
 | `no_save` | `True` | 不保存正式最佳模型 |
+| `skip_test` | `True` | 不在每个 trial 反复评估测试集 |
 
-未在本脚本中覆盖的参数继承 `train.py` 默认值。因此当前会继承 `objective_mode=direct_sfr`、`use_film=False`、`loss=mse` 等默认值。要优化 signed closure，必须先显式修改 HPO 配方，不能只换 cache 名。
+固定 (R_h) cache 会自动关闭 FiLM；带活动 `log_mass_filter` 条件的 (R_m)
+cache 会自动启用 FiLM。二者均由 metadata 决定。
 
 ## 4. 命令行参数
 
 | 参数 | 默认值 | 含义 |
 |---|---:|---|
+| `--cache-dir` | `.cache` | CachePT 和 metadata 所在目录 |
 | `--data-exp` | `Exp1_InstantSFR_NoInitialStellarDensity_` | Cache 文件前缀 |
+| `--objective-mode` | `auto` | `auto`、`direct_sfr` 或 `signed_closure` |
+| `--negative-sfr-weight` | `1.0` | closure 模式下最终负 SFR 的惩罚系数 |
+| `--loss` | `mse` | 所有 trial 固定使用 `mse`、`l1` 或 `huber` |
+| `--num-workers` | `0` | DataLoader worker 数量 |
 | `--n-trials` | `600` | 最大 trial 数 |
 | `--timeout` | `28800` 秒 | study 总时限，默认 8 小时 |
 
-二者任一先达到都会停止当前 `study.optimize`。
+trial 数或总时限任一先达到，都会停止当前 `study.optimize`。
 
 ## 5. 执行命令
 
-运行默认 HPO：
-
-```powershell
-python Experiment/run_optuna.py
-```
-
-指定 cache、trial 数和 2 小时时限：
+为 signed-closure cache 调参：
 
 ```powershell
 python Experiment/run_optuna.py `
-  --data-exp Exp1_Rh8x8_Direct_ `
+  --data-exp Exp1_Rh8x8_Closure_auto_ `
+  --objective-mode signed_closure `
+  --negative-sfr-weight 1.0 `
+  --loss l1 `
   --n-trials 100 `
-  --timeout 7200
+  --timeout 28800
+```
+
+也可以省略 `--objective-mode`。此时程序从 cache metadata 自动读取；启动时应明确看到：
+
+```text
+Resolved learning objective: signed_closure
 ```
 
 查看参数：
@@ -74,18 +84,22 @@ python Experiment/run_optuna.py --help
 
 ## 6. 输出与恢复
 
-SQLite 数据库路径为：
+SQLite 数据库路径包含训练目标：
 
 ```text
-.cache/<data-exp>sfrconvnet_hpo.db
+.cache/<data-exp><objective-mode>_sfrconvnet_hpo.db
 ```
 
-study 名称为 `.cache/<data-exp>sfrconvnet_hpo`，`load_if_exists=True`，因此同一 `data-exp` 再次运行会继续已有 study，而不是重新开始。
+study 名称同样包含 `<objective-mode>`，因此 direct-SFR 和 signed-closure 不会
+恢复到同一个历史 study。study user attributes 还会记录 cache 前缀、目标、条件变量
+和 closure 变换，并保存 cache metadata 的 SHA-256 指纹、固定损失函数、负 SFR
+惩罚系数及搜索空间版本；恢复时任一契约变化，程序都会拒绝继续。
 
 ## 7. 注意事项
 
-1. 不要用 direct-SFR 的最佳超参数直接宣布 closure 模型较差；两种目标应获得相同 HPO 预算；
-2. `objective()` 当前捕获所有训练异常并返回无穷大，需结合日志判断是坏超参数还是数据/代码错误；
-3. batch size 上限 `1024` 可能超过某些模型或 GPU 的显存；
-4. HPO 使用的验证 split 必须无时间泄漏，否则 Optuna 会优化到过于乐观的指标；
-5. 正式最优参数应重新进行多随机种子训练，而不是直接把某个 trial 当最终结果。
+1. 两种目标应使用相同的 split、HPO 搜索空间和计算预算；
+2. CUDA OOM 只剪枝当前 trial；其他数据契约、维度或代码异常会立即中止；
+3. batch size `1024` 可能使大模型 trial OOM，此时属于可预期剪枝；
+4. HPO 验证 split 必须避免时间泄漏；
+5. HPO 不评估测试集。确定超参数后应多随机种子正式训练，最后才使用测试集；
+6. 旧版 `<data-exp>sfrconvnet_hpo.db` 可能记录了错误的 direct-SFR trial，应单独归档。

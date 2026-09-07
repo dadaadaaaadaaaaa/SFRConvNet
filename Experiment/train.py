@@ -812,6 +812,14 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
 
     parser.add_argument("--log_dir", type=str, default="runs", help="Directory to write TensorBoard logs")
     parser.add_argument("--no_save", action="store_true", help="Disable saving results to disk (useful for HPO)")
+    parser.add_argument(
+        "--skip_test",
+        action="store_true",
+        help=(
+            "训练结束后不读取最佳模型并评估测试集。仅用于 HPO 等只允许使用验证集"
+            "选择超参数的阶段；正式训练默认仍评估测试集。"
+        ),
+    )
 
     args = parser.parse_args(argv)
     if args.negative_sfr_weight < 0:
@@ -1135,7 +1143,9 @@ def train_one_epoch(
     negative_sfr_weight=0.0,
 ):
     model.train()
-    total, n = 0.0, 0 
+    # 只在 epoch 结束时读取 CUDA 标量；detach 防止统计持有反向计算图。
+    total = torch.zeros((), dtype=torch.float64, device=device)
+    n = 0
     for batch in loader: # Batch 第3项是 cache 声明的分辨率条件 log10(M_filter)。
         x, coord, conditioning_scalar, y, baseline, target_physical, groups, _ = _move_batch(
             batch, device, objective_mode
@@ -1191,9 +1201,9 @@ def train_one_epoch(
                 scheduler.step()
 
         bs = y.size(0)  # 当前批次的样本数量
-        total += loss.detach().item() * bs # 累积加权损失总和，乘以批次大小以获得当前批次的总损失
+        total.add_(loss.detach().to(torch.float64) * bs)
         n += bs
-    return total / max(1, n) # 返回当前轮次的平均加权损失
+    return total.item() / max(1, n)
 
 
 '''
@@ -1305,10 +1315,11 @@ def eval_epoch(
         avg = total_loss / max(1, n_samples)
         return avg, [avg]
 
-    groups_sum = [0.0] * n_groups
-    groups_count = [0] * n_groups
-    closure_final_abs_sum = 0.0
-    closure_negative_count = 0
+    # 在设备端按星系统计，避免每个 batch 内多次取回标量和 Python 布尔同步。
+    groups_sum = torch.zeros(n_groups, dtype=torch.float64, device=device)
+    groups_count = torch.zeros(n_groups, dtype=torch.int64, device=device)
+    closure_final_abs_sum = torch.zeros((), dtype=torch.float64, device=device)
+    closure_negative_count = torch.zeros((), dtype=torch.int64, device=device)
     closure_sample_count = 0
 
     for batch in loader:
@@ -1339,22 +1350,20 @@ def eval_epoch(
             per_sample_loss = per_sample_loss + float(negative_sfr_weight) * negative
             closure_final_abs_sum += torch.abs(
                 composed["final_sfr_physical"] - target_physical.float()
-            ).sum().item()
-            closure_negative_count += int(
-                (composed["final_sfr_physical"] < 0).sum().item()
-            )
+            ).sum(dtype=torch.float64)
+            closure_negative_count += (composed["final_sfr_physical"] < 0).sum()
             closure_sample_count += int(target_physical.numel())
         else:
             per_sample_loss = _per_sample_weighted_loss(criterion, pred, y, groups)
 
-        # Cumulative by domain
-        for g in range(n_groups): # 累加每个group的损失总和，计算每一种星系的平均损失
-            m = groups == g
-            if m.any():
-                groups_sum[g] += per_sample_loss[m].mean().item() * m.sum().item()
-                groups_count[g] += m.sum().item()
+        groups_sum.scatter_add_(0, groups, per_sample_loss.to(torch.float64))
+        groups_count.scatter_add_(0, groups, torch.ones_like(groups))
 
     # Domain-by-domain mean and worst domain
+    groups_sum = groups_sum.cpu().tolist()
+    groups_count = groups_count.cpu().tolist()
+    closure_final_abs_sum = closure_final_abs_sum.item()
+    closure_negative_count = closure_negative_count.item()
     groups_mean = [(groups_sum[d] / groups_count[d]) if groups_count[d] > 0 else float("nan") for d in range(n_groups)]
     valid_means = [v for v in groups_mean if not (v != v)]  # 跳过 NaN
 
@@ -1756,7 +1765,13 @@ def main(args=None):
             best_val = val_metric
             no_improve = 0
             if args.no_save:
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                # HPO + skip_test 只需要最佳验证指标，不需要复制权重，更不能把
+                # best_path=None 传给 torch.save。no_save 但仍要测试时才保留内存副本。
+                if not args.skip_test:
+                    best_model_state = {
+                        key: value.cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
             else:
                 torch.save(
                     {
@@ -1784,6 +1799,17 @@ def main(args=None):
                 print(f"Early stopping at epoch {epoch}")
                 break
 
+    if args.skip_test:
+        writer.close()
+        if best_val == float("inf"):
+            print("No finite validation improvement was found during training.")
+            return float("inf")
+        print(
+            f"Best val metric loss: {best_val:.6f}. "
+            "Test evaluation skipped because --skip_test is active."
+        )
+        return best_val
+
     has_best = False
     if args.no_save: # 训练结束后，加载最好的模型，去测试集验证泛化能力
         if best_val != float("inf") and best_model_state is not None:
@@ -1794,6 +1820,7 @@ def main(args=None):
 
     if not has_best:
         print("No improvement was found during training. Best model not saved (or not found).")
+        writer.close()
         return float("inf")
 
     print(f"Best val metric loss: {best_val:.6f}. Loading best and testing.")
@@ -1820,6 +1847,7 @@ def main(args=None):
     if not args.no_save:
         print(f"Best model saved to: {best_path}")
 
+    writer.close()
     return best_val
 
 

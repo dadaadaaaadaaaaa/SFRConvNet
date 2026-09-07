@@ -215,6 +215,10 @@ class FourierPositionalEncoding2D(nn.Module):
         self.theta_pi_periodic = theta_pi_periodic
         self.r_log_scale = r_log_scale
         self.eps = eps
+        # 非持久 buffer 不进入 checkpoint；每个 trial 独立建立坐标缓存。
+        self.register_buffer("_fixed_r", None, persistent=False)
+        self.register_buffer("_fixed_theta", None, persistent=False)
+        self.register_buffer("_fixed_features", None, persistent=False)
         self.register_buffer(
             "freq_bands",
             torch.logspace(0.0, math.log10(max_frequency), steps=num_bands), # 生成num_bands个频率，呈对数空间分布，从1到max_frequency
@@ -241,6 +245,13 @@ class FourierPositionalEncoding2D(nn.Module):
         Returns: (B, Dpos, H, W)
         """
         B, _, H, W = r.shape
+        if self._fixed_features is not None and normalize and not r.requires_grad and not theta.requires_grad:
+            if (r.shape[1:] == self._fixed_r.shape[1:]
+                    and r.device == self._fixed_r.device
+                    and r.dtype == self._fixed_r.dtype
+                    and torch.equal(r, self._fixed_r.expand_as(r))
+                    and torch.equal(theta, self._fixed_theta.expand_as(theta))):
+                return self._fixed_features.expand(B, -1, -1, -1)
 
         # r normalization
         if self.r_log_scale: # 对r取对数并归一化，以更好地处理跨越多个数量级的半径值。每个r都属于[0,1]

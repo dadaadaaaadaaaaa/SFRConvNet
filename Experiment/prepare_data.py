@@ -176,11 +176,13 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         allow_mixed_coarsening: bool = False,
         require_complete_metadata: bool = False,
         exclude_raw_snapshot_indices=(),
+        show_progress: bool = False,
     ):
         self._dataset = GalDataSet().load_data(
             path,
             allow_mixed_coarsening=allow_mixed_coarsening,
             require_complete_metadata=require_complete_metadata,
+            show_progress=show_progress,
         )
         target_quantity = self._dataset.target_metadata.get("quantity")
         if require_target_quantity and target_quantity != require_target_quantity:
@@ -402,6 +404,7 @@ def _save_norm_stats(
     includes_zero_targets=True,
     oversample_groups=True,
     split_metadata=None,
+    closure_scale_selection=None,
 ): # 接收CachePt处理训练集时算出来的mean和std，打包保存成npz文件
     norm_path = f"{save_path}norm.npz"
     channel_names = np.asarray(tuple(input_channels), dtype=str)
@@ -460,6 +463,13 @@ def _save_norm_stats(
         ),
         "closure_transform": closure_transform,
         "closure_scale": float(closure_scale),
+        "closure_scale_selection": dict(closure_scale_selection or {
+            "mode": "explicit",
+            "source_split": None,
+            "source_tensor": None,
+            "method": "user_supplied",
+            "resolved_value": float(closure_scale),
+        }),
         "closure_definition": "target_sfr_physical-macer_sfr_baseline",
         "final_prediction": "macer_sfr_baseline+closure_hat_physical",
         "conditioning_variable": conditioning_name,
@@ -504,6 +514,8 @@ def _save_norm_stats(
         objective_mode=np.asarray(metadata["objective_mode"]),
         closure_transform=np.asarray(metadata["closure_transform"]),
         closure_scale=np.asarray(metadata["closure_scale"]),
+        closure_scale_mode=np.asarray(metadata["closure_scale_selection"]["mode"]),
+        closure_scale_method=np.asarray(metadata["closure_scale_selection"]["method"]),
         cache_schema_version=np.asarray(metadata["cache_schema_version"]),
     )
     metadata_path = f"{save_path}metadata.json"
@@ -529,6 +541,132 @@ def _parse_bool(value):
     raise argparse.ArgumentTypeError(
         f"Expected a boolean value (true/false), got {value!r}."
     )
+
+
+def _parse_closure_scale(value):
+    """解析正浮点数或 ``auto`` 形式的闭合项尺度。"""
+
+    normalized = str(value).strip().lower()
+    if normalized == "auto":
+        return "auto"
+    try:
+        scale = float(normalized)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--closure-scale 需要正浮点数或 'auto'，实际得到 {value!r}。"
+        ) from exc
+    if not np.isfinite(scale) or scale <= 0:
+        raise argparse.ArgumentTypeError(
+            f"--closure-scale 必须为正有限数，实际得到 {value!r}。"
+        )
+    return scale
+
+
+def _estimate_closure_scale_from_pt(temporary_train_path):
+    """只从临时训练 cache 的物理闭合项估计稳健尺度。
+
+    主定义是 ``median(abs(C_true))``。如果训练集中至少一半的闭合项恰为
+    零而导致该统计量退化，则回退到非零绝对值的中位数。这里不读取验证集或
+    测试集，从数据流上避免尺度估计造成信息泄漏。
+    """
+
+    payload = torch.load(temporary_train_path, map_location="cpu", weights_only=False)
+    try:
+        closure = payload["tensors"]["closure_true_physical"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            "closure-scale auto 需要临时 train.pt 包含 "
+            "tensors/closure_true_physical；请使用带 MACER-LR baseline 的数据。"
+        ) from exc
+
+    values = np.asarray(closure, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        raise ValueError("无法从空训练集估计 closure scale。")
+    if not np.all(np.isfinite(values)):
+        bad_count = int(np.count_nonzero(~np.isfinite(values)))
+        raise ValueError(
+            "训练集 closure_true_physical 含有非有限值，"
+            f"无法自动估计尺度（{bad_count}/{values.size}）。"
+        )
+
+    absolute = np.abs(values)
+    scale = float(np.median(absolute))
+    method = "median_abs"
+    positive = absolute[absolute > 0.0]
+    if not np.isfinite(scale) or scale <= 0.0:
+        if positive.size == 0:
+            raise ValueError(
+                "训练集 closure_true_physical 全部为零；自动尺度没有定义，"
+                "请检查 baseline/真值，或显式指定 --closure-scale。"
+            )
+        scale = float(np.median(positive))
+        method = "median_nonzero_abs_fallback"
+
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"自动估计得到非法 closure scale：{scale!r}。")
+
+    statistics = {
+        "mode": "auto",
+        "source_split": "train",
+        "source_tensor": "closure_true_physical",
+        "method": method,
+        "resolved_value": scale,
+        "sample_count": int(values.size),
+        "zero_count": int(np.count_nonzero(absolute == 0.0)),
+        "negative_count": int(np.count_nonzero(values < 0.0)),
+        "median_abs": float(np.median(absolute)),
+        "p90_abs": float(np.percentile(absolute, 90.0)),
+        "p99_abs": float(np.percentile(absolute, 99.0)),
+        "max_abs": float(np.max(absolute)),
+    }
+    return scale, statistics
+
+
+def _write_train_cache_with_resolved_closure_scale(
+    train_cache,
+    save_path,
+    transform_options,
+):
+    """写训练 cache，并在请求 ``auto`` 时执行临时 cache 两阶段流程。"""
+
+    resolved_options = dict(transform_options)
+    requested_scale = resolved_options.get("closure_scale", 1.0)
+    final_train_path = f"{save_path}train.pt"
+
+    if requested_scale != "auto":
+        resolved_options["closure_scale"] = float(requested_scale)
+        mean, std = train_cache.to_pt(final_train_path, **resolved_options)
+        selection = {
+            "mode": "explicit",
+            "source_split": None,
+            "source_tensor": None,
+            "method": "user_supplied",
+            "resolved_value": float(requested_scale),
+        }
+        return mean, std, resolved_options, selection
+
+    temporary_train_path = f"{save_path}train.auto_scale_tmp.pt"
+    provisional_options = dict(resolved_options)
+    # 临时 cache 中的物理闭合项与变换尺度无关；1.0 仅用于满足现有 schema。
+    provisional_options["closure_scale"] = 1.0
+    if os.path.exists(temporary_train_path):
+        os.remove(temporary_train_path)
+
+    print(f"[INFO] 写入临时训练 cache 以估计 closure scale: {temporary_train_path}")
+    try:
+        train_cache.to_pt(temporary_train_path, **provisional_options)
+        scale, selection = _estimate_closure_scale_from_pt(temporary_train_path)
+    finally:
+        if os.path.exists(temporary_train_path):
+            os.remove(temporary_train_path)
+
+    resolved_options["closure_scale"] = scale
+    print(
+        "[INFO] closure-scale auto：仅由训练集 "
+        f"{selection['method']} 得到 {scale:.10g}；正在重新生成正式 cache。"
+    )
+    mean, std = train_cache.to_pt(final_train_path, **resolved_options)
+    return mean, std, resolved_options, selection
 
 
 def _parse_experiment_tokens(values):
@@ -688,9 +826,13 @@ def _parse_args():
     )
     parser.add_argument(
         "--closure-scale",
-        type=float,
+        type=_parse_closure_scale,
         default=1.0,
-        help="signed_asinh 的物理 SFR 尺度；单位与 target_units 相同，所有数据划分必须一致。",
+        help=(
+            "signed_asinh 的物理 SFR 尺度，单位与 target_units 相同。"
+            "可传正浮点数，或传 auto 以只从临时 train.pt 的 "
+            "closure_true_physical 自动估计。"
+        ),
     )
     parser.add_argument(
         "--drop-zero-targets",
@@ -754,14 +896,24 @@ def _parse_args():
             "Accepts --oversample=true or --oversample=false."
         ),
     )
+    parser.add_argument(
+        "--progress",
+        type=_parse_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="BOOL",
+        help=(
+            "显示 processed HDF5 加载进度（默认 true）。"
+            "可用 --progress=false 关闭，便于非交互日志环境。"
+        ),
+    )
     args = parser.parse_args()
     args.exclude_channels = _parse_channel_list(args.exclude_channels)
     if args.target_scale <= 0:
         parser.error("--target-scale must be positive.")
     if args.target_floor <= 0:
         parser.error("--target-floor must be positive.")
-    if args.closure_scale <= 0:
-        parser.error("--closure-scale must be positive.")
     if args.exclude_channels and not args.cache_tag:
         parser.error("--cache-tag is required when --exclude-channels is used, to avoid overwriting old caches.")
     try:
@@ -829,7 +981,13 @@ def _prepare_random_snapshot_experiment(
     print(f"  Testing set size:    {len(test_cache)}")
 
     save_path = os.path.join(".cache", _cache_prefix(experiment_number, args.cache_tag))
-    mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+    mean, std, resolved_transform_options, scale_selection = (
+        _write_train_cache_with_resolved_closure_scale(
+            train_cache,
+            save_path,
+            transform_options,
+        )
+    )
     _save_norm_stats(
         save_path,
         mean,
@@ -841,6 +999,7 @@ def _prepare_random_snapshot_experiment(
         oversample_groups=args.oversample,
         cache_schema_version=train_cache.last_cache_schema_version,
         conditioning_contract=train_cache.last_conditioning_contract,
+        closure_scale_selection=scale_selection,
         split_metadata={
             "experiment": f"exp{experiment_number}",
             "split_strategy": split_label,
@@ -859,10 +1018,10 @@ def _prepare_random_snapshot_experiment(
             },
             "cache_prefix": os.path.basename(save_path),
         },
-        **transform_options,
+        **resolved_transform_options,
     )
-    val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
-    test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
+    val_cache.to_pt(save_path + "val.pt", mean, std, **resolved_transform_options)
+    test_cache.to_pt(save_path + "test.pt", mean, std, **resolved_transform_options)
     return save_path
 
 
@@ -935,7 +1094,13 @@ def _prepare_exp2_logo_folds(
         print(f"  In-distribution test set size:      {len(test_cache)}")
         print(f"  Held-out galaxy test set size:      {len(cache_out)}")
 
-        mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+        mean, std, resolved_transform_options, scale_selection = (
+            _write_train_cache_with_resolved_closure_scale(
+                train_cache,
+                save_path,
+                transform_options,
+            )
+        )
         split_metadata = {
             "experiment": "exp2",
             "split_strategy": "leave_one_galaxy_out",
@@ -974,12 +1139,13 @@ def _prepare_exp2_logo_folds(
             oversample_groups=args.oversample,
             cache_schema_version=train_cache.last_cache_schema_version,
             conditioning_contract=train_cache.last_conditioning_contract,
+            closure_scale_selection=scale_selection,
             split_metadata=split_metadata,
-            **transform_options,
+            **resolved_transform_options,
         )
-        val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
-        test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
-        cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
+        val_cache.to_pt(save_path + "val.pt", mean, std, **resolved_transform_options)
+        test_cache.to_pt(save_path + "test.pt", mean, std, **resolved_transform_options)
+        cache_out.to_pt(save_path + "out.pt", mean, std, **resolved_transform_options)
         folds.append(split_metadata)
 
     manifest_path = os.path.join(".cache", f"{base_prefix}folds.json")
@@ -1027,6 +1193,7 @@ if __name__ == "__main__":
         "include_zero_targets": include_zero_targets,
         "require_target_quantity": "instantaneous_sfr",
         "exclude_raw_snapshot_indices": tuple(args.exclude_raw_snapshot_index),
+        "show_progress": args.progress,
     }
     transform_options = {
         "target_transform": args.target_transform,
@@ -1129,7 +1296,13 @@ if __name__ == "__main__":
             held_out_group=held[1],
         )
         save_path = os.path.join(".cache", _cache_prefix(4, args.cache_tag))
-        mean, std = train_cache.to_pt(save_path + "train.pt", **transform_options)
+        mean, std, resolved_transform_options, scale_selection = (
+            _write_train_cache_with_resolved_closure_scale(
+                train_cache,
+                save_path,
+                transform_options,
+            )
+        )
         _save_norm_stats(
             save_path,
             mean,
@@ -1141,6 +1314,7 @@ if __name__ == "__main__":
             oversample_groups=args.oversample,
             cache_schema_version=train_cache.last_cache_schema_version,
             conditioning_contract=train_cache.last_conditioning_contract,
+            closure_scale_selection=scale_selection,
             split_metadata={
                 "experiment": "exp4",
                 "split_strategy": "legacy_single_group_holdout",
@@ -1158,8 +1332,8 @@ if __name__ == "__main__":
                 },
                 "cache_prefix": os.path.basename(save_path),
             },
-            **transform_options,
+            **resolved_transform_options,
         )
-        val_cache.to_pt(save_path + "val.pt", mean, std, **transform_options)
-        test_cache.to_pt(save_path + "test.pt", mean, std, **transform_options)
-        cache_out.to_pt(save_path + "out.pt", mean, std, **transform_options)
+        val_cache.to_pt(save_path + "val.pt", mean, std, **resolved_transform_options)
+        test_cache.to_pt(save_path + "test.pt", mean, std, **resolved_transform_options)
+        cache_out.to_pt(save_path + "out.pt", mean, std, **resolved_transform_options)

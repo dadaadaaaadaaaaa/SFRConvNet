@@ -64,7 +64,7 @@ C_\alpha^{\rm true}=Y_\alpha-B_\alpha.
 | `--target-floor` | `1e-9` | `log10_floor` 使用的正数下限 |
 | `--objective-mode` | `direct_sfr` | `direct_sfr` 或 `signed_closure` |
 | `--closure-transform` | `signed_asinh` | `signed_asinh` 或 `identity` |
-| `--closure-scale` | `1.0` | 闭合项变换尺度；必须只根据训练集确定 |
+| `--closure-scale` | `1.0` | 正浮点数或 `auto`。`auto` 只从临时训练 cache 的 `closure_true_physical` 估计尺度 |
 | `--drop-zero-targets` | 关闭 | 开启后删除零 SFR；默认保留物理零 SFR |
 | `--exclude-raw-snapshot-index` | 空 | 精确排除原始 snapshot index；可重复，例如初始化帧 `0` |
 | `--seed` | `42` | 划分及抽样随机种子 |
@@ -73,6 +73,7 @@ C_\alpha^{\rm true}=Y_\alpha-B_\alpha.
 | `--experiment` | 空 | 可重复的单数形式 |
 | `--held-out-galaxy` | 全部可用组 | 只生成指定 exp2 留出折；可用昵称或完整组名，可重复 |
 | `--oversample` | `true` | `true/false`；是否对训练组过采样平衡 |
+| `--progress` | `true` | `true/false`；显示跨星系的 processed HDF5 snapshot 加载进度 |
 
 ## 6. 输出文件
 
@@ -85,6 +86,10 @@ C_\alpha^{\rm true}=Y_\alpha-B_\alpha.
 .cache/Exp1_<tag>_norm.npz
 .cache/Exp1_<tag>_metadata.json
 ```
+
+这些路径相对于启动脚本时的当前工作目录，而不是相对于 `prepare_data.py` 所在目录。
+因此应从项目根目录运行；例如 `--cache-tag Rh8x8_Closure` 会生成
+`.cache/Exp1_Rh8x8_Closure_train.pt`、`val.pt` 和 `test.pt` 等文件。
 
 exp2 每个留出折还包含 `out.pt`，并生成总 manifest：
 
@@ -115,10 +120,23 @@ python Experiment/prepare_data.py `
   --cache-tag Rh8x8_Closure `
   --objective-mode signed_closure `
   --closure-transform signed_asinh `
-  --closure-scale 1.0 `
+  --closure-scale auto `
   --exclude-raw-snapshot-index 0 `
   --oversample=false
 ```
+
+当 `--closure-scale auto` 时，每个实验（Exp2 则为每个 fold）独立执行：
+
+1. 完成 train/val/test 划分和可选的训练组平衡；
+2. 用临时的 `*_train.auto_scale_tmp.pt` 保存训练集；
+3. 只读取其中的 `closure_true_physical`，计算
+   `median(abs(closure_true_physical))`；
+4. 如果该中位数因至少一半样本严格为零而退化为 0，则回退到非零绝对值的中位数；
+5. 删除临时文件，用确定的尺度重新生成正式 train/val/test（以及 out）cache。
+
+如果训练闭合项全部为零，程序会停止并要求显式检查数据或指定尺度。最终数值会写入
+各 `.pt` 的 `learning_contract.closure_scale`、`norm.npz` 的 `closure_scale`，并在
+`metadata.json` 的 `closure_scale_selection` 中记录来源、方法和训练集统计量。
 
 生成 exp2 的某一个留出折：
 
@@ -137,7 +155,7 @@ python Experiment/prepare_data.py --help
 ## 8. 注意事项
 
 1. direct 与 closure 公平比较时必须使用同一 HDF 数据、通道、split manifest 和随机种子；
-2. `closure_scale` 不得使用验证集或测试集统计量；
+2. `closure_scale` 不得使用验证集或测试集统计量；推荐用 `auto` 避免手工先生成一次 cache；
 3. (R_h) cache 训练时必须关闭 FiLM；(R_m) 的活动 `log_mass_filter` 条件通常需要 FiLM；
 4. 旧 `8x16` mirror cache 只能作为 legacy 结果，不能与新的原生 `8x8` cache 直接比较；
 5. 训练前检查 metadata 中的 `target_units`、`operator_id`、`sample_uid` 和 `parent_hr_uid`。

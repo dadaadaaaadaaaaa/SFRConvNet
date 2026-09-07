@@ -110,7 +110,7 @@ canonical baseline 使用 `data_compatible` 模式；`paper_physical` 作为物�
 
 | 方法 | 关键参数与默认值 | 含义 |
 |---|---|---|
-| `load_data(folder_conf, ...)` | 以目录和组名为主 | 按确定性文件顺序读取一个运行的全部 snapshot |
+| `load_data(folder_conf, show_progress=False, ...)` | 以目录和组名为主 | 按确定性文件顺序读取全部 snapshot；`prepare_data.py` 默认开启进度显示 |
 | `select_input_channels(include=None, exclude=None)` | 两者默认 `None` | 显式保留或排除输入通道；不能同时使用含义冲突的列表 |
 | `drop_invalid(...)` | 见函数签名 | 删除 NaN/Inf 等无效样本；是否要求正 SFR 可配置 |
 | `exclude_raw_snapshot_indices(indices)` | 无默认索引 | 按原始 snapshot index 精确排除初始化输出 |
@@ -123,6 +123,11 @@ canonical baseline 使用 `data_compatible` 模式；`paper_physical` 作为物�
 `log_mass_filter` 只允许用于具有正有限 `mass_filter` 的完整 (R_m) 数据集。固定分辨率 (R_h) 不应伪造该量。
 
 ## 5. 命令行参数
+
+> 当前推荐把批处理拆成 `build_fine_from_raw.py` 与
+> `build_coarse_from_fine.py` 两步。`galaxy_data.py` 的旧一体化入口仍保留用于兼容，
+> 但反复尝试粗粒化参数时不应重复读取原始 HDFRA。新入口的完整说明分别见
+> `build_fine_from_raw.md` 和 `build_coarse_from_fine.md`。
 
 脚本主程序会按 `.config` 批量把原始 HDF4 转为 fine 和 coarse HDF5。
 

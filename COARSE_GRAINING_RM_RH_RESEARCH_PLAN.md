@@ -2143,7 +2143,7 @@ a_z=a_r\cos\theta-a_\theta\sin\theta,
 
 再守恒沉积 (m a_R,m a_z)，最后转回粗网格中心的球坐标基。这样避免 Rm 跨
 (\theta) 输运时直接平均可变基分量产生非物理结果。相应冷却功率和 (R/z) 引力总力
-已经加入守恒审计。
+已经加入守恒审计。.8
 
 ### 26.5 HDF、metadata 与 UID
 
@@ -2227,3 +2227,114 @@ snapshot 可按 `raw_snapshot_index=0` 精确排除，不需要删除晚期物�
 \(M_{\rm BH}=8.0365833177\)，其 bracket 为
 \([0.00159787288,0.00349827950]\,\mathrm{Gyr}\)。该 snapshot 的 Rh 8x8 产品满足
 \(Y=B+C\)，HDF5 round-trip 保留 `linear_interpolation_empty_window` provenance。
+
+---
+
+## 28. 2026-09-07：预处理入口拆分为 raw→fine 与 fine→coarse
+
+### 28.1 拆分目标与兼容策略
+
+原 `raw_data_processing/galaxy_data.py` 同一个主程序会在每次粗粒化实验中重复执行：
+
+```text
+HDFRA 读取 → 日志匹配 → fine 写出 → coarse 写出
+```
+
+这使改变 \(R_h\) 输出形状、\(R_m\) 质量尺度或核函数时仍要重新读取较慢的原始 HDF4。
+本轮保留 `galaxy_data.py` 的 `GalData/GalDataSet`、统一算子调度和旧一体化 CLI 兼容入口，
+新增两个推荐入口：
+
+```text
+raw_data_processing/build_fine_from_raw.py
+    raw HDFRA + Parquet log → format-v6 fine HDF5
+
+raw_data_processing/build_coarse_from_fine.py
+    format-v6 fine HDF5 → Rh / Rm-v0 / Rm-v1 coarse HDF5
+```
+
+两个脚本没有复制物理公式：raw 入口复用 `read_hdfra/set_coord/save_h5`，coarse 入口复用
+`load_h5/coarsen/save_h5`。因此 Data-Set 语义、Data-Set-15 体积、冷却率密度、加速度
+固定基沉积、SFR baseline、守恒审计和 metadata/UID 仍只有 `GalData` 与各粗粒化模块一套
+权威实现。
+
+`build_coarse_from_fine.py` 保持原有参数名和默认值：`--coarsener`、`--coarse-shape`、
+`--mass-filter`、`--kernel`、`--coarse-dirname`、`--initial-neighbors`、
+`--balance-*` 与 `--v1-*`。两个入口新增 `--snapshot-index` 和 `--max-snapshots`，用于不改
+正式默认行为的抽样 smoke test；另有 `--config-dir` 和 `--fine-dirname` 以支持隔离验证。
+
+### 28.2 新增的输入防线
+
+fine→coarse 在运行算子前会检查：
+
+1. metadata 必须为 complete，且 UID 可由 source/geometry/derivation 重新计算；
+2. `derivation.operator_id` 必须为 `identity_fine`，防止误做 coarse→coarse；
+3. 必须存在构造当前 LR MACER baseline 的密度、内能密度、冷却和径向加速度字段；
+4. canonical `sfr_target/sfr_macer_baseline/sfr_closure_true` 可读取；
+5. \(R_m\) 必须提供正 `mass_filter`，且核函数与 v0/v1 契约一致。
+
+另外修复了旧 HDF4 入口的 Windows 跨盘及中文路径问题。原实现无条件调用
+`os.path.relpath`，workspace 在 D:、RawData 在 E: 时会先抛 `ValueError`；中间版本改为
+跨盘时传绝对路径，又会因为 pyhdf 的 HDF4 C 库不能处理中文绝对路径而报
+`HDF4Error: Bad file name on open`。当前实现由 Python 临时进入源文件目录，只把 ASCII
+basename `hdfra.<index>` 交给 `SD()`，文件句柄打开后立即恢复原工作目录。集成测试同时
+覆盖了中文源目录和跨盘布局。
+
+### 28.3 文档
+
+新增：
+
+- `raw_data_processing/build_fine_from_raw.md`；
+- `raw_data_processing/build_coarse_from_fine.md`。
+
+两份文档分别记录职责边界、完整参数表、默认值、命令、输出结构、失败语义和训练衔接。
+`galaxy_data.md` 也已注明新两阶段入口；旧一体化命令仍存在，但不再推荐用于多参数粗粒化
+实验。
+
+### 28.4 小样本可靠性与训练接口验证
+
+自动集成测试用 2 个带正确 `long_name`、Data-Set-15、Data-Set-11、坐标和日志的最小
+HDF4 snapshot 实际执行 raw→fine。两个输出均能 HDF5 round-trip，形状为 \(4\times6\)，
+metadata operator 为 `identity_fine`，Data-Set-11 总 SFR 为 3，并满足 \(Y=B+C\)。
+
+另一组测试把 2 个完整 synthetic fine snapshot 经新 fine→coarse 入口降为 \(2\times3\)，
+随后依次通过：
+
+```text
+GalData.load_h5
+GalDataSet.load_data(require_complete_metadata=True)
+CachePt.to_pt(objective_mode="direct_sfr")
+CachePt.to_pt(objective_mode="signed_closure")
+GalPTDataset(direct_sfr / signed_closure)
+SFRConvNet + train.predict_batch
+```
+
+因此 metadata、inactive Rh conditioning、Y/B/C payload 和 `train.py` batch 接口相容。
+
+还对真实 `data/disk_galaxy_fiducial/fine/00000.h5` 与 `00001.h5` 运行新 CLI，生成 Rh
+\(8\times8\) 临时输出。与对同一 fine 对象直接调用原有 `GalData.coarsen()` 相比：
+
+- 所有 snapshot 字段最大绝对差为 0；
+- `sample_uid` 完全相同；
+- metadata 为 complete，operator 为 `spatial_block`；
+- `epsilon_conservation` 分别为 \(3.064\times10^{-16}\) 与
+  \(2.969\times10^{-16}\)；
+- 两个文件的 \(Y-(B+C)\) 均为 0。
+
+真实临时 coarse 数据继续生成 direct/closure 两种 PT 并由 `GalPTDataset` 加载，张量形状
+为 `(2, 13, 8, 8)`，Rh conditioning 均为 `none`。float32 cache 中
+\(Y-B-C\) 最大绝对舍入误差为 \(3.815\times10^{-6}\)，通过既有容差。验证结束后临时 HDF5
+和 PT 均已删除，没有生成正式 cache 或启动训练。
+
+本轮完整自动测试为 89 项全部通过。该结果验证的是入口拆分和接口等价性，不代替后续对
+全 snapshot、多输出分辨率和 \(R_m\) 参数组合的科学审计。
+
+### 28.5 后续推荐工作流
+
+1. 用 `build_fine_from_raw.py` 一次性重建并审计 format-v6 fine 数据；
+2. 固定一份 fine 数据版本和 source UID 后，用 `build_coarse_from_fine.py` 分别生成
+   Rh 8×8、16×16 及其他候选分辨率；
+3. 每种算子/网格/质量尺度使用独立 `coarse_dirname`，不在同目录静默混合；
+4. 先抽样检查守恒、\(Y=B+C\)、坐标一致性和极低 SFR，再批量生成；
+5. 对同一时间块划分分别构建 direct-SFR 与 signed-closure cache，确保比较只改变学习目标，
+   不改变样本集合和标准化统计量；
+6. \(R_m\) 继续单独使用 `log_mass_filter`/FiLM 契约，固定单分辨率 Rh 不启用 FiLM。
