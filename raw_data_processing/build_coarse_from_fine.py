@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from collections.abc import Iterable
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     from raw_data_processing.galaxy_data import GalData
@@ -23,6 +27,7 @@ except ModuleNotFoundError:  # 兼容从 raw_data_processing 目录直接运行�
 
 
 SUPPORTED_COARSENERS = (
+    "spatial_3d",
     "spatial_block",
     "axisymmetric_rm_v0",
     "axisymmetric_rm_v1",
@@ -161,7 +166,7 @@ def build_coarse_from_fine(
     config_dir: str | os.PathLike[str] = ".config",
     galaxies: Iterable[str] = (),
     coarsener: str = "spatial_block",
-    coarse_shape: tuple[int, int] = (8, 8),
+    coarse_shape: tuple[int, ...] | None = None,
     mass_filter: float | None = None,
     kernel: str | None = None,
     coarse_dirname: str | None = None,
@@ -175,10 +180,19 @@ def build_coarse_from_fine(
     v1_max_runtime_seconds: float = 60.0,
     v1_solver_max_iterations: int = 300,
     v1_polish_max_iterations: int = 500,
+    prediction_mode: str = "direct",
 ) -> list[Path]:
     """从 fine 目录构建 coarse 数据，并返回本次写出的文件路径。"""
 
-    coarse_shape = tuple(int(value) for value in coarse_shape)
+    if coarsener == "spatial_3d":
+        if mass_filter is not None or kernel is not None or initial_neighbors is not None:
+            raise ValueError("三维空间块算子不接受 R_m 参数。")
+        from raw_data_processing.build_snapshots_3d import build_coarse_3d
+        return build_coarse_3d(config_dir=config_dir,galaxies=galaxies,
+            shape=(32,16,32) if coarse_shape is None else coarse_shape,
+            mode=prediction_mode,fine_dirname=fine_dirname,coarse_dirname=coarse_dirname,
+            indices=snapshot_indices,max_snapshots=max_snapshots)
+    coarse_shape = tuple(int(value) for value in ((8,8) if coarse_shape is None else coarse_shape))
     validate_coarsening_options(
         coarsener=coarsener,
         coarse_shape=coarse_shape,
@@ -231,6 +245,10 @@ def build_coarse_from_fine(
     written: list[Path] = []
 
     for galaxy_name in galaxy_names:
+        if galaxy_name.startswith("dwarf_galaxy_"):
+            if selected:
+                raise ValueError("矮星系请指定 --coarsener spatial_3d。")
+            continue
         input_dir = data_dir / galaxy_name / fine_dirname
         if not input_dir.exists():
             print(f"[跳过] {galaxy_name}：找不到 fine 目录 {input_dir}")
@@ -274,12 +292,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--galaxy", action="append", default=[])
     parser.add_argument("--config-dir", default=".config")
     parser.add_argument("--fine-dirname", default="fine")
+    parser.add_argument("--prediction-mode", choices=("direct", "residual"), default="direct", help="三维 Direct/Residual；二维行为不变。")
     parser.add_argument("--snapshot-index", action="append", default=[], type=int)
     parser.add_argument("--max-snapshots", type=int, default=None)
     parser.add_argument("--coarsener", choices=SUPPORTED_COARSENERS, default="spatial_block")
     parser.add_argument(
-        "--coarse-shape", nargs=2, type=int, default=(8, 8),
-        metavar=("N_THETA", "N_R"),
+        "--coarse-shape", nargs="+", type=int, default=None,
+        metavar="N", help="二维默认 8 8；spatial_3d 默认 32 16 32，顺序 r theta phi。",
     )
     parser.add_argument("--mass-filter", type=float, default=None)
     parser.add_argument(
@@ -310,7 +329,8 @@ def main(argv: list[str] | None = None) -> int:
             config_dir=args.config_dir,
             galaxies=args.galaxy,
             coarsener=args.coarsener,
-            coarse_shape=tuple(args.coarse_shape),
+            coarse_shape=None if args.coarse_shape is None else tuple(args.coarse_shape),
+            prediction_mode=args.prediction_mode,
             mass_filter=args.mass_filter,
             kernel=args.kernel,
             coarse_dirname=args.coarse_dirname,

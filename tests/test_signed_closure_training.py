@@ -123,11 +123,19 @@ class SignedClosureCacheTests(unittest.TestCase):
                 "sfr_closure_true": np.asarray([-1.0, 2.0]),
             }
 
-            def standardize(self, mean=None, std=None):
+            def standardize(
+                self,
+                mean=None,
+                std=None,
+                log_transform_mask=None,
+                return_log_transform_mask=False,
+            ):
                 x = np.ones((2, 2, 4, 4), dtype=np.float32)
+                mask = np.ones(2, dtype=bool)
                 if mean is None:
-                    return x, np.zeros(2), np.ones(2)
-                return x
+                    result = (x, np.zeros(2), np.ones(2))
+                    return (*result, mask) if return_log_transform_mask else result
+                return (x, mask) if return_log_transform_mask else x
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.pt"

@@ -80,6 +80,14 @@ def main():
             "source_file_size_bytes": int(source_path.stat().st_size),
             "time": expected_time,
             "time_units": "Gyr",
+            "time_mapping": galaxy_config.get(
+                "time_mapping",
+                {
+                    "mode": "linear_index",
+                    "snapshot_dt": float(galaxy_config["snapshot_dt"]),
+                    "offset": float(galaxy_config.get("offset", 0.0)),
+                },
+            ),
             "metadata_upgrade_source": "processed_format_v4_with_Data-Set-15",
         }
     )

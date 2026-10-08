@@ -34,6 +34,9 @@ except ModuleNotFoundError:  # 仅解析参数和读取缓存时不强制依赖 
     SummaryWriter = None
 
 from Experiment.models import AccretionTransformer, SFRConvNet, MACNetRes_mbh, MACNetFiLM
+from Experiment.training_performance import make_training_loader
+from Experiment.geometry_contract import validate_geometry_contract, validate_geometry_ablation
+from raw_data_processing.geometry_features import SUPPORTED_GEOMETRY_INPUT_MODES
 
 
 MBH_CONDITIONED_MODELS = (MACNetRes_mbh, MACNetFiLM)
@@ -316,10 +319,13 @@ class GalPTDataset(Dataset):
         self.closure_scale = None
         self.conditioning_active = None
         self.conditioning_contract = None
+        payload_geometry_contract = None
+        payload_input_channels = ()
+        payload_log_transform_mask = None
         if isinstance(loaded, dict):
             schema = loaded.get("schema", {})
             schema_version = int(schema.get("version", -1))
-            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4, 5}:
+            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4, 5, 6}:
                 raise RuntimeError(
                     f"Unsupported cache schema in '{pt_path}': {schema!r}"
                 )
@@ -397,17 +403,25 @@ class GalPTDataset(Dataset):
                     f"Cache '{pt_path}' has identity arrays that do not match its sample count."
                 )
             contract = loaded.get("model_input_contract", {})
+            payload_geometry_contract = contract.get("geometry_inputs")
+            payload_input_channels = tuple(contract.get("input_channels", ()))
+            payload_log_transform_mask = loaded.get("preprocessing_contract", {}).get("log_transform_mask")
+            if schema_version == 6 and (
+                not isinstance(payload_geometry_contract, dict)
+                or payload_geometry_contract.get("mode") == "none"
+            ):
+                raise RuntimeError("Version-6 cache 必须明确声明活动几何输入。")
             if schema_version >= 5:
                 conditioning_contract = contract.get("conditioning")
                 if not isinstance(conditioning_contract, dict):
                     raise RuntimeError(
-                        f"Version-5 cache '{pt_path}' has no structured conditioning contract."
+                        f"Version-{schema_version} cache '{pt_path}' has no structured conditioning contract."
                     )
                 if conditioning_contract.get("name") != "none" or bool(
                     conditioning_contract.get("active", True)
                 ):
                     raise RuntimeError(
-                        "当前 version-5 固定 R_h cache 必须声明 inactive conditioning='none'."
+                        "当前固定 R_h cache 必须声明 inactive conditioning='none'."
                     )
                 if contract.get("resolution_features") != []:
                     raise RuntimeError(
@@ -556,7 +570,18 @@ class GalPTDataset(Dataset):
                 )
             if self.objective_mode == "signed_closure":
                 self.y = self.closure_true_transformed
-        self.input_channels = tuple(channel_metadata.get("input_channels", ()))
+        self.input_channels = tuple(channel_metadata.get("input_channels", payload_input_channels))
+        if payload_input_channels and self.input_channels != payload_input_channels:
+            raise RuntimeError("cache payload 与 sidecar 的输入通道不一致。")
+        sidecar_geometry = channel_metadata.get("geometry_input_contract")
+        if sidecar_geometry is not None and payload_geometry_contract is not None and sidecar_geometry != payload_geometry_contract:
+            raise RuntimeError("cache payload 与 sidecar 的几何输入契约不一致。")
+        self.geometry_input_contract = validate_geometry_contract(
+            payload_geometry_contract if payload_geometry_contract is not None else sidecar_geometry,
+            self.input_channels,
+            payload_log_transform_mask,
+        )
+        self.log_transform_mask = payload_log_transform_mask
         self.excluded_channels = tuple(channel_metadata.get("excluded_channels", ()))
         self.target_metadata = {
             key: channel_metadata[key]
@@ -626,12 +651,64 @@ class GalPTDataset(Dataset):
         return x, coord, self.conditioning_scalar[idx], self.y[idx], self.groups[idx], self.n_groups
 
 
-def _validate_leave_one_out_cache_contract(
-    cache_dir, data_exp, datasets, *, objective_mode="direct_sfr"
+def _validate_cache_split_contract(
+    cache_dir, data_exp, datasets, *, objective_mode="direct_sfr", validate_holdout=True
 ):
-    """Validate new Exp2 caches against both metadata and actual PT group labels."""
+    """用 metadata、实际 group 与 UID 验证 Exp2/Exp3 数据隔离。"""
     metadata = _load_cache_channel_metadata(os.path.join(cache_dir, data_exp + "train.pt"))
-    if metadata.get("split_strategy") != "leave_one_galaxy_out":
+    split_strategy = metadata.get("split_strategy")
+
+    if split_strategy == "random_snapshot_75_25_torus_test":
+        train_groups = set(metadata.get("train_groups", ()))
+        validation_groups = set(metadata.get("validation_groups", ()))
+        test_groups = set(metadata.get("test_groups", ()))
+        if not train_groups or validation_groups != train_groups:
+            raise RuntimeError(
+                "Invalid Exp3 metadata: train_groups 必须非空且与 validation_groups 相同。"
+            )
+        if len(test_groups) != 1 or train_groups.intersection(test_groups):
+            raise RuntimeError(
+                "Invalid Exp3 metadata: test_groups 必须是与 Zou train/val 不相交的单一组。"
+            )
+        expected_by_split = {
+            "train": train_groups,
+            "val": validation_groups,
+            "test": test_groups,
+        }
+        for split, dataset in datasets.items():
+            actual = set(dataset.group_names)
+            if actual != expected_by_split[split]:
+                raise RuntimeError(
+                    f"Exp3 {split}.pt groups={sorted(actual)}，"
+                    f"metadata 预期为 {sorted(expected_by_split[split])}。"
+                )
+        for identity_name in ("sample_uid", "parent_hr_uid"):
+            identity_sets = {}
+            for split, dataset in datasets.items():
+                values = np.asarray(getattr(dataset, identity_name), dtype=str)
+                if len(values) != len(dataset) or np.any(values == ""):
+                    raise RuntimeError(
+                        f"Exp3 {split}.pt 缺少完整 {identity_name}。"
+                    )
+                identity_sets[split] = set(values.tolist())
+            split_names = tuple(identity_sets)
+            for index, left in enumerate(split_names):
+                for right in split_names[index + 1:]:
+                    overlap = identity_sets[left].intersection(identity_sets[right])
+                    if overlap:
+                        raise RuntimeError(
+                            f"Exp3 {left}/{right} 的 {identity_name} 存在数据泄漏。"
+                        )
+        if validate_holdout:
+            print(
+                "[PASS] Exp3 cache contract verified: "
+                f"train/val={sorted(train_groups)}, test={sorted(test_groups)}"
+            )
+        else:
+            print("[PASS] Exp3 HPO train/val 分组与 UID 隔离已校验；test.pt 未加载。")
+        return metadata
+
+    if split_strategy != "leave_one_galaxy_out":
         return metadata
 
     train_groups = set(metadata.get("train_groups", ()))
@@ -660,6 +737,10 @@ def _validate_leave_one_out_cache_contract(
         raise RuntimeError(
             f"Leave-one-galaxy-out cache is incomplete: required held-out cache not found: {out_path}"
         )
+    if not validate_holdout:
+        # HPO 只检查 train/val 实际数据和元信息；正式训练仍完整检查留出集。
+        print("[PASS] HPO train/val 分组已校验；out.pt 内容留待正式评估校验。")
+        return metadata
     out_dataset = GalPTDataset(out_path, objective_mode=objective_mode)
     actual_out = set(out_dataset.group_names)
     if actual_out != held_out_groups:
@@ -688,6 +769,11 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
     parser.add_argument("--exp_name", type=str, default="Exp5_", help="Experiment name prefix used for saving results") # 这次做哪个实验
     parser.add_argument( # 从哪个实验的数据中加载.pt文件，默认和当前实验名相同
         "--data_exp", type=str, default=None, help="Experiment name prefix for loading data (default: same as exp_name)"
+    )
+    parser.add_argument(
+        "--expected_geometry_input_mode", "--expected-geometry-input-mode",
+        choices=SUPPORTED_GEOMETRY_INPUT_MODES, default=None,
+        help="检查 Exp3.1/Exp3.2 是否加载了对应的几何消融 cache。",
     )
 
     # ↓ 训练的超参数
@@ -720,8 +806,21 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
         "--persistent_workers", action="store_true", help="Keep dataloader workers persistent between epochs" # 是否在epoch之间保持数据加载器的子进程持续运行，启用后可以减少每个epoch开始时的启动开销，但会占用更多系统资源；通常在num_workers > 0且系统资源允许的情况下启用
     )
     parser.add_argument("--prefetch_factor", type=int, default=3, help="Prefetch factor for dataloader (per worker)") # 每个数据加载器子进程预取的批次数量，默认3表示每个子进程在当前批次处理时预取3个批次的数据，以提高数据加载效率；如果num_workers=0，则此参数被忽略
+    parser.add_argument("--batch_backend", choices=("standard", "tensor_cpu"),
+                        default="standard", help="常规 DataLoader / CPU 整批索引。后者要求无在线增强且 num_workers=0。")
+    parser.add_argument("--skip_model_graph", action="store_true",
+                        help="不追踪 TensorBoard 模型图，仍写 loss 等标量且保持原随机数消耗。")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility") # 随机种子，用于保证实验的可重现性
     parser.add_argument("--print_group_counts", action="store_true", help="Print per-group sample counts for loaders") # 打印每个组的样本数量，有助于检查数据分布是否平衡
+    parser.add_argument(
+        "--sampling_mode",
+        choices=("uniform", "run_time_balanced"),
+        default="uniform",
+        help=(
+            "训练集抽样方式。run_time_balanced 令每个运行的总抽样概率相同，"
+            "并在运行内部按相邻 snapshot 的物理时间区间加权；validation/test 始终顺序读取。"
+        ),
+    )
     
     # ↓ cpu/gpu相关的参数
     parser.add_argument( # 选择cpu还是cuda训练
@@ -824,6 +923,8 @@ def parse_args(argv=None) -> argparse.Namespace: # 能够输入哪些训练参�
     args = parser.parse_args(argv)
     if args.negative_sfr_weight < 0:
         parser.error("--negative_sfr_weight must be non-negative.")
+    if args.num_workers < 0:
+        parser.error("num_workers 不能为负数。")
     return args
 
 
@@ -878,6 +979,7 @@ def _apply_hpo_overrides(args: argparse.Namespace) -> argparse.Namespace: # 在�
         "weight_power": float,
         "weight_q_low": float,
         "weight_q_high": float,
+        "sampling_mode": str,
         "d_model": int,
         "n_layers": int,
         "n_heads": int,
@@ -1143,9 +1245,7 @@ def train_one_epoch(
     negative_sfr_weight=0.0,
 ):
     model.train()
-    # 只在 epoch 结束时读取 CUDA 标量；detach 防止统计持有反向计算图。
-    total = torch.zeros((), dtype=torch.float64, device=device)
-    n = 0
+    total, n = 0.0, 0
     for batch in loader: # Batch 第3项是 cache 声明的分辨率条件 log10(M_filter)。
         x, coord, conditioning_scalar, y, baseline, target_physical, groups, _ = _move_batch(
             batch, device, objective_mode
@@ -1201,9 +1301,9 @@ def train_one_epoch(
                 scheduler.step()
 
         bs = y.size(0)  # 当前批次的样本数量
-        total.add_(loss.detach().to(torch.float64) * bs)
+        total += loss.detach().item() * bs # 累积加权损失总和，乘以批次大小以获得当前批次的总损失
         n += bs
-    return total.item() / max(1, n)
+    return total / max(1, n) # 返回当前轮次的平均加权损失
 
 
 '''
@@ -1399,7 +1499,17 @@ def eval_epoch(
 # =============================================
 # 4) Main
 # =============================================
-def main(args=None):
+def main(args=None, *, dataset_cache=None):
+    """管理本次训练的日志资源；包括 OOM、cache 异常和用户中断路径。"""
+    writers = []
+    try:
+        return _train_main(args, dataset_cache=dataset_cache, writers=writers)
+    finally:
+        for writer in writers:
+            writer.close()
+
+
+def _train_main(args=None, *, dataset_cache=None, writers):
     if args is None:
         args = parse_args()
     args = _apply_hpo_overrides(args) # 取命令行参数，并允许 HPO（自动化调参）覆盖手写参数。
@@ -1426,6 +1536,7 @@ def main(args=None):
     if SummaryWriter is None:
         raise ImportError("启动训练需要安装 tensorboard；仅导入训练工具时不要求该依赖。")
     writer = SummaryWriter(log_dir=log_dir)
+    writers.append(writer)
     print(f"TensorBoard logs will be saved to: {log_dir}")
 
     # Datasets / Loaders
@@ -1441,39 +1552,45 @@ def main(args=None):
             p_rot=args.sfr_aug_prob,
         )
 
-    train_ds = GalPTDataset(
-        os.path.join(cache_dir, data_exp + "train.pt"),
-        augmentor=train_augmentor,
-        objective_mode=args.objective_mode,
-    ) # 训练集
-    val_ds = GalPTDataset(
-        os.path.join(cache_dir, data_exp + "val.pt"), objective_mode=args.objective_mode
-    ) # 验证集
-    test_ds = GalPTDataset(
-        os.path.join(cache_dir, data_exp + "test.pt"), objective_mode=args.objective_mode
-    ) # 测试集
-    cache_split_metadata = _validate_leave_one_out_cache_contract(
+    def load_split(split):
+        path = os.path.join(cache_dir, data_exp + split + ".pt")
+        options = dict(objective_mode=args.objective_mode,
+                       augmentor=train_augmentor if split == "train" else None)
+        if dataset_cache is not None:
+            return dataset_cache.load(GalPTDataset, path, **options)
+        return GalPTDataset(path, **options)
+
+    # HPO 不反序列化 test.pt，不让测试集进入逐 trial 的计算过程。
+    datasets = {split: load_split(split) for split in
+                (("train", "val") if args.skip_test else ("train", "val", "test"))}
+    train_ds, val_ds = datasets["train"], datasets["val"]
+    cache_split_metadata = _validate_cache_split_contract(
         cache_dir,
         data_exp,
-        {"train": train_ds, "val": val_ds, "test": test_ds},
+        datasets,
         objective_mode=args.objective_mode,
+        validate_holdout=not args.skip_test,
     )
 
-    channel_counts = {int(ds.x.shape[1]) for ds in (train_ds, val_ds, test_ds)}
+    channel_counts = {int(ds.x.shape[1]) for ds in datasets.values()}
     if len(channel_counts) != 1:
         raise RuntimeError(f"Train/validation/test caches have inconsistent channel counts: {channel_counts}")
     known_channel_sets = {
-        ds.input_channels for ds in (train_ds, val_ds, test_ds) if ds.input_channels
+        ds.input_channels for ds in datasets.values() if ds.input_channels
     }
     if len(known_channel_sets) > 1:
         raise RuntimeError(f"Train/validation/test caches have inconsistent channel metadata: {known_channel_sets}")
-    target_metadata_present = [ds.target_metadata for ds in (train_ds, val_ds, test_ds) if ds.target_metadata]
+    geometry_contract = validate_geometry_ablation(
+        datasets, getattr(args, "expected_geometry_input_mode", None)
+    )
+    print(f"Geometry input contract: {geometry_contract}")
+    target_metadata_present = [ds.target_metadata for ds in datasets.values() if ds.target_metadata]
     known_target_metadata = {
         json.dumps(ds.target_metadata, sort_keys=True)
-        for ds in (train_ds, val_ds, test_ds)
+        for ds in datasets.values()
         if ds.target_metadata
     }
-    if target_metadata_present and (len(target_metadata_present) != 3 or len(known_target_metadata) != 1):
+    if target_metadata_present and (len(target_metadata_present) != len(datasets) or len(known_target_metadata) != 1):
         raise RuntimeError(
             "Train/validation/test caches are missing target metadata or use inconsistent target semantics. "
             f"Found: {known_target_metadata}"
@@ -1484,7 +1601,7 @@ def main(args=None):
             f"got {train_ds.target_metadata.get('target_quantity')!r}."
         )
     conditioning_variables = {
-        ds.conditioning_variable for ds in (train_ds, val_ds, test_ds)
+        ds.conditioning_variable for ds in datasets.values()
     }
     if len(conditioning_variables) != 1:
         raise RuntimeError(
@@ -1494,7 +1611,7 @@ def main(args=None):
     conditioning_variable = next(iter(conditioning_variables))
     conditioning_contracts = {
         json.dumps(ds.conditioning_contract, sort_keys=True)
-        for ds in (train_ds, val_ds, test_ds)
+        for ds in datasets.values()
     }
     if len(conditioning_contracts) != 1:
         raise RuntimeError(
@@ -1530,7 +1647,7 @@ def main(args=None):
     if args.objective_mode == "signed_closure":
         closure_contracts = {
             (ds.closure_transform, ds.closure_scale)
-            for ds in (train_ds, val_ds, test_ds)
+            for ds in datasets.values()
         }
         if len(closure_contracts) != 1:
             raise RuntimeError(
@@ -1559,21 +1676,22 @@ def main(args=None):
         q_high=args.weight_q_high,
     )
 
-    common = dict(batch_size=args.batch_size, pin_memory=(device.type == "cuda"), drop_last=False)
-    dl_extra = {}
-    if args.num_workers > 0: # 调用cpu准备数据
-        # On Windows, persistent_workers=True is highly recommended to avoid repeated spawning
-        pw = args.persistent_workers or (os.name == "nt")
-        dl_extra.update(dict(persistent_workers=pw, prefetch_factor=max(1, args.prefetch_factor)))
-
-    train_loader = DataLoader(train_ds, shuffle=True, num_workers=max(0, args.num_workers // 2), **common, **dl_extra)
-    val_loader = DataLoader(val_ds, shuffle=False, num_workers=max(0, args.num_workers // 2), **common, **dl_extra)
-    test_loader = DataLoader(test_ds, shuffle=False, num_workers=max(0, args.num_workers // 2), **common, **dl_extra)
+    loaders = {split: make_training_loader(ds, args, device, shuffle=split == "train")
+               for split, ds in datasets.items()}
+    train_loader, val_loader = loaders["train"], loaders["val"]
+    test_loader = loaders.get("test")
+    print(f"Data path: {getattr(args, 'batch_backend', 'standard')}; "
+          f"workers={args.num_workers}; CPU threads={torch.get_num_threads()}")
+    print(
+        "Training sampling: "
+        f"{args.sampling_mode}; validation/test are not resampled"
+    )
 
     if args.print_group_counts:
         print_group_counts(train_loader, "train", objective_mode=args.objective_mode)
         print_group_counts(val_loader, "val", objective_mode=args.objective_mode)
-        print_group_counts(test_loader, "test", objective_mode=args.objective_mode)
+        if test_loader is not None:
+            print_group_counts(test_loader, "test", objective_mode=args.objective_mode)
 
     # Model 根据指令调用model，发射到GPU上
     c_in = train_ds.x.shape[1]
@@ -1622,7 +1740,10 @@ def main(args=None):
             temp_loader = DataLoader(train_ds, batch_size=2, shuffle=True, num_workers=0)
             sample_batch = next(iter(temp_loader))
             sample_x, sample_coord, sample_conditioning_scalar = sample_batch[:3]
-            if isinstance(model, MBH_CONDITIONED_MODELS):
+            if getattr(args, "skip_model_graph", False):
+                # 保留上面 seed 和取样步骤，避免开关模型图时改变训练样本顺序。
+                pass
+            elif isinstance(model, MBH_CONDITIONED_MODELS):
                 writer.add_graph(model, (sample_x.to(device), sample_conditioning_scalar.view(-1).to(device)))
             elif isinstance(model, SFRConvNet):
                 writer.add_graph(
@@ -1696,6 +1817,7 @@ def main(args=None):
                 "run_stamp": run_stamp,
                 "n_input_channels": int(train_ds.x.shape[1]),
                 "input_channels": list(train_ds.input_channels),
+                "geometry_input_contract": geometry_contract,
                 "excluded_channels": list(train_ds.excluded_channels),
                 "target_metadata": train_ds.target_metadata,
                 "conditioning_variable": conditioning_variable,
@@ -1781,6 +1903,7 @@ def main(args=None):
                         "epoch": epoch,
                         "n_input_channels": int(train_ds.x.shape[1]),
                         "input_channels": list(train_ds.input_channels),
+                        "geometry_input_contract": geometry_contract,
                         "excluded_channels": list(train_ds.excluded_channels),
                         "target_metadata": train_ds.target_metadata,
                         "conditioning_variable": conditioning_variable,
@@ -1800,7 +1923,6 @@ def main(args=None):
                 break
 
     if args.skip_test:
-        writer.close()
         if best_val == float("inf"):
             print("No finite validation improvement was found during training.")
             return float("inf")
@@ -1820,7 +1942,6 @@ def main(args=None):
 
     if not has_best:
         print("No improvement was found during training. Best model not saved (or not found).")
-        writer.close()
         return float("inf")
 
     print(f"Best val metric loss: {best_val:.6f}. Loading best and testing.")
@@ -1828,7 +1949,8 @@ def main(args=None):
     if args.no_save:
         model.load_state_dict(best_model_state)
     else:
-        ckpt = torch.load(best_path, map_location=device)
+        # 正式 checkpoint 只包含 tensor state_dict 与基础标量/容器，使用受限加载器即可。
+        ckpt = torch.load(best_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model"])
 
     test_metric, group_means = eval_epoch(
@@ -1847,7 +1969,6 @@ def main(args=None):
     if not args.no_save:
         print(f"Best model saved to: {best_path}")
 
-    writer.close()
     return best_val
 
 

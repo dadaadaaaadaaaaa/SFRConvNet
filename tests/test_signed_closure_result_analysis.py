@@ -70,6 +70,8 @@ class SignedClosureResultAnalysisTests(unittest.TestCase):
             closure_true_physical=closure_true,
             time=np.asarray([0.0, 1.0]),
             group_names=np.asarray(["a", "a"]),
+            sample_uid=np.asarray(["sample:0", "sample:1"]),
+            parent_hr_uid=np.asarray(["hr:0", "hr:1"]),
         )
 
     def test_prediction_explicitly_composes_baseline_and_closure(self):
@@ -124,6 +126,33 @@ class SignedClosureResultAnalysisTests(unittest.TestCase):
                 self.assertIn("sfr_macer_baseline", handle)
                 self.assertIn("sfr_ks_baseline", handle)
                 self.assertIn("closure_pred_physical", handle)
+
+    def test_prediction_propagates_identity_and_compact_h5_omits_inputs(self):
+        dataset = self._dataset([2.0, -3.0])
+        frame = analysis_utils.predict_dataset(
+            dataset,
+            _ClosureEchoModel(),
+            torch.device("cpu"),
+            "convnet",
+            batch_size=2,
+        )
+        self.assertEqual(frame["sample_uid"].tolist(), ["sample:0", "sample:1"])
+        self.assertEqual(frame["parent_hr_uid"].tolist(), ["hr:0", "hr:1"])
+        frame["split"] = "test"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "compact_prediction.h5"
+            analysis_utils.save_to_h5(
+                path, frame, feats=None, x_data=None, ds_type="test_cached"
+            )
+            import h5py
+
+            with h5py.File(path, "r") as handle:
+                self.assertNotIn("x", handle)
+                self.assertNotIn("latent", handle)
+                self.assertIn("sample_uid", handle)
+                self.assertIn("parent_hr_uid", handle)
+                self.assertIn("split", handle)
 
     def test_macer_code_sfr_integration_factor(self):
         dataset = self._dataset([2.0, -3.0])

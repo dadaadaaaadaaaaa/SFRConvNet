@@ -1,5 +1,19 @@
 # `build_coarse_from_fine.py` 使用说明
 
+## MACER3D 空间降采样（2026-09-10 新增）
+
+```powershell
+python raw_data_processing/build_coarse_from_fine.py --galaxy dwarf_galaxy_fullFB_inflow --coarsener spatial_3d --prediction-mode residual --fine-dirname fine_residual
+python raw_data_processing/build_coarse_from_fine.py --galaxy dwarf_galaxy_fullFB_inflow --coarsener spatial_3d --prediction-mode direct --fine-dirname fine_residual --coarse-shape 16 16 32
+```
+
+三维默认 shape 为 `(32,16,32)`，参数顺序是 `r theta phi`。每个维度必须整除 fine 对应维度。
+输出默认位于 `data/<galaxy>/coarse_spatial3d_<shape>_<mode>/`，可用 `--coarse-dirname` 指定单层目录名。
+Residual fine 可以生成 Direct 或 Residual coarse；Direct fine 缺少冷却和引力，不能生成 Residual coarse。
+三维默认 `--prediction-mode direct`，如要输出 baseline 与 closure 必须显式指定 `residual`。
+本入口名为 `build_coarse_from_fine.py`，没有单独的 `build_raw_from_fine.py`。
+二维仍默认 `8 8`，原空间及质量粗粒化行为保留；以下章节描述二维契约。
+
 ## 1. 功能与边界
 
 `build_coarse_from_fine.py` 从已经生成的 processed fine HDF5 构建 coarse 数据：
@@ -174,3 +188,7 @@ resolution FiLM。\(R_m\) 保持 `log10(mass_filter)` 条件语义并要求相�
 6. \(Y=B+C^{\rm true}\) 在浮点容差内成立；
 7. 同目录所有文件坐标网格与 processing signature 一致；
 8. direct-SFR 与 signed-closure 两种 CachePT/GalPTDataset 都能加载。
+
+三维 `fine→coarse` 已经完整读取 fine 数组，因此 provenance 默认记录文件名、大小和
+纳秒修改时间，不再为每个大型 fine HDF5 额外计算一次全文件 SHA-256。物理产品身份
+仍由 fine 的 `sample_uid`、算子参数和输出几何共同确定。

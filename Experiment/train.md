@@ -58,6 +58,21 @@ signed closure 模式下网络输出 (\widehat C) 的变换值，训练代码执
 | `--no_amp` | 关闭 | 开启后禁用自动混合精度 |
 | `--cudnn_benchmark` | 关闭 | 开启 cuDNN benchmark；固定输入尺寸时可能加速 |
 | `--print_group_counts` | 关闭 | 打印各数据集合分组计数 |
+| `--sampling_mode` | `uniform` | `uniform` 或 `run_time_balanced`；后者仅重采样训练集，使运行等权、运行内按物理时间间隔加权 |
+| `--batch_backend` | `standard` | `standard` 为 DataLoader；`tensor_cpu` 为 CPU 整批索引，要求 `--num_workers 0` 且无在线增强 |
+| `--skip_model_graph` | 关闭 | 跳过 TensorBoard 模型图追踪，仍记录标量，并保持原有图取样的 RNG 消耗 |
+
+自 2026-09-08 起，`num_workers` 表示实际 worker 数，不再隐式除以二。
+`--skip_test` 不仅跳过末尾测试，还不加载 `test.pt`；正式训练不应使用该开关。
+Exp2 的 HPO 只校验 train/val 实际分组、metadata 和 out 文件存在性；正式训练仍完整校验 out 数据分组。
+新 Exp3 会根据 metadata 校验 train/validation 只含同一组 Zou 运行、test 只含一个独立
+torus 运行，并检查三个 split 的 `sample_uid` 和 `parent_hr_uid` 互斥。HPO 不加载
+`test.pt`，但仍校验 train/validation 的组与 UID；正式训练再完整校验 torus test。
+无论正常结束、cache 异常、OOM 还是中断，日志 writer 都会关闭。
+
+正式单次训练可在原命令追加 `--batch_backend tensor_cpu --num_workers 0 --skip_model_graph`。
+`run_train.py` 的 JSON 配方可填写同名 `batch_backend`、`num_workers`、`skip_model_graph` 字段，
+不需要更换模型或重新生成 PT。启用在线增强时必须保留 `standard`，不能静默跳过增强。
 
 ## 5. 损失和样本权重
 
@@ -161,3 +176,17 @@ closure checkpoint 会额外记录 `objective_mode`、`closure_transform`、`clo
 3. 分别报告 baseline (B)、direct 预测和 (B+\widehat C)；
 4. 不要用旧 mirror cache 的结果作为正式 matched direct 对照；
 5. 目前随机 snapshot split 仍有时间泄漏风险，不能据此声称时间外推能力。
+
+## 11. Exp3.1 / Exp3.2 几何输入消融
+
+几何通道已经包含于 cache 的 `x`，模型继续使用原相对 Fourier 编码，不修改
+`SFRConvNet.forward`。训练支持 cache schema 6，并核验 payload/sidecar 通道、
+固定 kpc 参考尺度、禁止重复 `log1p`、各 split 的几何契约和消融模式。
+
+新增 `--expected_geometry_input_mode {none,absolute_radius,absolute_radius_widths}`
+（也接受横线形式）；该参数只检查 cache，不在训练时临时生成或替换输入。
+`run_train.py` 的 `exp3.1` / `exp3.2` 别名自动传递预期模式，误用原 Exp3 cache 会停止。
+checkpoint 和 `hyperparameters.json` 都保存 `geometry_input_contract`。
+
+完整数据前提、Direct/Closure 配方及 Windows/Linux 命令见
+[exp3_geometry_ablations.md](exp3_geometry_ablations.md)。

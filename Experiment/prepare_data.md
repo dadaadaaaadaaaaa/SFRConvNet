@@ -7,7 +7,7 @@
 1. 加载多个盘星系运行；
 2. 检查目标语义、粗粒化算子和输入通道；
 3. 排除初始化 snapshot、NaN/Inf 和可选的零 SFR；
-4. 完成数据划分和训练组过采样；
+4. 完成数据划分，并按实验契约决定训练期是否过采样；
 5. 只用训练集计算通道均值与标准差；
 6. 保存 direct-SFR 或 signed-closure 监督量；
 7. 保存通道、单位、目标变换、条件变量、UID 和 split metadata。
@@ -47,10 +47,19 @@ C_\alpha^{\rm true}=Y_\alpha-B_\alpha.
 |---|---|
 | `exp1` | 盘星系组内随机 snapshot 60/20/20 参考划分 |
 | `exp2` | 对所有可用盘星系逐一执行 leave-one-galaxy-out；每折保存 train/val/test/out |
-| `exp3` | 删除 `disk_galaxy_low` 后做随机 snapshot 划分 |
+| `exp3` | 五组 Zou 盘星系按运行分层后随机做 75% train / 25% validation；`torus_100yr` 是唯一 test-only 域 |
 | `exp4` | 旧版单星系留出：将第三个可用的非 low 运行作为 out；新研究优先使用 exp2 |
+| `exp8` | 原 exp3：删除 `disk_galaxy_low` 后做随机 snapshot 60/20/20 划分 |
 
-重要限制：exp1/exp3 和 exp2 折内的 train/val/test 仍是随机 snapshot 划分，相邻时间帧可能泄漏。正式时间泛化结论应另行实现 time-block/run-block split。
+Exp3 的五个 Zou 运行固定为 `fiducial`、`fiducial_4`、`fiducial_7`、
+`model_0_75`、`model_1_1`。配置中标记 `role=test_only` 的 torus 不会进入其他盘星系
+实验的默认训练路径。Exp3 不在 CachePT 中复制少样本运行；训练时应使用
+`run_time_balanced` sampler，使每个运行总抽样权重相同，并在运行内部按 snapshot 所代表的
+物理时间区间加权。validation 和 torus test 都不重采样。
+
+重要限制：exp1/exp8、exp2 折内划分以及当前 exp3 的 Zou train/validation 划分仍采用随机
+snapshot。相邻时间帧可能跨 split，因此当前 Exp3 的 validation 不是严格的时间外推验证；
+这是本轮明确保留的实验选择。
 
 ## 5. 命令行参数
 
@@ -69,7 +78,7 @@ C_\alpha^{\rm true}=Y_\alpha-B_\alpha.
 | `--exclude-raw-snapshot-index` | 空 | 精确排除原始 snapshot index；可重复，例如初始化帧 `0` |
 | `--seed` | `42` | 划分及抽样随机种子 |
 | `--only-exp1` | 关闭 | 旧兼容别名，只生成 exp1 |
-| `--experiments` | `exp1 exp2 exp3 exp4` | 一次选择一个或多个实验 |
+| `--experiments` | `exp1 exp2 exp3 exp4 exp8` | 一次选择一个或多个实验 |
 | `--experiment` | 空 | 可重复的单数形式 |
 | `--held-out-galaxy` | 全部可用组 | 只生成指定 exp2 留出折；可用昵称或完整组名，可重复 |
 | `--oversample` | `true` | `true/false`；是否对训练组过采样平衡 |
@@ -96,6 +105,10 @@ exp2 每个留出折还包含 `out.pt`，并生成总 manifest：
 ```text
 .cache/Exp2_<tag>_folds.json
 ```
+
+Exp3 输出仍是 `train.pt`、`val.pt`、`test.pt`：前两者只含五组 Zou 数据，`test.pt`
+只含 torus。归一化均值、标准差、输入通道的 `log1p` 掩码及可选 closure scale 都只由
+train split 确定；torus 不参与这些统计量。
 
 ## 7. 执行命令
 
@@ -146,6 +159,22 @@ python Experiment/prepare_data.py `
   --held-out-galaxy fiducial_4
 ```
 
+生成本轮 12×20 Exp3 cache：
+
+```powershell
+python Experiment/prepare_data.py `
+  --experiments exp3 `
+  --resolution-dirname coarse_rh_12x20_sfr_v6 `
+  --cache-tag InstantSFR_NoInitialStellarDensity `
+  --objective-mode direct_sfr `
+  --oversample=false
+```
+
+该命令要求五组 Zou 和 torus 的相同 resolution 目录均已生成；缺少任何一组都会停止，
+不会自动缩减训练域或用别的运行代替。torus 的 11 个坏帧应在 `raw → fine` 阶段通过
+`build_fine_from_raw.py --exclude-snapshot ...` 排除，而不是把同一个
+`--exclude-raw-snapshot-index` 清单施加到所有六个运行。
+
 查看参数：
 
 ```powershell
@@ -159,3 +188,27 @@ python Experiment/prepare_data.py --help
 3. (R_h) cache 训练时必须关闭 FiLM；(R_m) 的活动 `log_mass_filter` 条件通常需要 FiLM；
 4. 旧 `8x16` mirror cache 只能作为 legacy 结果，不能与新的原生 `8x8` cache 直接比较；
 5. 训练前检查 metadata 中的 `target_units`、`operator_id`、`sample_uid` 和 `parent_hr_uid`。
+6. Exp3 会同时检查 group allowlist、输入通道、target metadata、`sample_uid` 与
+   `parent_hr_uid` 的 split 互斥；任何不一致都会停止写 cache。
+
+## 9. Exp3.1 / Exp3.2 的显式物理尺度通道
+
+新增 `--geometry-input-mode`，默认 `none` 保持原输入：
+
+| 模式 | 追加到 x 的通道 | 对应实验 |
+|---|---|---|
+| `absolute_radius` | `log10_radius_kpc` | Exp3.1 |
+| `absolute_radius_widths` | 上述通道及 `log10_radial_width_kpc`、`log10_polar_arc_width_kpc` | Exp3.2 |
+
+公式分别是 `log10(r/(1 kpc))`、`log10(Δr/(1 kpc))`、
+`log10(rΔtheta/(1 kpc))`。读取 processed HDF5 的坐标中心和保存边界；不按
+索引估算宽度，不覆盖 Data-Set-15 的权威体积。几何通道已取 log10，只做训练集
+均值/标准差标准化，不再做 log1p，不在每帧重新 min-max。torus 复用训练统计。
+
+新增输入使用独立 cache schema 6；旧 R_h schema 5 和 R_m schema 3/4 不变。
+PT、metadata JSON、norm NPZ 保存几何公式、单位、通道及训练统计来源；新几何 cache
+拒绝覆盖现有产物。必须指定独立 `--cache-tag`，不支持把几何消融用于 R_m FiLM。
+
+仍使用 `--experiments exp3` 的 75/25 Zou 划分和 torus test-only 契约；训练阶段用
+`run_train.py --experiments exp3.1` 或 `exp3.2`。完整命令见
+[exp3_geometry_ablations.md](exp3_geometry_ablations.md)。

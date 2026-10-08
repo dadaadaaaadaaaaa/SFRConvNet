@@ -175,3 +175,14 @@ python -m py_compile Experiment/models.py
 # 正式训练
 python Experiment/train.py --model_type convnet
 ```
+
+## 6. Exp3.1 / Exp3.2 的输入扩展
+
+两项消融不修改本文件的 Fourier 实现、池化或标量输出头。几何通道由 CachePT
+构建阶段追加到 `x`，模型的 `c_in` 自动从 cache 获取：Exp3.1 增加 1 个通道，
+Exp3.2 增加 3 个通道。第一层卷积输入参数相应增加，其余结构及本路线超参数不变。
+这不是参数量完全相同的对照，也不是改成逐格 SFR 显式积分。
+
+它表达的是固定单位下的半径和方向性几何尺度，不复用 R_m 的 `log_mass_filter`
+FiLM，不代表普通卷积已经改成固定物理长度卷积。入口、契约与限制见
+[exp3_geometry_ablations.md](exp3_geometry_ablations.md)。

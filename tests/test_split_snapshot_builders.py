@@ -11,8 +11,16 @@ from pathlib import Path
 import numpy as np
 
 from raw_data_processing.build_coarse_from_fine import build_coarse_from_fine
-from raw_data_processing.build_fine_from_raw import build_fine_from_raw
-from raw_data_processing.galaxy_data import GalData, GalDataSet
+from raw_data_processing.build_fine_from_raw import (
+    _select_snapshot_rows,
+    build_fine_from_raw,
+)
+from raw_data_processing.galaxy_data import (
+    GalData,
+    GalDataSet,
+    _build_snapshot_schedule,
+    _validate_macer_snapshot_time,
+)
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -196,6 +204,81 @@ class CoarseBuilderContractTests(unittest.TestCase):
 
 
 class RawBuilderIntegrationTests(unittest.TestCase):
+    def test_hdf_time_guard_uses_printed_precision_and_rejects_mismatch(self):
+        class FakeDataset:
+            @staticmethod
+            def attributes():
+                return {"long_name": "SFR (M/yr) AT TIME=6.20E-01"}
+
+        class FakeHandle:
+            @staticmethod
+            def select(name):
+                self = name
+                return FakeDataset()
+
+        _validate_macer_snapshot_time(FakeHandle(), 0.6204)
+        with self.assertRaisesRegex(ValueError, "日志"):
+            _validate_macer_snapshot_time(FakeHandle(), 0.0575)
+
+    def test_segmented_restart_absolute_time_mapping(self):
+        names = [
+            "hdfra.00000",
+            "hdfra.00001",
+            "hdfra.00999",
+            "hdfra.01000",
+            "hdfra.01998",
+            "hdfra.01999",
+        ]
+        times, indices = _build_snapshot_schedule(
+            names,
+            {
+                "mode": "filename_index",
+                "snapshot_dt": 0.00125,
+                "range": [0, 9541],
+                "offset": 0,
+                "time_mapping": {
+                    "mode": "segmented_restart_absolute",
+                    "index_zero_time": 0.0,
+                    "positive_index_offset": 0.5625,
+                    "segment_cycle_size": 999,
+                    "extra_time_steps_per_segment": 1,
+                },
+            },
+        )
+        np.testing.assert_array_equal(indices, [0, 1, 999, 1000, 1998, 1999])
+        np.testing.assert_allclose(
+            times,
+            [0.0, 0.56375, 1.81125, 1.81375, 3.06125, 3.06375],
+            rtol=0.0,
+            atol=1e-14,
+        )
+
+    def test_explicit_exclusions_replace_default_stability_selection(self):
+        rows = [
+            (index, f"hdfra.{index:03d}", index * 1.0e-7, index)
+            for index in range(50)
+        ]
+        selected = _select_snapshot_rows(
+            rows,
+            requested_indices=set(),
+            excluded_indices={2, 7, 49},
+            max_snapshots=None,
+        )
+        self.assertEqual([row[3] for row in selected[:3]], [0, 1, 3])
+        self.assertNotIn(2, {row[3] for row in selected})
+        self.assertNotIn(7, {row[3] for row in selected})
+        self.assertNotIn(49, {row[3] for row in selected})
+
+    def test_requested_and_excluded_snapshot_cannot_overlap(self):
+        rows = [(0, "hdfra.000", 0.0, 0)]
+        with self.assertRaisesRegex(ValueError, "同时"):
+            _select_snapshot_rows(
+                rows,
+                requested_indices={0},
+                excluded_indices={0},
+                max_snapshots=None,
+            )
+
     def test_raw_hdf4_to_fine_for_two_snapshots(self):
         try:
             import pandas as pd
@@ -249,7 +332,9 @@ class RawBuilderIntegrationTests(unittest.TestCase):
                         dataset = handle.create(name, SDC.FLOAT64, shape)
                         dataset[:] = np.asarray(values, dtype=np.float64)
                         if name in labels:
-                            dataset.long_name = labels[name]
+                            dataset.long_name = (
+                                f"{labels[name]} AT TIME={index * 0.01:.2E}"
+                            )
                         dataset.endaccess()
                     radial = handle.create("fakeDim2", SDC.FLOAT64, (6,))
                     radial[:] = np.geomspace(0.5, 4.0, 6)
@@ -272,6 +357,7 @@ class RawBuilderIntegrationTests(unittest.TestCase):
             outputs = build_fine_from_raw(
                 config_dir=config_dir,
                 galaxies=("disk_galaxy_fiducial",),
+                exclude_snapshot_indices=(999,),
                 max_snapshots=2,
             )
             self.assertEqual(len(outputs), 2)

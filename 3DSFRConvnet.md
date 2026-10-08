@@ -487,10 +487,11 @@ $$
 \frac{\partial\Phi}{\partial r}=-a_r=|\mathrm{grav}|.
 $$
 
-解析重建仍缺少 `ratio_gs` 的定义/数值，以及每个 snapshot 应使用的
-`M_BH(t)`。直接读取专用 `grav` 文件可以绕过其余三项的重复计算，但还需要
-原作者确认该场是否允许对所有时间复用，以及其中黑洞项采用的是初始还是
-随时间变化的黑洞质量。
+2026-09-10：用户转述作者确认专用 `grav` 为静态场，可跨时间复用。
+当前离线算子直接读取该场，并逐轴核对目标 snapshot 的中心和边界。
+解析重建仍缺少 `ratio_gs`，但不再阻塞该读取路径。
+注意：多 snapshot 的局部 SFR 残差显示，恒星形成模块可能另有随时间变化的
+中心质量贡献；这与背景场静态是否矛盾，需要作者说明，见第 18 节。
 
 Direct-SFR 降采样和训练不需要 `grav`，因此这些问题不阻塞本轮 Direct 数据
 生成；它们只阻塞后续严格 residual/closure baseline。
@@ -531,7 +532,8 @@ Direct-SFR 降采样和训练不需要 `grav`，因此这些问题不阻塞本�
 - 论文是否省略了该因子；
 - `rhodotsf` 实际由哪一种实现产生。
 
-在得到确认前，不能把现有二维 operator 直接复用为“严格的 MACER3D baseline”。
+2026-09-10：独立三维算子的未降采样验证强烈支持带 `2pi` 的旋转时标；
+不直接复用二维效率、密度阈值或有限时间步函数。数值证据见第 18 节。
 
 ### 6.6 `cool_rate` 与严格 LR baseline 的区别
 
@@ -552,12 +554,18 @@ Direct-SFR 降采样和训练不需要 `grav`，因此这些问题不阻塞本�
 
 原作者已经确认 `cool_rate` 是单位体积冷却率，因此若以后需要对它做空间
 降采样，应采用体积加权平均，以守恒 coarse cell 内的总 cooling power。
-其 code/cgs 单位、符号以及它表示纯冷却还是净冷却仍未确认，因此还不能
-仅凭字段名写死 cooling-time 公式。Direct 模式本轮不读取也不降采样该字段。
+2026-09-10：用户授权先采用 `t_cool=press/((gamma-1)*cool_rate)`。
+离线算子把输入解释为正的 code cooling power density，拒绝负值，零值对应
+无限冷却时间。该假设在当前高分辨率样本上与记录 SFR 相容，但恒星形成区
+主要由动力学时标主导，因此尚不能凭 SFR 吻合独立确认冷却功率的完整定义。
+Direct 模式仍不要求该字段作为网络输入。
 
 ---
 
-## 7. 待实现：可配置的三维守恒降采样
+## 7. 可配置的三维守恒降采样
+
+2026-09-10：Direct/Residual 空间块降采样已实现；最新接口与运行结果见第 20 节。
+本节保留物理设计，早期接口草案以第 20 节为准。
 
 ### 7.1 初始目标分辨率
 
@@ -1161,11 +1169,11 @@ tests/test_athdf_reader.py
 | 字段角色 | 基本完成 | metallicity 仅作温度依赖还是也保存为候选输入 | 不阻塞最小 direct 模型 |
 | code units | 作者已提供 | 需写入正式配置和 HDF5 metadata | 不阻塞数值降采样 |
 | 热力学派生量 | 公式已确认 | 缺 `solar_metallicity` 精确值与 ATHDF metallicity 口径 | 阻塞最终温度实现 |
-| 三维守恒降采样 | 设计已完善，未实现 | 需确认速度两套表示、是否保存 fine 副本 | 阻塞正式 processed 数据 |
+| 三维守恒降采样 | Direct/Residual 空间块已实现，真实样本两种 shape 通过 | 仅支持正密度、无 AMR、整除的原生球坐标网格 | 可生成 fine/coarse；尚未接入三维训练 |
 | target | 基本确认 | `rhodotsf` 精确单位、时间层、limiter/stochastic 语义未由作者确认 | 可保守降采样原值，但阻塞最终物理解读 |
-| 引力势 | 源码与专用 `grav` 已取得 | 跨时间复用、`ratio_gs`、时间匹配 `M_BH` 未确认 | 只阻塞 residual baseline |
-| rotation time | 论文与当前 operator 有 (2\pi) 差异 | 需作者/源代码确认 | 阻塞严格 baseline |
-| cooling time | Direct 阶段不处理 | `cool_rate` 已知为单位体积量；符号/net 定义和 LR 重算仍未知 | 不阻塞 Direct，阻塞 residual |
+| 引力势 | 用户确认静态 grav 可复用，已用于离线算子 | 局部残差暗示 SFR 模块可能另用增长后的 BH 质量 | 不阻塞当前总 SFR 复现；局部精确率待确认 |
+| rotation time | 18 个 snapshot 的验证支持带 2pi | 尚未取得三维恒星形成函数源码 | 已有数据支持的默认实现 |
+| cooling time | 已按用户授权实现 p/((gamma-1)cool_rate) | SF 区几乎无冷却主导，不能充分识别该定义；LR 冷却表仍未接入 | 可离线求值，不等于严格 LR 重算 |
 | 3D 模型 | 未实现 | 标量或场输出的阶段安排 | 不应直接照搬全部 2D 层数 |
 | 泛化数据 | 仅发现 `fullFB_inflow` | 其他 run 尚未挂载 | 无法验证跨物理配置泛化 |
 
@@ -1193,12 +1201,112 @@ tests/test_athdf_reader.py
 6. 用户是否同意默认不复制完整 fine HDF5，只保存 coarse processed HDF5，以避免不必要的磁盘占用。
 
 第 1–4 项属于应继续向模拟作者确认的物理/数据语义；第 5–6 项属于项目接口决策。
-在这些问题确认前，本项目只完成设计和数据审计，不开始编写
-`coarsening_spatial_3D.py`。
+以上为早期决策记录。2026-09-10 用户已授权保存三套速度相关字段、通过拆分
+builder 保存 fine/coarse，并采用质量加权有效径向引力。温度和数密度沿用已验证
+SFR3D 公式；metallicity 绝对质量分数仍标注为数据支持的口径。实现状态见第 20 节。
 
 ---
 
-## 18. 变更日志
+## 18. 2026-09-10 三维原始分辨率 SFR 验证结果
+
+本节为最新离线算子状态；前文的 Direct/coarse 开发计划并不因此视为已完成。
+
+实现：`raw_data_processing/macer_sfr_operator_3d.py`。采用连续时间公式：
+
+```text
+mu = 1 / (2*X + 0.75*(1-X-Z) + 0.5*Z), X=0.7
+T = press/rho * mu*mH_code/kB_code
+n = rho / (mu*mH_code*length_unit_cm^3)  [cm^-3]
+t_cool = press / ((gamma-1)*cool_rate)
+t_ff = sqrt(3*pi/(32*G_code*rho))
+t_rot = rotation_factor * sqrt(r/abs(grav))
+t_SF = max(t_cool, min(t_ff, t_rot))
+rhodot_model = etaSF*rho/t_SF, if T < temp_sf and n > nrho_sf
+```
+
+其中 `gamma=1.666666666667, etaSF=0.03, temp_sf=40000, nrho_sf=1`
+读取挂载数据中的 `input.txt`。`rotation_factor` 可指定 1 或 2pi，默认后者。
+`G_code=112.4766, mH_code=3.364939e-65, kB_code=2.904099e-67,
+length_unit_cm=3.085678e21` 来自作者。金属丰度采用数据支持的绝对质量分数
+解释。密度阈值使用总自由粒子数密度；不采用二维 `1.02*rho`，也不采用氢核数密度。
+
+静态 `grav` 来源于根目录参考 ATHDF，已对所有扫描 snapshot 核对网格中心与
+faces。SFR 参考值为各文件 `rhodotsf*cell_volume` 的积分，换算采用项目统一的
+0.025 Msun/yr 每 code rate，未从标签估计或拟合 eta。
+
+结果位于 `data/sfr3d_validation_20260910/`：
+
+- `scan.json`：250 个 snapshot 的原始总 SFR、时刻和非零格点数。
+- `validation.json`：18 个选择样本、选样理由、源哈希、参数、五个变体和局部诊断。
+- `report.md`：逐 snapshot 的总 SFR 与误差。
+- `rotation_diagnostics.json`：00051、00200、00299 的局部旋转残差与无表头 hst 数值对照。
+
+一个全零 snapshot 单列；其余 17 个覆盖 0.862757–2.701754 Msun/yr。
+带 2pi 时，最大积分相对绝对误差为 3.23062e-6（0.000323062%）；最大场
+积分 L1 误差 `sum(abs(pred-true)*V)/sum(true*V)` 为 3.87606e-6
+（0.000387606%），每个选样 snapshot 的正 SFR 格点集合均完全一致。
+不带 2pi 时，正参考样本的总 SFR 高估 8.8673%–76.6515%。
+改用氢核数密度导致低估 7.7406%–47.5189%；改用 rho/mH 导致低估
+4.0993%–25.7306%。仅把温度替换为固定 71.41*p/rho（数密度仍保留 mu(Z)），
+最大积分相对误差约 0.00151244%。
+
+局部限制：不能用全局积分精度宣称每格都已精确复现。00299 的活跃格点中，
+局部相对误差最大约 5.8573%；这些偏差主要发生在旋转时标主导区。
+该 snapshot 的旋转主导区域仅贡献总 SFR 的 0.03543%；局部误差超过 1%
+的格点合计仅贡献总 SFR 的 0.01037%。
+
+对远离时标切换边界的旋转主导格点，用记录率反推有效加速度，仅作诊断：
+
+```text
+g_eff = r * (2*pi*rhodotsf/(etaSF*rho))^2
+delta_M = (g_eff - abs(grav))*r^2/G_code
+```
+
+反推增量在同一 snapshot 内接近常数，00051、00200、00299 的中位数约为
+24776、80700、132369 Msun。最近时刻 hst 的第 27 列分别约为
+24790.52、80706.0、132374.6，第 20 列减第 27 列约为 875000 Msun，恰好
+等于 input.txt 的 `eps_bh_mass*Mstar`。这强烈提示 SFR 模块可能使用了
+增长后的中心黑洞质量，即使输出的背景 grav 是静态的。由于 hst 无表头，
+尚不将第 20/27 列解释设为正式接口，也不把监督值反推的质量用于 baseline。
+需要作者明确：SFR 的旋转时间是否另行使用当前 M_BH；hst 第 20、27 列的确切含义。
+
+hst 第 30 列在上述三个匹配时刻也与原 snapshot 的 SFR 积分吻合到输出精度，
+但列语义仍未正式确认。因此正式误差表以 snapshot 的 rhodotsf 积分为参考。
+
+当前诊断中恒星形成几乎均受动力学时标限制，良好的 SFR 复现不足以独立验证
+冷却公式、低温 cooling table 或 coarse 冷却重算。原始 HR 验证不构成 LR
+闭合或跨星系预测能力证明。尚未引入三维有限时间步修正。
+
+复现命令（项目根目录）：
+
+```powershell
+python raw_data_processing/validate_macer_sfr_3d.py --raw-dir "E:\科研项目与原始数据\ai+MACERsimulation\MACNet-v1\RawData\DwarfGalaxy\fullFB_inflow" --input "E:\科研项目与原始数据\ai+MACERsimulation\MACNet-v1\RawData\DwarfGalaxy\input.txt" --output data/sfr3d_validation_20260910
+python raw_data_processing/diagnose_sfr3d_rotation.py --raw-dir "E:\科研项目与原始数据\ai+MACERsimulation\MACNet-v1\RawData\DwarfGalaxy\fullFB_inflow" --input "E:\科研项目与原始数据\ai+MACERsimulation\MACNet-v1\RawData\DwarfGalaxy\input.txt" --output data/sfr3d_validation_20260910/rotation_diagnostics.json
+```
+
+## 19. 变更日志
+
+### 2026-09-10：实现 Direct/Residual 三维空间降采样及拆分构建入口
+
+- 新增 `coarsening_spatial_3D.py`：精确 faces 几何、非重叠索引块聚合、笛卡尔动量守恒、温度重算和自动审计。
+- 新增 `galaxy_data_3d.py`：三维字段与独立监督组、稳定 metadata/UID、原子 HDF5 保存及读回校验。
+- 新增 `build_snapshots_3d.py`；扩展 `build_fine_from_raw.py`、`build_coarse_from_fine.py`，保留二维入口行为。
+- `GalData.read_athdf()` 和 `GalData.load_h5()` 返回三维对象，其 `.coarsen()` 调用三维算子。
+- 增加 RawDataConfig 的 dwarf run；旧 parse_log_file 和二维 galaxy_data 主程序跳过 ATHDF，避免误解析日志。
+- 模式、源哈希、physics 参数进入产品身份；不同签名的三维产品不允许同名覆盖。
+- 验证 00051、00254、00299，两种 coarse shape × Direct/Residual 共 12 个产品，最大守恒 scaled relative error 为 5.40774e-16。
+- 新增九个三维空间/文件/入口测试，覆盖标签隔离、冗余字段损坏、几何错配、守恒及禁止 coarse→coarse。
+- 相关回归测试共 45 项通过：包含二维 builder、空间算子、metadata、ATHDF 和二维/三维 SFR 算子。
+- 未接入三维模型、训练缓存或二维 Results notebook。三维文件若送入旧 GalDataSet，会明确拒绝。
+
+### 2026-09-10：实现并验证独立三维 SFR 算子
+
+- 新增 `raw_data_processing/macer_sfr_operator_3d.py`，输入不含 `rhodotsf`。
+- 新增 `validate_macer_sfr_3d.py`：扫描 250 个 ATHDF，按正 SFR 分位数、时间覆盖及最快上升/下降前后选择 18 个样本，比较 5 个公式变体。
+- 新增 `diagnose_sfr3d_rotation.py`：诊断局部旋转残差；监督值反推的质量仅用于分析，不进入正式算子。
+- 更新 dwarf baseline 配置，记录静态 grav、冷却公式和独立算子接口；尚未接入模型训练或三维降采样。
+- 新增 6 个三维单元测试；连同二维算子和 ATHDF 读取器共 23 个相关测试通过。
+- 结果与复现入口见第 18 节。新增算子不覆盖二维实现。
 
 ### 2026-09-05：记录原作者回复并完善 Direct 三维降采样设计
 
@@ -1245,7 +1353,118 @@ tests/test_athdf_reader.py
 
 ---
 
-## 19. 后续更新本文档时的最低要求
+## 20. 三维空间降采样的实际接口与验证
+
+### 20.1 构建流程与模式
+
+```text
+ATHDF + input.txt [+ 静态参考 grav]
+  -> build_fine_from_raw.py
+  -> data/<galaxy>/<fine_dirname>/*.h5
+  -> build_coarse_from_fine.py --coarsener spatial_3d
+  -> data/<galaxy>/coarse_spatial3d_<shape>_<mode>/*.h5
+```
+
+当前 run 生成名为 `dwarf_galaxy_fullFB_inflow`。无须先执行 parse_log_file；时间
+读取 ATHDF metadata，输出索引保留原文件编号。原始零 SFR 帧仍保存，不自动删除；
+Residual fine 中 SFR 与 cooling_rate 同时全零时记录 initialization_candidate，
+该标记仅供诊断，不能单独据此判断物理淬灭或训练纳入规则。
+
+`--prediction-mode direct` 为三维默认。Direct fine 仅读取 rho、press、vel1/2/3、
+metallicity、rhodotsf 与坐标。Residual fine 另读 cool_rate 和静态 grav；
+这份 fine 可复用于两类 coarse，Direct fine 则不能构建 Residual coarse。
+旧二维处理的物理逻辑不随该三维模式开关改变。
+
+```powershell
+python raw_data_processing/build_fine_from_raw.py --galaxy dwarf_galaxy_fullFB_inflow --prediction-mode residual --fine-dirname fine_residual
+python raw_data_processing/build_coarse_from_fine.py --galaxy dwarf_galaxy_fullFB_inflow --coarsener spatial_3d --prediction-mode residual --fine-dirname fine_residual
+python raw_data_processing/build_coarse_from_fine.py --galaxy dwarf_galaxy_fullFB_inflow --coarsener spatial_3d --prediction-mode direct --fine-dirname fine_residual --coarse-shape 16 16 32
+```
+
+fine/coarse 两个命令均支持重复的 `--snapshot-index` 与 `--max-snapshots`。
+默认三维 shape `(32,16,32)`；可指定 `(16,16,32)`，必须逐轴整除。
+三维只有空间块算子，拒绝 R_m 参数。不允许 coarse 覆盖 fine 目录、coarse 再次
+降采样或不同产品签名覆盖同名文件。相同签名允许原子替换重新生成。
+
+### 20.2 字段规则
+
+| 字段 | coarse 定义 | 文件角色 |
+|---|---|---|
+| cell_volume | fine 体积求和；同时验证 coarse faces 解析体积 | geometry |
+| density、gas_mass | 总质量/总体积；单元总质量 | snapshot |
+| pressure、gas_energy | 压强体积加权；内能密度 p/(gamma−1) | snapshot |
+| metallicity | 金属质量/气体质量 | snapshot，辅助字段 |
+| temperature | 由 coarse p、rho、Z 与作者 mu(Z) 公式重算 | snapshot，辅助字段 |
+| momentum_x/y/z | 固定笛卡尔基底的单元积分动量，直接求和 | snapshot，辅助字段 |
+| velocity_x/y/z | coarse 动量/质量 | snapshot，候选速度表示 |
+| vel1/2/3 | 同一笛卡尔速度在 coarse 中心球坐标基底的投影 | snapshot，默认速度输入 |
+| sfr_density_true | fine rhodotsf 体积加权 | sfr_supervision，禁止作为输入 |
+| cooling_rate_density | fine cool_rate 体积加权 | Residual baseline-only |
+| cooling_time | coarse gas_energy/cooling_rate_density；零冷却率为 +inf | Residual baseline-only |
+| radial_acceleration | fine 径向 grav 的质量加权标量 | Residual baseline-only |
+
+每个速度字段的 HDF5 dataset attrs 都包含中文说明。momentum 不是动量密度；
+两套速度表示对应同一个矢量，不能把九个通道当作九个独立物理自由度。
+密度、压强、vel1/2/3 标注为默认输入，其余物理字段按角色区分。
+所有物理量在文件中保持作者代码单位；温度为 K；积分 SFR 转 Msun/yr 乘 0.025。
+
+体积仅从真实边界或 fine 权威体积求和获得。coarse r 中心为 sqrt(r_in*r_out)，
+theta/phi 中心为边界中点；中心不承担体积恢复职责。
+
+自动审计总体积、质量、内能、金属质量、三个笛卡尔动量分量、SFR；Residual
+另审计冷却功率和质量加权径向标量积分。动量近抵消时误差以 fine 各单元绝对量
+之和缩放，避免净动量接近零导致相对误差失真。未解析动能单独记录，不转入热能。
+
+### 20.3 Residual 监督与局限
+
+同一个已验证的 SFR3D 算子作用于 coarse density、pressure、metallicity、
+cooling_rate 和有效径向引力，在监督组保存局部 baseline、局部 signed closure
+以及 canonical `Y_alpha/B_alpha/C_alpha_true`。Y 来自原始 rhodotsf 的守恒积分，
+B 来自 coarse 状态重算，C=Y−B；baseline 函数接口不接受真实 SFR。
+
+有效径向引力保持静态 fine grav 的质量加权标量积分，但不等于完整引力矢量的
+守恒聚合，也不一定等于 coarse 中心加速度。冷却率来自 HR 数据的体积平均，
+不代表在 coarse 状态重新查询 cooling table。以上近似写入 metadata。
+后续若修改黑洞质量口径、冷却表或温度关系，应使用新目录重建产品。
+
+三维数据采用 `macnet_3d_format=1`，与二维 format-version 6 区分。当前
+`GalDataSet`/CNN/Results notebook 仍是二维流程，不能直接训练三维产品。
+Python 使用 `sample = GalData().load_h5(path)` 或 `GalData3D.load_h5(path)`，
+必须接收返回对象；三维字段不走二维的 T=93e/rho、坐标转置和 KS baseline。
+
+### 20.4 真实数据验证
+
+选取低 SFR 的 00051、高 SFR 的 00254 和末期 00299。生成三个 Residual fine、
+一个独立 Direct fine，以及两个 shape × 两个模式 × 三个 snapshot 的 12 个 coarse。
+审计均通过，所有加和量的最大 scaled relative error 约 5.41e-16。
+
+| snapshot | 守恒 True (Msun/yr) | B:32×16×32 | B:16×16×32 |
+|---|---:|---:|---:|
+| 00051 | 0.862757335 | 0.797669279 | 0.647725029 |
+| 00254 | 2.701753484 | 2.193384856 | 2.016161159 |
+| 00299 | 2.437168153 | 2.011702403 | 1.863385733 |
+
+Direct/Residual 的相同 shape 上物理聚合和 True 一致。baseline 与 True 不相等
+是 coarse 状态进入非线性 SFR 算子的结果，不是质量/SFR 守恒失败。
+验证文件位于 `data/dwarf_galaxy_fullFB_inflow/`：`fine_smoke_3d`（约 628 MiB）、
+`fine_direct_smoke_3d`（约 175 MiB）和四个带 shape/mode 的 coarse 目录（合计约 20 MiB）。
+本轮没有批量处理全部 250 个原始文件。
+
+### 2026-09-10：大型三维文件的续跑与源身份策略
+
+- `build_fine_from_raw.py` 新增默认安全续跑。已有输出只有在来源 snapshot、模式、
+  物理参数、输入文件和引力来源契约一致时才跳过；损坏或不匹配的同名文件会停止。
+- 三维 ATHDF 默认使用 `--source-hash stat`，记录文件名、字节数和纳秒修改时间，
+  避免 `read_athdf` 后再完整读取约 216 MiB 源文件一次。`--source-hash sha256` 保留为
+  显式强校验选项，适合新目录的归档级构建，但必然增加一次完整磁盘读取。
+- `GalData3D.from_raw` 不再隐式计算 SHA-256；强哈希只能由批处理入口明确传入。
+- 三维 fine→coarse provenance 同样改为 stat 文件身份；coarse 的物理来源仍由
+  `source_sample_uid` 约束。
+- 已实际检查 `fine_sfr_v6/00050.h5` 至 `00052.h5`：均可只读 metadata 后安全跳过，
+  三个文件合计续跑约 1.3 秒，未重新载入 snapshot 场。
+- 新增 stat 不调用 SHA 与 SHA 显式 opt-in 测试；相关三维测试共 17 项通过。
+
+## 21. 后续更新本文档时的最低要求
 
 每次重大修改至少记录：
 

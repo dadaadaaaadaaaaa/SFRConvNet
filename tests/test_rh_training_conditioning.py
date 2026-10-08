@@ -45,11 +45,19 @@ class _SyntheticConditioningDataset:
             raise ValueError("mass_filter 必须正且有限。")
         return np.log10(self._mass_filters)
 
-    def standardize(self, mean=None, std=None):
+    def standardize(
+        self,
+        mean=None,
+        std=None,
+        log_transform_mask=None,
+        return_log_transform_mask=False,
+    ):
         x = np.ones((2, 2, 4, 4), dtype=np.float32)
+        mask = np.ones(2, dtype=bool)
         if mean is None:
-            return x, np.zeros(2), np.ones(2)
-        return x
+            result = (x, np.zeros(2), np.ones(2))
+            return (*result, mask) if return_log_transform_mask else result
+        return (x, mask) if return_log_transform_mask else x
 
 
 class RhTrainingConditioningTests(unittest.TestCase):
@@ -75,6 +83,13 @@ class RhTrainingConditioningTests(unittest.TestCase):
 
         self.assertFalse(temporary_exists_after_write)
         self.assertAlmostEqual(options["closure_scale"], 1.5)
+        np.testing.assert_array_equal(
+            options["log_transform_mask"], np.ones(2, dtype=bool)
+        )
+        self.assertEqual(
+            payload["preprocessing_contract"]["log_transform_mask"],
+            [True, True],
+        )
         self.assertEqual(selection["source_split"], "train")
         self.assertEqual(selection["source_tensor"], "closure_true_physical")
         self.assertEqual(selection["method"], "median_abs")

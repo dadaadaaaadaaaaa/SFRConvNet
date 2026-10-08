@@ -134,6 +134,14 @@ def main():
             "source_file_size_bytes": int(raw_path.stat().st_size),
             "time": time,
             "time_units": "Gyr",
+            "time_mapping": galaxy_config.get(
+                "time_mapping",
+                {
+                    "mode": "linear_index",
+                    "snapshot_dt": float(galaxy_config["snapshot_dt"]),
+                    "offset": float(galaxy_config.get("offset", 0.0)),
+                },
+            ),
         },
     )
     fine.set_coord(["fakeDim2", "fakeDim1"])

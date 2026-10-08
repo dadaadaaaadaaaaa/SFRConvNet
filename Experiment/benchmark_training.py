@@ -41,6 +41,21 @@ def sync():
         torch.cuda.synchronize()
 
 
+def configure_position_cache(model, datasets):
+    """仅用于重现已回退的固定位置编码候选，不进入正式训练路径。"""
+    reference = datasets[0].coord[:1]
+    for dataset in datasets:
+        if not torch.equal(dataset.coord, reference.expand_as(dataset.coord)):
+            raise ValueError("位置编码候选要求共享坐标网格。")
+    encoding = model.posenc
+    coord = reference.cuda()
+    with torch.no_grad():
+        features = encoding(coord[:, :1], coord[:, 1:2], normalize=True)
+        encoding._fixed_r = coord[:, :1].clone()
+        encoding._fixed_theta = coord[:, 1:2].clone()
+        encoding._fixed_features = features
+
+
 def subset(dataset, count):
     """取已打乱 cache 的固定前缀，并覆盖尾批；所有逐样本字段保持对齐。"""
     result = copy.copy(dataset)
@@ -71,22 +86,28 @@ def run_case(name, args, original, datasets):
     mode = base_name if base_name in {"batched", "device"} else args.loader
     if base_name == "baseline":
         mode = "standard"
-    train_fn = original.train_one_epoch if base_name == "baseline" else train.train_one_epoch
+    train_fn = original.train_one_epoch if base_name in {"baseline", "train_reference"} else train.train_one_epoch
+    if base_name == "accum":
+        train_fn = load_original(ROOT / "Results/performance_audit_20260908/train_accum_candidate.py").train_one_epoch
     eval_fn = original.eval_epoch if base_name in {"baseline", "accum"} else train.eval_epoch
     start = time.perf_counter()
     train_loader = make_loader(datasets[0], args.batch_size, mode, args.workers, 711)
     val_loader = make_loader(datasets[1], args.batch_size, mode, args.workers, 712)
-    model = SFRConvNet(c_in=12, base_ch=32, stage_depths=(2, 2, 2, 2),
-                      pos_num_bands=32, pos_max_freq=101, p_drop=0.0,
-                      prediction_mode="signed_closure").cuda()
+    model_type = SFRConvNet
     if base_name == "pe":
-        from Experiment.training_performance import configure_position_cache
-        configure_position_cache(model, datasets, augmentor=None)
+        model_type = load_original(ROOT / "Results/performance_audit_20260908/models_position_candidate.py").SFRConvNet
+    model = model_type(c_in=12, base_ch=args.base_ch, stage_depths=(2, 2, 2, 2),
+                      pos_num_bands=32, pos_max_freq=101, p_drop=args.dropout,
+                      prediction_mode=args.objective).cuda()
+    if base_name == "pe":
+        configure_position_cache(model, datasets)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
     scaler = torch.amp.GradScaler(enabled=True)
-    criterion = train.make_criterion("l1", 1.0, weight_mode="none")
+    # 独立导入的旧模块拥有独立 WeightedLoss 类身份，必须从验证函数所属模块构造。
+    criterion_module = original if base_name in {"baseline", "accum"} else train
+    criterion = criterion_module.make_criterion("l1", 1.0, weight_mode="none")
     writer = ScalarRecorder()
-    options = dict(objective_mode="signed_closure", closure_transform="signed_asinh",
+    options = dict(objective_mode=args.objective, closure_transform="signed_asinh",
                    closure_scale=datasets[0].closure_scale, negative_sfr_weight=1.0)
     sync()
     setup = time.perf_counter() - start
@@ -122,6 +143,9 @@ def main():
     parser.add_argument("--train-samples", type=int, default=1539)
     parser.add_argument("--val-samples", type=int, default=769)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--base-ch", type=int, default=32)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--objective", choices=("direct_sfr", "signed_closure"), default="signed_closure")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--loader", default="standard")
@@ -129,21 +153,27 @@ def main():
     original = load_original(args.original)
     torch.set_num_threads(args.threads)
     datasets = [subset(train.GalPTDataset(ROOT / ".cache" / f"{args.prefix}{split}.pt",
-                                        objective_mode="signed_closure"), count)
+                                        objective_mode=args.objective), count)
                 for split, count in (("train", args.train_samples), ("val", args.val_samples))]
     output = dict(environment=dict(platform=platform.platform(), torch=torch.__version__,
                                    cuda=torch.version.cuda, gpu=torch.cuda.get_device_name(0),
                                    cpu_count=os.cpu_count()), config=vars(args), runs=[])
     reference_state = None
+    reference_epochs = None
     for repeat in range(args.repeats):
         for name in (args.cases if repeat % 2 == 0 else list(reversed(args.cases))):
             result, state = run_case(name, args, original, datasets)
             if reference_state is None:
                 reference_state = state
+                reference_epochs = result["epochs"]
             result["state_max_abs_vs_first"] = max(
                 (value.to(torch.float64) - reference_state[key].to(torch.float64)).abs().max().item()
                 for key, value in state.items())
             result["repeat"] = repeat
+            result["metric_max_abs_vs_first"] = max(abs(a["metric"] - b["metric"])
+                for a, b in zip(result["epochs"], reference_epochs))
+            np.testing.assert_allclose([r["metric"] for r in result["epochs"]],
+                                       [r["metric"] for r in reference_epochs], rtol=1e-5, atol=1e-7)
             output["runs"].append(result)
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
             Path(args.output).write_text(json.dumps(output, indent=2), encoding="utf-8")

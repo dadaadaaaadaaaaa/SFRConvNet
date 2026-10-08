@@ -184,3 +184,16 @@ python raw_data_processing/galaxy_data.py --help
 3. `Data-Set-5`、`10`、`15`、`17`、加速度字段及目标字段的 `long_name` 必须与配置一致；
 4. 不要把不同粗粒化算子或不同物理参数的 HDF5 静默混入同一训练目录；
 5. 批量生成前先对单 snapshot 检查守恒、SFR supervision 和 HDF5 round-trip。
+
+## 8. GalDataSet 的几何输入消融
+
+库接口 `GalDataSet.load_data(..., geometry_input_mode="none")` 默认保持原输入。
+`absolute_radius` 追加 `log10_radius_kpc`；`absolute_radius_widths` 再追加
+`log10_radial_width_kpc`、`log10_polar_arc_width_kpc`。公式使用固定 1 kpc 参考长度和
+processed 中心/保存边界，不覆盖权威体积或监督量。只支持二维 polar，非法/非正/非有限
+几何立即报错，不默默 clamp。split/add 保留模式，不能合并不同契约。
+
+几何通道已经 log10，`standardize` 自动将其 log1p 掩码置 False；传入启用重复 log1p 的
+显式掩码会报错。`geometry_input_contract` 声明固定单位和完整追加通道，CachePT 检查
+配置与实际选中通道一致。命令与物理适用范围见
+[Exp3 几何消融说明](../Experiment/exp3_geometry_ablations.md)。

@@ -2338,3 +2338,557 @@ SFRConvNet + train.predict_batch
 5. 对同一时间块划分分别构建 direct-SFR 与 signed-closure cache，确保比较只改变学习目标，
    不改变样本集合和标准化统计量；
 6. \(R_m\) 继续单独使用 `log_mass_filter`/FiLM 契约，固定单分辨率 Rh 不启用 FiLM。
+
+## 29. 2026-09-08：Rh 8×8 训练性能优化与逐项审计
+
+本轮在既有 `Exp1_Rh8x8_Closure_auto_*.pt` 上进行性能基准，不修改粗粒化、MACER SFR 算子、
+metadata 物理契约、closure scale、\(Y=B+C\)、CNN 架构或正式 cache。未启动正式 Optuna study。
+
+### 29.1 保留与撤回
+
+保留验证端设备内分星系统计、CPU 整批 tensor 索引、HPO 同进程 train/val dataset 复用，
+以及不重复加载测试集/追踪模型图。新增 `Experiment/training_performance.py`；
+Optuna 默认使用 `tensor_cpu`，单次 train 保持 `standard` 默认，可用 `--batch_backend tensor_cpu` 启用。
+tensor 路径要求 worker=0 且无在线增强，不会静默更改增强或样本数量。
+
+逐 batch loss 的设备端累积、GPU 常驻正式入口、位置编码缓存因缺乏可靠额外收益而撤回；
+CPU 线程数和 worker 增加也未被强制采用。修复 `num_workers` 隐式除二与预取配置矛盾的问题，
+并保证日志 writer 在异常、中断及 OOM 路径释放。
+
+### 29.2 最终测量与数值检查
+
+本地 RTX 4060 Laptop、Windows、PyTorch 2.5.1，固定小训练交替重复，修正后的微基准显示：
+batch64/128/512 的 train+val 单轮耗时分别减少约 8.1%/14.5%/24.0%。
+完整 14615/4871 样本各训练 2 轮的补充检查，实际训练验证循环耗时减少约 12%；
+cache 命中后短任务总耗时约从 5.66 秒变为 3.74 秒，但不能把短任务启动收益外推为 90 轮 trial 的加速比。
+
+最终比较的权重最大绝对差为 0，微基准逐轮验证指标差异约 \(10^{-7}\)，来自归约精度差异。
+完整回归测试 109 项全部通过；direct-SFR、base_ch=64、dropout=0.3 的 GPU 补充对照也通过。
+验证仍按“各星系内部平均 → 有样本星系等权平均”聚合，而非按各星系样本数重加权。
+正式训练仍测试最佳权重；HPO 不读测试集做计算。不会为了速度改变训练目标或绕过物理基线。
+
+审计发现并修正了旧模块独立导入时 WeightedLoss 类身份不同的 benchmark 问题；
+旧的部分微基准不作最终证据，已重跑并增加验证指标一致性断言。
+详细步骤、有效/无效 JSON 标记、保留/撤回原因、复现命令和服务器同步文件见
+`Experiment/TRAINING_PERFORMANCE_AUDIT_20260908.md`。
+
+### 29.3 下一步
+
+同步同一版本的 `train.py`、`run_optuna.py` 和 `training_performance.py` 到服务器。
+不需要重新生成 PT。恢复已有 study 时保持原 cache 前缀、objective、loss 等固定契约不变；
+性能参数不改变搜索空间，逐 trial 另写 `performance_settings` 便于追溯。
+A100/Linux 的收益必须在目标实例上重新测量，不能把本地加速比当成服务器结论。
+
+## 30. 2026-09-10：Rh 8×8 Direct/Closure 损失函数、实测比较与适用边界
+
+当前 Direct 与 signed-closure 实验不是只把 MSE 替换为 L1，而是同时改变了预测对象、
+目标变换空间和损失函数。因此，已有结果可以比较两条完整路线，但不能单独归因为
+“L1 优于 MSE”。
+
+### 30.1 Direct：`log10_1p` 目标空间的 MSE
+
+Direct 模型学习：
+
+\[
+\boldsymbol X_{R_h}\longrightarrow \widehat y,
+\qquad
+y=\log_{10}(1+\mathrm{SFR}),
+\]
+
+损失为：
+
+\[
+\mathcal L_{\rm direct}
+=
+\frac{1}{N}\sum_i(\widehat y_i-y_i)^2.
+\]
+
+当前正式运行 `Exp1_Rh8x8_Direct_Trial27_seed42_20260909_200536` 的契约为：
+
+```text
+objective_mode = direct_sfr
+loss = mse
+weight_mode = none
+target_transform = log10_1p
+```
+
+这一设定适合 SFR 跨越多个数量级、同时关注高低 SFR 区域，且更关心倍数/相对误差的场景。
+对数变换压缩动态范围，MSE 会对 target space 中的大残差施加二次惩罚，优化通常较平滑。
+但它不直接最小化物理 SFR 误差；高 SFR 爆发期的大绝对误差可能被对数压缩，
+并且 target space 无偏不等于反变换后物理空间无偏。Direct 的反变换还会默认将负物理
+SFR 裁剪为零，所以 `NegativePredFrac=0` 不能独立证明网络原始输出天然满足非负性。
+
+### 30.2 Signed closure：最终物理 SFR 空间的归一化 L1
+
+Closure 模型先预测 signed-asinh 空间的闭合项，反变换后显式组合：
+
+\[
+\widehat C_i=s_C\sinh(\widehat z_{C,i}),
+\qquad
+\widehat Y_i=B_i+\widehat C_i,
+\]
+
+其中当前自动确定的：
+
+\[
+s_C=226.31541789318408.
+\]
+
+主损失为归一化后最终物理 SFR 的 L1，而不是变换后 closure 本身的 L1：
+
+\[
+\mathcal L_{\rm primary}
+=
+\frac{1}{N}\sum_i
+\left|
+\frac{\widehat Y_i-Y_i}{s_C}
+\right|.
+\]
+
+同时使用负 SFR 平方 hinge 惩罚：
+
+\[
+\mathcal L_{\rm negative}
+=
+\frac{1}{N}\sum_i
+\left[
+\frac{\max(-\widehat Y_i,0)}{s_C}
+\right]^2,
+\]
+
+\[
+\mathcal L_{\rm closure}
+=
+\mathcal L_{\rm primary}
++\lambda_{\rm negative}\mathcal L_{\rm negative},
+\qquad
+\lambda_{\rm negative}=1.
+\]
+
+当前正式运行 `Exp1_Rh8x8_Closure_BestTrial61_20260908_082411` 使用：
+
+```text
+objective_mode = signed_closure
+loss = l1
+weight_mode = none
+closure_transform = signed_asinh
+closure_scale = 226.31541789318408
+negative_sfr_weight = 1.0
+```
+
+这一设定直接对齐最终物理 MAE，对少量极端 snapshot 更稳健，并保留了
+\(\mathcal S_{\rm LR}+\mathcal C_\theta\) 的可解释闭合结构，适合未来作为亚网格模型嵌入模拟。
+其局限是 L1 对巨大误差只线性增长，可能不足以约束灾难性失败，且条件中位数倾向可能弱化
+SFR 峰值。若 baseline 很差，网络还需同时抵消 \(B\) 并重建大部分 \(Y\)。
+
+### 30.3 当前同一 Cached Test Set 的端到端结果
+
+两个结果使用 4873 个测试样本，MACER-LR 与 KS baseline 数值完全一致，因此可以比较
+两条完整预测路线：
+
+| Cached Test Set 物理指标 | Direct + log-MSE | Closure + physical-L1 |
+|---|---:|---:|
+| Physical RMSE | 26.4438 | **17.7567** |
+| Physical MAE | 11.8621 | **7.7072** |
+| Physical \(R^2\) | 0.996767 | **0.998542** |
+| 中位绝对相对误差 | 2.6759% | **1.7662%** |
+| 负最终 SFR 比例 | **0** | 0.6567% |
+
+相对于当前 Direct，Closure 的 Physical RMSE 降低约 32.8%，Physical MAE 降低约 35.0%，
+中位相对误差降低约 34.0%。因此，若项目的首要判据是最终物理 SFR 接近 MACER 真值，
+当前 **Closure 完整方案明显优于 Direct 完整方案**。
+
+Direct 在自己的 target space 中表现更好：
+
+| Cached Test Set target-space 指标 | Direct | Closure |
+|---|---:|---:|
+| RMSE | **0.03222** | 0.04933 |
+| MAE | **0.01744** | 0.01947 |
+| \(R^2\) | **0.99790** | 0.99479 |
+
+这与两者的优化目标一致：Direct 直接优化对数 target-space MSE，Closure 直接优化最终
+物理 SFR 的归一化 L1。Closure 在 target space 中只有 4841 个有效样本，因为 32 个负预测
+无法进入 `log10_1p` 变换；物理空间指标正确包含全部 4873 个样本。
+
+### 30.4 当前可以与不可以宣称的结论
+
+当前可以说：
+
+> 在现有 Rh 8×8 cache、相同 Cached Test Set 与各自最优训练契约下，
+> `signed-closure + physical-L1` 的物理 SFR 预测优于 `direct-SFR + log-MSE`。
+
+当前不能说：
+
+> L1 损失函数本身必然优于 MSE。
+
+原因是实验同时改变了 Direct/Closure 预测对象、log/physical 损失空间、MSE/L1、
+模型最优超参数和随机训练轨迹。目前两个正式结果也各只是一次运行，尚不能量化随机种子方差。
+另外，当前 Exp1 的测试主要表征当前 split 下的分布内能力，不代表 time-block 外推、
+leave-one-galaxy-out 或 GIZMO 输入上的迁移能力。
+
+### 30.5 下一步损失函数与路线消融
+
+要分离“路线”和“损失函数”的影响，至少需要四组控制实验：
+
+| 实验 | 预测路线 | 损失/评价空间 |
+|---|---|---|
+| A | Direct | log-space MSE（当前对照） |
+| B | Direct | physical-space L1 或 Huber |
+| C | Closure | physical-space L1（当前主模型） |
+| D | Closure | physical-space MSE 或 Huber |
+
+四组必须保持相同数据 split、样本集、模型容量、HPO 预算、early-stopping 规则和预先确定的
+随机种子集。不能根据测试集选择随机种子。最终应统一报告物理空间 RMSE/MAE/\(R^2\)、
+相对误差分位数、负 SFR 率、每个星系的误差、SFR 峰值幅度/时刻、time-block 外推和累积新生恒星质量。
+
+现阶段将 Closure + physical-L1 作为主模型，Direct + log-MSE 作为强数据驱动对照。
+同时必须单独分析 Closure 的 32 个负 SFR 预测。若后续发现 L1 对爆发峰值的约束不足，
+可测试归一化物理空间 Huber：
+
+\[
+\mathcal L
+=
+\operatorname{Huber}
+\left(
+\frac{B+\widehat C-Y}{s_C}
+\right)
++\lambda_{\rm negative}\mathcal L_{\rm negative}.
+\]
+
+Huber 在小残差区近似 MSE，在大残差区近似 L1，可作为长尾 SFR 的折中候选；
+其优势必须由上述控制变量实验验证，不应预先假定。
+
+---
+
+## 31. Exp3：Zou 五组训练/验证与 torus 域外测试（2026-09-19）
+
+### 31.1 最终实验定义
+
+本轮按以下固定口径实现，不再沿用旧 Exp3：
+
+| 项目 | 新 Exp3 | 迁移后的 Exp8 |
+|---|---|---|
+| 数据域 | Zou 五组为开发域；`torus_100yr` 为唯一 test-only 域 | 原 Exp3 的非 low 盘星系集合 |
+| Zou 运行 | `fiducial`、`fiducial_4`、`fiducial_7`、`model_0_75`、`model_1_1` | 沿用原逻辑 |
+| 划分 | 每个 Zou 运行内随机 75% train / 25% validation；无 Zou test | 随机 60/20/20 |
+| torus 用途 | 只写入 `test.pt`，不得进入训练、验证、归一化或 HPO | 不使用 |
+| CachePT 运行平衡 | 不复制、不欠采样 | 沿用原 Exp3 行为 |
+| 训练抽样 | 每个运行总权重相同；运行内按物理时间间隔加权 | 沿用原行为 |
+| validation/test 抽样 | 顺序读取，不重采样 | 沿用原行为 |
+
+旧 `.config/ExperimentSetting.json` 中四个 `Exp3_*` 配置已改名为对应 `Exp8_*`，
+`data_exp` 同步由 `Exp3_` 改为 `Exp8_`。`prepare_data.py` 和 `run_train.py` 均已增加
+`exp8` 入口；新 `exp3` 简写则指向 Zou→torus 实验。
+
+用户明确要求本轮保留随机帧划分。因此，75/25 是按运行分层的随机 snapshot split，
+不是 time-block split。它可用于模型选择，但相邻时间帧可能分居 train/validation，不能把
+validation 结果解释为严格时间外推。真正的域外检验来自从未参与开发的 torus test。
+
+### 31.2 数据角色与防泄漏约束
+
+`.config/RawDataConfig.json` 为 `torus_100yr` 新增：
+
+```json
+{
+  "folder_name": "DiskGalaxy/torus_100yr/torus_100yr",
+  "log_file": "../torus_100yr.log",
+  "mode": "filename_index",
+  "snapshot_dt": 1e-7,
+  "range": [0, 1000],
+  "offset": 0,
+  "role": "test_only"
+}
+```
+
+`role=test_only` 使默认盘星系路径只返回训练角色数据，避免 torus 意外进入 Exp1、Exp2、
+Exp4 或 Exp8。Exp3 再使用严格 allowlist：五组 Zou 缺一不可，torus 也必须存在；程序不会
+静默用 `low`、`fiducial_10` 或其他运行补位。
+
+Cache 构建和训练加载均检查：
+
+1. train/validation 实际 group 恰好等于五组 Zou；test 恰好只含 torus；
+2. Zou 与 torus 的输入通道顺序和 target metadata 完全一致；
+3. train、validation、test 的 `sample_uid` 两两不交叉；
+4. 三者的 `parent_hr_uid` 两两不交叉；
+5. 归一化均值/标准差、通道 `log1p` 掩码和 closure scale 只由 train split 确定。
+
+其中第 5 点同时修正了旧预处理的一处域外风险：旧代码会分别根据每个 split 的最小值判断
+某通道是否做 `log1p`。现在由训练集确定布尔掩码并写入 PT、NPZ 和 metadata，validation/
+torus 必须复用；若训练定义为非负的通道在 torus 出现负值，程序停止并要求检查坏帧或字段
+语义，而不是悄悄更换变换。
+
+### 31.3 torus raw → fine 排除规则
+
+`build_fine_from_raw.py` 新增可重复参数 `--exclude-snapshot INDEX`。二维 HDFRA 默认仍按
+排序位置跳过前 46 帧；一旦用户显式提供该参数，显式清单完整取代默认规则。新 Exp3 的
+torus 主产品只排除已确认损坏的 11 帧：
+
+```text
+747, 754, 755, 763, 764, 765, 766, 767, 768, 769, 770
+```
+
+参考命令：
+
+```powershell
+python raw_data_processing/build_fine_from_raw.py `
+  --galaxy disk_galaxy_torus_100yr `
+  --exclude-snapshot 747 --exclude-snapshot 754 --exclude-snapshot 755 `
+  --exclude-snapshot 763 --exclude-snapshot 764 --exclude-snapshot 765 `
+  --exclude-snapshot 766 --exclude-snapshot 767 --exclude-snapshot 768 `
+  --exclude-snapshot 769 --exclude-snapshot 770
+```
+
+排除在打开 HDF4 前发生，`--snapshot-index` 与 `--exclude-snapshot` 有交集会报错。本轮不
+自动生成另一套含/不含初始帧的敏感性数据；纳入哪些 snapshot 完全由用户给出的排除清单
+决定。`--exclude-raw-snapshot-index` 是后续 CachePT 的全组过滤器，不应用它承载 torus
+专属的 11 帧清单，否则会把同一 index 同时从五组 Zou 中删除。
+
+### 31.4 运行等权、物理时间加权
+
+训练集保留每个运行的原始样本，不在 cache 中把短运行复制到最长运行。训练 loader 使用
+`WeightedRandomSampler`，每个 epoch 抽取 `len(train)` 个样本并允许有放回抽样。对单个
+运行按物理时间排序，使用梯形积分支持宽度：
+
+\[
+\tilde w_0=\frac{t_1-t_0}{2},\qquad
+\tilde w_i=\frac{t_{i+1}-t_{i-1}}{2},\qquad
+\tilde w_{n-1}=\frac{t_{n-1}-t_{n-2}}{2}.
+\]
+
+每个运行内再归一化为 \(\sum_i w_i=1\)。因此五个运行理论上各占训练抽样概率的 20%，
+而运行内部的时间缺口和不同 cadence 由权重表示。单点运行权重为 1；同一运行内时间重复、
+倒序或非有限时立即停止。validation 与 torus test 使用顺序 sampler，不做过采样。本轮不
+加入“把高频运行降采样到 12.5 Myr”的敏感性实验。
+
+### 31.5 Fourier 位置编码的已知限制
+
+本轮按要求保留现有 `FourierPositionalEncoding2D`。它对每个样本分别计算：
+
+\[
+r_{\rm norm}=\frac{\log r-\min(\log r)}{\max(\log r)-\min(\log r)}.
+\]
+
+这会把 Zou 的约 100 pc–500 kpc 和 torus 的 1 pc–1 kpc 都映射为 `[0,1]`。网络可以学习
+各自网格内的相对径向结构，但位置通道本身没有统一保留绝对 pc 尺度；绝对尺度只能通过
+气体场、cell volume 等输入间接体现。因此 Exp3 若失败，可能同时包含物理状态域移、积分
+孔径差异以及位置表示域移，不能只归因于“更靠近黑洞”。后续可比较固定物理参考尺度的
+`log10(r/pc)` 编码，但不属于本轮修改。
+
+### 31.6 执行顺序与当前状态
+
+1. 运行 `parse_log_file.py --galaxy disk_galaxy_torus_100yr`，只生成 torus Parquet；
+2. 用上述 11 个 `--exclude-snapshot` 生成 torus fine；
+3. 用与 Zou 相同的算子和 `coarse_rh_12x20_sfr_v6` 生成 torus coarse；
+4. 运行 `prepare_data.py --experiments exp3 --resolution-dirname coarse_rh_12x20_sfr_v6`；
+5. 检查 metadata 中 75/25 样本数、五组 Zou/torus group、UID、单位、通道和训练统计来源；
+6. 运行 `run_train.py --experiments exp3`，其简写会启用 `run_time_balanced` 并对固定
+   12×20 R_h 自动关闭 FiLM；
+7. HPO 只读取 train/validation，确定模型后才在 torus test 上做一次正式评价。
+
+截至本节记录时，配置、数据角色、划分、采样器、训练期防泄漏检查、测试和说明文件已经
+修改；尚未执行全量 torus raw→fine/coarse、Exp3 cache 生成或模型训练。旧 cache 不会被
+自动删除或改名。
+
+### 31.7 Exp3 正式测试结果与分析产物（2026-09-19）
+
+Exp3 已完成训练，并从最佳 validation checkpoint 对 torus test-only 数据执行正式评价。
+分析统一在反变换后的物理 SFR 空间进行；训练日志中的 `Test metric loss=2.714167` 是
+归一化 closure 空间的训练目标，不能与下表的物理量空间指标直接比较。
+
+| 指标 | torus test |
+|---|---:|
+| RMSE | 432.226165 |
+| MAE | 428.434459 |
+| R² | -1734.032517 |
+| 总时间段 SFR 低估率 | -1225.975316% |
+
+总时间段 SFR 低估率定义为
+`100 × (∫SFR_true dt - ∫SFR_pred dt) / ∫SFR_true dt`；因此负值表示高估。该结果即模型在
+整个 torus 模拟时间段内积分 SFR 高估 1225.975316%。积分前按物理时间排序、合并重复时间
+点，并保留真实时间间隔。
+
+分析入口为 `VisualScripts/ResultAnalysis/analyze_exp3.py`，Notebook 为
+`VisualScripts/ResultAnalysis/Results_stat_Exp3.ipynb`。产物包括总体指标 CSV、逐帧预测
+CSV、分析 metadata，以及与 Exp2 同功能的散点图、误差分布图、瞬时 SFR 时间演化图和
+累计恒星质量图。本轮未加入其他统计量。
+
+训练末尾的 `torch.load(..., weights_only=False)` FutureWarning 不影响本次已完成结果；
+它提示传统 pickle 反序列化不应加载不可信 checkpoint。实际 checkpoint 已验证只含
+state dict、tensor 和基础容器，因此加载改为显式 `weights_only=True`，不改变模型权重或
+数值结果，并消除后续运行的该警告。
+
+### 31.8 Exp3 分析兼容 Direct 与 Closure（2026-09-20）
+
+`VisualScripts/ResultAnalysis/analyze_exp3.py` 与 `Results_stat_Exp3.ipynb` 已改为同时支持
+`direct_sfr` 和 `signed_closure`。模式由结果目录中的 `hyperparameters.json` 与 checkpoint
+自动确定并交叉校验，不根据目录名猜测。Direct 模式直接对网络输出执行目标反变换；Closure
+模式继续按 `macer_sfr_baseline + closure_hat_physical` 组成最终 SFR。两种模式使用相同的
+torus test-only 契约、物理 SFR 指标、全时间段积分口径和四类图表。现有 Direct 与 Closure
+正式结果目录均已完成端到端运行验证。
+
+### 31.9 Fiducial flat 绝对时间与日志匹配修复（2026-09-20）
+
+E 盘恢复后现场核验发现，`fiducial`、`fiducial_4`、`fiducial_7` 的 flat 文件不能使用
+`global_index*snapshot_dt` 作为日志绝对时间。index 0 是时间 0 的特殊初始帧；index 1 起
+包含 0.5625 Gyr 的既有松弛时间。每个原始重启段推进 1000 个输出步，而扁平命名按 999
+个正编号拼接，因此对 `i>0`：
+
+\[
+t_{\rm abs}=0.5625+
+\left[i+\left\lfloor\frac{i-1}{999}\right\rfloor\right]0.00125\ {\rm Gyr}.
+\]
+
+修复内容：
+
+1. 三个运行的 `RawDataConfig` 新增结构化 `time_mapping`，显式保存 index 0、正编号偏移、
+   segment cycle size 和每段额外时间步；
+2. `_build_snapshot_schedule` 实现 `segmented_restart_absolute`，其余运行仍沿用线性映射；
+3. `GalData.read_hdfra` 读取原始文件后，按 Data-Set-11 `long_name` 的实际打印精度核验
+   `AT TIME=`；不一致时停止，拒绝以错误时间匹配日志中的 `mbh/dt`；
+4. 新 fine metadata 保存完整 time-mapping 契约；物理 snapshot 的 `parent_hr_uid` 保持不变，
+   但由 `mbh/dt` 上下文决定的 baseline `physics_product_uid` 会变化；
+5. 增加跨 999 边界的单元测试，并以 E 盘原始 HDF 对三个 flat 运行做全量时间标签核验。
+
+现有 E 盘 `snapshot_manifest.csv` 的 `time_gyr=global_index*snapshot_dt` 是旧扁平化工具写出的
+线性辅助列，不含上述松弛偏移与重启段额外步；本次不改写 RawData。新的 raw→fine 不读取
+该列，而以配置的 `time_mapping` 生成绝对时间并由原始 HDF 标签校验。manifest 中的
+segment/local/global index 仍可用于追溯文件来源。
+
+该修复不原地改写已经生成的 `fine_sfr_v6`、`coarse_rh_12x20_sfr_v6`、CachePT 或既有
+checkpoint；它们保留为旧实验可复现产物。后续有效 Exp3 必须使用新的版本目录重建
+三个 flat 运行的 fine/coarse，重新生成 cache 并重新训练。Model0.75、Model1.1 与 torus
+的现有时间映射已与原始 HDF 相符，不因本项修复重建。
+
+建议使用 `fine_sfr_v7_timefix` 和 `coarse_rh_12x20_sfr_v7_timefix`，不要覆盖 v6。三个 flat
+运行的 fine 需要修复时间及日志上下文；可以从 raw 重建，或使用第 33 节经核验的完整 v6
+fine 迁移入口。Model0.75、Model1.1 和 torus 的 fine 可继续读取既有产品，但为使
+Exp3 维持统一 `--resolution-dirname`，六个运行均应向新的 coarse 目录写产品。随后运行：
+
+```powershell
+python Experiment/prepare_data.py --experiments exp3 `
+  --resolution-dirname coarse_rh_12x20_sfr_v7_timefix
+```
+
+重建三个 flat 时不传 `--exclude-snapshot`，会按用户指定的当前默认规则跳过排序后的前 46
+个 snapshot。旧 `fine_sfr_v6` 曾把三个 flat 的 0–45 也纳入，因此 v7 的样本数变化不仅来自
+metadata/日志时间修正，还包含既定稳定性排除规则真正落地；比较新旧训练时必须明确这一点。
+
+## 32. Exp3.1 / Exp3.2 显式物理尺度输入消融（2026-10-07）
+
+### 32.1 定义与实现范围
+
+保留原相对 Fourier 和 snapshot 标量输出，只在 processed→CachePT 阶段追加几何通道：
+
+| 实验 | 模式 | 通道 |
+|---|---|---|
+| Exp3.1 | `absolute_radius` | `log10_radius_kpc=log10(r/(1 kpc))` |
+| Exp3.2 | `absolute_radius_widths` | 上述通道，加 `log10_radial_width_kpc=log10(Δr/(1 kpc))`、`log10_polar_arc_width_kpc=log10(rΔtheta/(1 kpc))` |
+
+数据按 `(N_theta,N_r)`；使用保存的中心与 cell edges，固定 1 kpc 参考单位。
+不从 coarse 中心重新猜边界，不改变 Data-Set-15 体积，不重算或替换 Data-Set-11 真值。
+保存边界来自现有上游流程，其中 fine edges 由坐标中心推断；不是独立读取的原始 faces。
+几何字段已 log10，只用训练集 mean/std 标准化，强制 log1p=False，不做逐帧 min-max。
+原物理通道、坐标、Y/B/C 和输入排除清单保持不变；不额外排除初始 torus 帧。
+
+`GalDataSet.load_data(geometry_input_mode=...)` 默认为 `none`，split/add 保留契约。
+显式几何仅支持二维 polar、正有限半径和宽度；遇非法 shape/边界/单位契约立即报错，
+不静默 clamp。几何 cache 使用独立 schema 6，原 schema 3/4/5 不变；processed HDF5
+format-version 6 不变。原 12 通道配方分别增加至 13/15，模型自动获取 c_in。
+第一层输入参数随通道增加，其余 backbone/池化/目标不变，故不是严格等参数量消融。
+
+### 32.2 训练、分析与泄漏边界
+
+PT、metadata JSON、norm NPZ、hyperparameters 和 checkpoint 保存几何公式、来源、固定单位、
+通道和统计来源。加载核验 payload/sidecar、各 split 契约、追加通道与预期模式一致；
+已经 log10 的字段若再次启用 log1p 会拒绝。新几何 cache 不覆盖旧文件。
+共享分析支持 schema 6；HDF5 重评估从 reference cache 继承几何模式与训练 log 掩码，
+必须提供训练 mean/std，不能在 torus 重估统计。Direct 和 signed_closure 均保留。
+
+Zou 五组随机 75/25、torus test-only、UID 互斥和 run_time_balanced 不变。
+宽度通道是一种局部、方向性的几何分辨率信息，但不是 R_m 的 log_mass_filter FiLM；
+固定 R_h 仍 conditioning=none，FiLM=False。它也不等于 MFM 核尺度或求解器完整有效分辨率。
+宇宙学模拟的局部分辨率随状态和配置变化，不能断言所有单元必然比 MACER 更宽。
+
+`run_train.py` 新增 tracked 独立配方：`exp3.1`、`exp3.2` 默认 signed_closure Trial23；
+`exp3.1-direct`、`exp3.2-direct` 使用 Direct Trial61。不继承 Exp1，不读取本机 JSON/HPO
+来改变消融参数；原 exp3 简写行为不变。两路线原本容量/loss 不同，消融主要做各路线内部比较。
+
+### 32.3 数据前提、命令与当前状态
+
+现场检查 v7_timefix 尚未生成。正式实验先按 31.9 在新目录重建三个 flat fine 和六组统一
+coarse，再生成几何 cache；原 Exp3 对照也应在同源修复产品上重训，不能把与旧 v6 的差异
+全部归因于几何通道。本次不启动全量重建、不覆盖生产产品、不启动正式训练或 HPO。
+
+完整本地 PowerShell（反引号续行）和服务器 Bash（反斜杠续行）命令、配方、cache 前缀、
+前置重建及限制见 `Experiment/exp3_geometry_ablations.md`。本机 torus 可复用 fine 目录名是
+`fine`，Model0.75/1.1 为 `fine_sfr_v6`；服务器必须核对 `.config/BaseConfig.json` 实际路径。
+
+修改实现：`geometry_features.py`、`galaxy_data.py`、`geometry_contract.py`、`prepare_data.py`、
+`run_train.py`、`train.py`、共享 `analysis_utils.py`，并同步对应脚本文档和 README。
+新增测试：`test_geometry_input_features.py`、`test_geometry_ablation_aliases.py`、
+`test_geometry_ablation_pipeline.py`。
+
+验证覆盖：保存边界公式与方向、固定单位缩放、非法几何拒绝、默认输入不变、禁止重复 log、
+训练归一化不泄漏、原字段/坐标/Y/B/C/time/UID 不变、75/25 与 test-only、旧 cache 兼容、
+模式/sidecar 防错，以及两消融×两 objective 的一轮 CPU 训练→checkpoint→共享分析加载。
+CPU smoke 使用合成小数据、临时目录和空 TensorBoard writer，不是正式训练，不登记 Train_history。
+原生 Fiducial/torus 各一个 coarse snapshot 的几何只读 smoke 通过；未执行全量数据构建、
+全量训练、GPU/AMP 或 Linux 实机验证，不能承诺该改动改善 13 倍高估。
+
+torus 已用于失败诊断，本消融属于探索性域外研究；后续选参数只使用 Zou 内部验证，不能把
+针对已知 torus 失败反复优化后的结果称为完全未接触的最终独立测试。
+
+本轮实际验证命令：
+
+```powershell
+python -m unittest tests.test_geometry_input_features tests.test_geometry_ablation_aliases tests.test_geometry_ablation_pipeline tests.test_rh_training_conditioning tests.test_exp3_torus_contract tests.test_signed_closure_training tests.test_signed_closure_result_analysis tests.test_exp3_analysis tests.test_training_performance tests.test_metadata_contract tests.test_sfr_supervision_products tests.test_spatial_coarsening_module -q
+python -m py_compile raw_data_processing/geometry_features.py raw_data_processing/galaxy_data.py Experiment/geometry_contract.py Experiment/prepare_data.py Experiment/train.py Experiment/run_train.py VisualScripts/ResultAnalysis/analysis_utils.py
+```
+
+12 个测试模块合计 79 项通过；语法检查通过。已有测试产生的 tensor→scalar 提示以及
+缺少 scipy 时的 R_m 慢速 NumPy 邻居搜索提示不影响通过结果；本轮未改动这些既有行为。
+为减少控制台输出，实际整批 unittest 调用经标准库 runner 汇总，测试内容与上面命令一致。
+
+## 33. 完整二维 fine 的时间/日志迁移（2026-10-07）
+
+源码与真实数据确认：时间错配不影响已保存的原始气体数组、坐标/权威体积和 Data-Set-11
+真值 Y。因此修复必须发生在 fine 层，但不必全量重新读取 HDF4。新增
+`raw_data_processing/migrate_fine_time_context.py`，只支持完整二维 format-version 6、
+`identity_fine`、filename_index 盘星系数据；目录版本 v7 不代表 HDF5 format 升为 7。
+
+迁移复用新版 raw→fine 的文件清单、数值排序、时间映射、默认前 46 帧与显式排除规则。
+需要 E 盘以枚举来源和检查大小，默认复用旧 fine 的 raw SHA256，不重新通读 raw 内容。
+日志每运行只读取一次，索引窗口后调用共享 `ll_dg_from_frame`；原文件入口也委托同一函数，
+窗口平均、空窗口插值、重复时间平均及端点行为不变。保留 Y/单位/物理数组，重新生成全部
+日志诊断、两套逐格及总 baseline/closure、context 和 physics_product_uid；snapshot UID 不变。
+
+新增可选 metadata `time_context_migration`，内部版本 1，记录旧 fine/日志哈希、旧时间、
+排除清单及是否重验原始时间标签；HDF5/schema 主版本不变。默认不读取 raw 时间标签，
+显式 `--verify-raw-time` 才通过 pyhdf 重验。复用旧哈希+大小不能发现同大小 raw 篡改。
+不同配置、日志、字段或筛选契约禁止混写；不提供覆盖选项，同签名才可续跑。每帧通过
+内容保留和 HDF5 round-trip 检查后独占发布，同目录临时文件由本次清理。
+
+本次只在独立 smoke 子目录处理三个运行各 `[46,999,1000,9531]`，共 12 帧。修正后的
+时间为 `[0.62,1.81125,1.81375,12.4875]` Gyr。与新版 raw→fine 独立重建对照，物理数组、
+坐标/体积、Y/单位/UID 完全相同，日志在 rtol=1e-12/atol=1e-14 内一致，两套逐格 baseline
+与物理产品 UID 一致。原始 HDF 时间标签全通过；同参数续跑跳过 12 帧，新写出 0。
+两套 fine 分别生成 12×20 coarse，共 24 个 smoke coarse；对应数组、两套 B/C 与 UID
+一致，三个迁移目录完整 metadata dataset 加载通过。生产 v6、已有 v7、cache/checkpoint
+及训练配置均未改写；未执行全量迁移、CachePT 生成、训练或全量性能测量。
+
+修改文件：迁移脚本及独立说明、`parse_log_file.py` 的共享内存日志入口、新增迁移测试，
+以及 README、raw→fine 说明和本研究计划。测试环境是已有的
+`D:/conda_envs/physics_ai/python.exe`，未安装依赖或修改 base。
+
+```powershell
+& 'D:/conda_envs/physics_ai/python.exe' -B -X utf8 -m unittest tests.test_fine_time_context_migration tests.test_log_context_selection tests.test_split_snapshot_builders tests.test_metadata_contract tests.test_sfr_supervision_products tests.test_spatial_coarsening_module -q
+```
+
+具体全量/抽样命令、安全限制、测试目录和迁移契约见
+`raw_data_processing/migrate_fine_time_context.md`。正式流程后续必须重新构建 coarse、CachePT
+与训练统计并重训。默认排除前 46 帧仍是独立的样本变化，比较新旧实验时必须说明。
+
+上述 6 个模块合计 39 项通过，包括零 Y 与负 closure、拒绝混写和失败临时文件清理；
+迁移脚本、日志脚本和新测试的 3 个源文件内存编译检查通过，未写入 pyc。现场只读检查
+发现 Fiducial 的 `fine_sfr_v7` 已有 raw 重建产物（核验时 261 帧），没有修改或清理。
+全量迁移命令因此使用尚未生成的独立 `fine_sfr_v7_timefix`，不要向旧 v7 混写。

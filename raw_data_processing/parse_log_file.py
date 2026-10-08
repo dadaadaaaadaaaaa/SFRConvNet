@@ -7,6 +7,7 @@
 import os
 import re
 import json
+import argparse
 import warnings
 import numpy as np
 import pandas as pd
@@ -298,8 +299,8 @@ def ll_eg(path: str, time: float, scope: float) -> pd.Series: # 读取日志文�
     avg["sfr_target"] = avg["sfr_tot"]
     return avg
 
-def ll_dg(path: str, time: float, scope: float) -> pd.Series: 
-    df = pd.read_parquet(path)
+def ll_dg_from_frame(df: pd.DataFrame, time: float, scope: float) -> pd.Series:
+    """复用已加载的盘星系日志；物理语义与文件入口完全一致。"""
     avg = mean_around_time_with_linear_fallback(df, time, scope)
     _require_columns(avg, ["NEWstar", "mbh"])
     # NEWstar is the cumulative newly formed stellar mass, not an
@@ -308,16 +309,51 @@ def ll_dg(path: str, time: float, scope: float) -> pd.Series:
     avg["cumulative_new_stellar_mass"] = avg["NEWstar"]
     return avg
 
-if __name__ == "__main__":
-    force_parse = True
 
-    configs = load_config()
+def ll_dg(path: str, time: float, scope: float) -> pd.Series:
+    return ll_dg_from_frame(pd.read_parquet(path), time, scope)
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="把选定 MACER 文本日志解析为 Parquet。")
+    parser.add_argument(
+        "--galaxy",
+        action="append",
+        default=[],
+        help="只解析指定生成名，例如 disk_galaxy_torus_100yr；可重复。",
+    )
+    parser.add_argument("--config-dir", default=".config", help="JSON 配置目录。")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="即使目标 Parquet 已存在也重新解析；默认直接复用已有文件。",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    configs = load_config(args.config_dir)
     raw_data_dir = configs["BaseConfig"]["raw_data_dir"]
     df = {}
+    selected = set(args.galaxy)
+    configured = {
+        f"{gal_type}_{nickname}"
+        for gal_type, group in configs["RawDataConfig"].items()
+        for nickname in group
+        if configs["HdfraConfig"].get(gal_type, {}).get("format") != "athdf"
+    }
+    unknown = sorted(selected.difference(configured))
+    if unknown:
+        raise ValueError(f"--galaxy 与二维日志配置不匹配：{unknown}")
     for gal_type, gal_group in configs["RawDataConfig"].items():
+        # ATHDF 直接记录时间和 SFR；无表头 hst 不走二维日志解析流程。
+        if configs["HdfraConfig"].get(gal_type, {}).get("format") == "athdf":
+            continue
         print(f"Processing galaxy group: {gal_type}")
         for gal_nickname, gal_config in gal_group.items():
             gal_name = f"{gal_type}_{gal_nickname}"
+            if selected and gal_name not in selected:
+                continue
             print(f"  Parsing galaxy: {gal_name}")
 
             path = os.path.join(raw_data_dir, gal_config["folder_name"], gal_config["log_file"])
@@ -329,5 +365,15 @@ if __name__ == "__main__":
             col_names = configs["HdfraConfig"][gal_type]["colnames"]
             save_path = os.path.join(configs["BaseConfig"]["data_dir"], f"{gal_name}.parquet")
 
-            df[gal_name] = parse_logfile(path=path, colnames=col_names, save_path=save_path, force_parse=force_parse)
+            df[gal_name] = parse_logfile(
+                path=path,
+                colnames=col_names,
+                save_path=save_path,
+                force_parse=args.force,
+            )
     print("Parsing completed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

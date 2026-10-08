@@ -52,7 +52,7 @@ EXPERIMENT_ALIASES = {
 # Shorthand experiments use the current instantaneous-SFR, no-initial-stellar-
 # density SFRConvNet recipe. Explicit ExperimentSetting.json keys remain fully
 # supported for other architectures.
-for _experiment_number in range(2, 8):
+for _experiment_number in range(2, 9):
     EXPERIMENT_ALIASES[
         f"Exp{_experiment_number}_InstantSFR_NoInitialStellarDensity_SFRConvNet"
     ] = {
@@ -64,12 +64,145 @@ for _experiment_number in range(2, 8):
         },
     }
 
+# 新 Exp3 使用无重复 CachePT；训练期按运行等权、运行内物理时间间隔加权。
+EXPERIMENT_ALIASES[
+    "Exp3_InstantSFR_NoInitialStellarDensity_SFRConvNet"
+]["overrides"].update(
+    {
+        "DataSampling": {"sampling_mode": "run_time_balanced"},
+        # Exp3 使用固定 12×20 R_h，conditioning 不活动，必须关闭 FiLM。
+        "ModelArchitecture": {"use_film": False},
+    }
+)
+
+
+# 几何消融复用已完成 Exp3 的 Trial23/Trial61 配方，不继承本机 JSON 或 HPO。
+# 只增加 CachePT 中的几何输入通道；原相对 Fourier 编码与输出结构保持不变。
+_EXP3_GEOMETRY_COMMON_CONFIG = {
+    "BaseInformation": {
+        "cache_dir": ".cache",
+        "log_dir": "runs",
+        "seed": 42,
+        "device": "auto",
+    },
+    "ModelArchitecture": {
+        "model_type": "convnet",
+        "stage_depths": "2,2,2,2",
+        "se_reduction": 4,
+        "p_drop": 0.0,
+        "use_film": False,
+    },
+    "TrainingLoop": {
+        "epochs": 90,
+        "patience": 15,
+        "num_workers": 0,
+        "persistent_workers": False,
+        "prefetch_factor": 3,
+        "batch_backend": "tensor_cpu",
+    },
+    "Optimization": {
+        "lr_min": 0.0,
+        "lr_warmup_steps": 0,
+        "lr_warmup_ratio": 0.2,
+        "lr_warmup_start_factor": 0.0,
+        "grad_clip": 0.3,
+        "hpo_params": None,
+    },
+    "LossFunction": {
+        "weight_mode": "none",
+        "weight_alpha": 0.5,
+        "weight_tau": 3.0,
+        "weight_q_low": 0.1,
+        "weight_q_high": 0.9,
+        "weight_power": 1.0,
+        "huber_delta": 1.0,
+        "negative_sfr_weight": 1.0,
+    },
+    "DataSampling": {"sampling_mode": "run_time_balanced"},
+    "DataAugmentation": {
+        "aug_prob": 0.0,
+        "aug_min_crop_ratio": 0.6,
+        "sfr_aug_prob": 0.0,
+    },
+    "System": {
+        "no_amp": False,
+        "cudnn_benchmark": False,
+        "skip_model_graph": True,
+        "skip_test": False,
+        "no_save": False,
+    },
+}
+
+_EXP3_GEOMETRY_OBJECTIVE_CONFIGS = {
+    "Closure": {
+        "BaseInformation": {"objective_mode": "signed_closure"},
+        "ModelArchitecture": {
+            "base_ch": 32,
+            "pos_num_bands": 8,
+            "pos_max_freq": 101.0,
+        },
+        "TrainingLoop": {"batch_size": 64},
+        "Optimization": {
+            "lr": 0.004388374713974493,
+            "weight_decay": 6.833477992130433e-06,
+        },
+        "LossFunction": {"loss": "l1"},
+    },
+    "Direct": {
+        "BaseInformation": {"objective_mode": "direct_sfr"},
+        "ModelArchitecture": {
+            "base_ch": 128,
+            "pos_num_bands": 16,
+            "pos_max_freq": 32.0,
+        },
+        "TrainingLoop": {"batch_size": 128},
+        "Optimization": {
+            "lr": 0.00992825268659391,
+            "weight_decay": 2.440185070480983e-06,
+        },
+        "LossFunction": {"loss": "mse"},
+    },
+}
+
+_EXP3_GEOMETRY_SHORTHANDS = {}
+for _ablation_number, _geometry_mode, _geometry_label in (
+    ("3.1", "absolute_radius", "AbsRadius"),
+    ("3.2", "absolute_radius_widths", "AbsRadiusWidths"),
+):
+    for _objective_label, _objective_recipe in _EXP3_GEOMETRY_OBJECTIVE_CONFIGS.items():
+        _geometry_key = (
+            f"Exp{_ablation_number}_Rh12x20_FiveRuns_"
+            f"{_objective_label}_{_geometry_label}"
+        )
+        _geometry_config = copy.deepcopy(_EXP3_GEOMETRY_COMMON_CONFIG)
+        for _section, _values in _objective_recipe.items():
+            _geometry_config.setdefault(_section, {}).update(_values)
+        _trial_label = "Trial23" if _objective_label == "Closure" else "Trial61"
+        _geometry_config["BaseInformation"].update(
+            {
+                "data_exp": (
+                    f"Exp3_Rh12x20_FiveRuns_{_objective_label}_{_geometry_label}_"
+                ),
+                # 缩短实际输出目录，完整 cache 和参数仍写入 hyperparameters.json。
+                "exp_name": f"Exp{_ablation_number}_{_objective_label}_{_trial_label}_seed42",
+                "expected_geometry_input_mode": _geometry_mode,
+            }
+        )
+        EXPERIMENT_ALIASES[_geometry_key] = {"standalone_config": _geometry_config}
+        _EXP3_GEOMETRY_SHORTHANDS[
+            f"exp{_ablation_number}-{_objective_label.lower()}"
+        ] = _geometry_key
+        if _objective_label == "Closure":
+            _EXP3_GEOMETRY_SHORTHANDS[f"exp{_ablation_number}"] = _geometry_key
+
 
 def _canonical_shorthand(value):
     value = str(value).strip()
+    if value.lower() in _EXP3_GEOMETRY_SHORTHANDS:
+        return _EXP3_GEOMETRY_SHORTHANDS[value.lower()]
     if value.lower().startswith("exp") and value[3:].isdigit():
         number = int(value[3:])
-        if 1 <= number <= 7:
+        if 1 <= number <= 8:
             return f"Exp{number}_InstantSFR_NoInitialStellarDensity_SFRConvNet"
     return value
 
@@ -93,6 +226,11 @@ def load_config(exp_key):
     """
     Load configuration from ExperimentSetting.json and flatten it.
     """
+    # 几何消融必须独立于未跟踪的本机 JSON，避免服务器或旧配置改变对照配方。
+    alias = EXPERIMENT_ALIASES.get(exp_key, {})
+    if "standalone_config" in alias:
+        return _flatten_config(exp_key, copy.deepcopy(alias["standalone_config"]))
+
     # Path to the JSON configuration file (Located in .config folder, sibling to Experiment folder)
     current_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.abspath(os.path.join(current_dir, "..", ".config", "ExperimentSetting.json"))
@@ -125,8 +263,12 @@ def load_config(exp_key):
     else:
         exp_config = full_config[exp_key]
     
-    # Flatten the configuration
-    # 展平配置
+    return _flatten_config(exp_key, exp_config)
+
+
+def _flatten_config(exp_key, exp_config):
+    """展平配置段，保持旧配置字段映射及实验名称覆盖规则。"""
+
     flat_config = {"exp_name": exp_key} # Use the key as the experiment name
     
     for section, params in exp_config.items():
@@ -327,7 +469,7 @@ if __name__ == "__main__":
         dest="experiment_flags",
         action="append",
         default=None,
-        help="Repeatable experiment key or shorthand such as exp3.",
+        help="Repeatable experiment key or shorthand such as exp3, exp3.1, exp3.2-direct.",
     )
     parser.add_argument(
         "--experiments",

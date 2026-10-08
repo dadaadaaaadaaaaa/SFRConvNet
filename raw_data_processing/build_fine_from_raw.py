@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from collections.abc import Iterable
 from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     from raw_data_processing.galaxy_data import (
@@ -32,14 +36,6 @@ except ModuleNotFoundError:  # 兼容从 raw_data_processing 目录直接运行�
     from parse_log_file import load_config, ll_dg, ll_eg
 
 
-_STABLE_FROM_START = {
-    "disk_galaxy_fiducial",
-    "disk_galaxy_supplement",
-    "disk_galaxy_fiducial_4",
-    "disk_galaxy_fiducial_7",
-}
-
-
 def _snapshot_sort_key(name: str) -> tuple[int, int | str]:
     """按 ``hdfra.<整数>`` 的数值后缀排序，非标准名称排在末尾。"""
 
@@ -51,11 +47,10 @@ def _iter_galaxy_configs(configs: dict, selected: set[str]):
     """按配置顺序产生被选择的星系运行。"""
 
     for galaxy_type, galaxy_group in configs["RawDataConfig"].items():
-        # dwarf_galaxy 使用 ATHDF，不属于本脚本的 HDFRA 输入契约。
         if galaxy_type not in configs["HdfraConfig"]:
             continue
         hdfra_config = configs["HdfraConfig"][galaxy_type]
-        if str(hdfra_config.get("format", "hdfra")).lower() != "hdfra":
+        if str(hdfra_config.get("format", "hdfra")).lower() not in ("hdfra", "athdf"):
             continue
         for nickname, galaxy_config in galaxy_group.items():
             galaxy_name = f"{galaxy_type}_{nickname}"
@@ -68,9 +63,19 @@ def _select_snapshot_rows(
     rows: list[tuple[int, str, float, int]],
     *,
     requested_indices: set[int],
+    excluded_indices: set[int],
     max_snapshots: int | None,
 ) -> list[tuple[int, str, float, int]]:
-    """按逻辑输出索引筛选 snapshot，并在最后应用数量上限。"""
+    """按逻辑输出索引包含/排除 snapshot，并在最后应用数量上限。"""
+
+    overlap = requested_indices.intersection(excluded_indices)
+    if overlap:
+        raise ValueError(
+            "同一 snapshot 不能同时出现在 --snapshot-index 和 "
+            f"--exclude-snapshot 中：{sorted(overlap)}"
+        )
+    if excluded_indices:
+        rows = [row for row in rows if row[3] not in excluded_indices]
 
     if requested_indices:
         available = {row[3] for row in rows}
@@ -88,8 +93,12 @@ def build_fine_from_raw(
     config_dir: str | os.PathLike[str] = ".config",
     galaxies: Iterable[str] = (),
     snapshot_indices: Iterable[int] = (),
+    exclude_snapshot_indices: Iterable[int] | None = None,
     max_snapshots: int | None = None,
     fine_dirname: str = "fine",
+    prediction_mode: str = "direct",
+    source_hash: str = "stat",
+    resume: bool = True,
 ) -> list[Path]:
     """依据配置批量构建 fine HDF5，并返回本次写出的文件路径。
 
@@ -97,6 +106,10 @@ def build_fine_from_raw(
     ``galaxy_data.py`` 主程序的行为；建议正式重建前先备份旧目录。
     """
 
+    if prediction_mode not in ("direct", "residual"):
+        raise ValueError("prediction_mode 必须为 direct 或 residual。")
+    if source_hash not in ("stat", "sha256"):
+        raise ValueError("source_hash 必须为 stat 或 sha256。")
     configs = load_config(str(config_dir))
     required_sections = {"BaseConfig", "RawDataConfig", "HdfraConfig"}
     missing_sections = required_sections.difference(configs)
@@ -109,8 +122,14 @@ def build_fine_from_raw(
 
     selected = set(galaxies)
     requested_indices = {int(value) for value in snapshot_indices}
+    explicit_exclusions = exclude_snapshot_indices is not None
+    excluded_indices = {
+        int(value) for value in (exclude_snapshot_indices or ())
+    }
     if any(value < 0 for value in requested_indices):
         raise ValueError("snapshot_indices 不能包含负数。")
+    if any(value < 0 for value in excluded_indices):
+        raise ValueError("exclude_snapshot_indices 不能包含负数。")
     configured_names = {
         galaxy_name
         for _, galaxy_name, _, _ in _iter_galaxy_configs(configs, set())
@@ -125,6 +144,17 @@ def build_fine_from_raw(
     for galaxy_type, galaxy_name, galaxy_config, hdfra_config in _iter_galaxy_configs(
         configs, selected
     ):
+        if hdfra_config.get("format") == "athdf":
+            if explicit_exclusions:
+                raise ValueError(
+                    "--exclude-snapshot 当前只支持二维 HDFRA 数据；"
+                    f"{galaxy_name} 是 ATHDF 三维数据。"
+                )
+            from raw_data_processing.build_snapshots_3d import build_fine_3d
+            written.extend(build_fine_3d(configs, galaxy_name, galaxy_config,
+                requested_indices, max_snapshots, fine_dirname, prediction_mode,
+                source_hash=source_hash,resume=resume))
+            continue
         hdfra_folder = raw_data_dir / galaxy_config["folder_name"] / "data"
         if not hdfra_folder.exists():
             hdfra_folder = raw_data_dir / galaxy_config["folder_name"]
@@ -149,15 +179,15 @@ def build_fine_from_raw(
             )
 
         times, output_indices = _build_snapshot_schedule(hdfra_names, galaxy_config)
-        stable_from_start = galaxy_name in _STABLE_FROM_START
         rows = [
             (position, name, float(times[position]), int(output_indices[position]))
             for position, name in enumerate(hdfra_names)
-            if stable_from_start or position > 45
+            if explicit_exclusions or position > 45
         ]
         rows = _select_snapshot_rows(
             rows,
             requested_indices=requested_indices,
+            excluded_indices=excluded_indices,
             max_snapshots=max_snapshots,
         )
 
@@ -203,6 +233,14 @@ def build_fine_from_raw(
                     "source_file_size_bytes": int(source_path.stat().st_size),
                     "time": snapshot_time,
                     "time_units": "Gyr",
+                    "time_mapping": galaxy_config.get(
+                        "time_mapping",
+                        {
+                            "mode": "linear_index",
+                            "snapshot_dt": float(galaxy_config["snapshot_dt"]),
+                            "offset": float(galaxy_config.get("offset", 0.0)),
+                        },
+                    ),
                 },
             )
             galaxy.set_coord(["fakeDim2", "fakeDim1"])
@@ -226,12 +264,29 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config-dir", default=".config", help="JSON 配置目录。")
     parser.add_argument("--fine-dirname", default="fine", help="星系数据目录下的 fine 子目录名。")
+    parser.add_argument("--prediction-mode", choices=("direct", "residual"), default="direct", help="三维字段选择；不改变二维行为。")
+    parser.add_argument("--source-hash", choices=("stat", "sha256"), default="stat",
+        help="三维源文件身份校验：stat 不额外通读大文件（默认）；sha256 最严格但较慢。")
+    parser.add_argument("--no-resume", action="store_false", dest="resume",
+        help="不跳过已有的三维输出；已有文件仍受产品签名检查保护。")
     parser.add_argument(
         "--snapshot-index",
         action="append",
         default=[],
         type=int,
         help="只处理指定逻辑/原始 snapshot index，可重复。",
+    )
+    parser.add_argument(
+        "--exclude-snapshot",
+        action="append",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help=(
+            "按逻辑/原始 snapshot index 在读取 HDF4 前排除，可重复。"
+            "未提供时沿用旧稳定性规则：除已知从起点稳定的运行外跳过前 46 帧；"
+            "一旦显式提供，本参数取代该默认规则。"
+        ),
     )
     parser.add_argument(
         "--max-snapshots",
@@ -251,13 +306,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-snapshots 必须为正整数。")
     if any(index < 0 for index in args.snapshot_index):
         parser.error("--snapshot-index 不能为负数。")
+    if args.exclude_snapshot is not None and any(
+        index < 0 for index in args.exclude_snapshot
+    ):
+        parser.error("--exclude-snapshot 不能为负数。")
     try:
         written = build_fine_from_raw(
             config_dir=args.config_dir,
             galaxies=args.galaxy,
             snapshot_indices=args.snapshot_index,
+            exclude_snapshot_indices=args.exclude_snapshot,
             max_snapshots=args.max_snapshots,
             fine_dirname=args.fine_dirname,
+            prediction_mode=args.prediction_mode,
+            source_hash=args.source_hash,
+            resume=args.resume,
         )
     except ValueError as exc:
         parser.error(str(exc))

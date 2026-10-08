@@ -6,12 +6,25 @@ snapshot 加载、通道选择、标准化、分组及划分。作者：Peng Che
 """
 
 import os
+import re
+import sys
 import warnings
+
+# 兼容直接运行脚本时，三维子模块的包内导入。
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import h5py
 import numpy as np
 
 from typing import Callable, List, Tuple
+
+from raw_data_processing.geometry_features import (
+    GEOMETRY_INPUT_CHANNELS,
+    build_geometry_input_features,
+    geometry_input_channels,
+    geometry_input_contract,
+)
 
 try:
     from raw_data_processing.metadata_schema import (
@@ -102,6 +115,45 @@ def _validate_macer_dataset_labels(handle, datasets: set[str]) -> None:
                 f"{dataset_name} 的 long_name={long_name!r} 与预期语义不符；"
                 "该运行可能因条件输出导致 Data-Set 编号偏移。"
             )
+
+
+_HDF_SNAPSHOT_TIME_RE = re.compile(
+    r"AT\s+TIME\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[DEde][+-]?\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _validate_macer_snapshot_time(handle, expected_time: float) -> None:
+    """按 HDF 标签的打印精度核验配置时间，防止日志上下文静默错配。"""
+
+    try:
+        long_name = str(handle.select("Data-Set-11").attributes()["long_name"])
+    except Exception as exc:
+        raise ValueError("无法从 Data-Set-11 long_name 核验 snapshot 时间。") from exc
+    match = _HDF_SNAPSHOT_TIME_RE.search(long_name)
+    if match is None:
+        raise ValueError(
+            f"Data-Set-11 的 long_name={long_name!r} 不含 'AT TIME='；"
+            "无法确认日志匹配时间。"
+        )
+    token = match.group(1).upper().replace("D", "E")
+    stored_time = float(token)
+    mantissa, exponent = token.split("E") if "E" in token else (token, "0")
+    decimals = len(mantissa.split(".", 1)[1]) if "." in mantissa else 0
+    # HDF 只保留格式化时间；容差取最后一位打印精度的一半。
+    rounding_tolerance = 0.50001 * 10.0 ** (int(exponent) - decimals)
+    if not np.isclose(
+        stored_time,
+        float(expected_time),
+        rtol=0.0,
+        atol=rounding_tolerance + 1.0e-12,
+    ):
+        raise ValueError(
+            "配置生成的 snapshot 时间与 HDF 标签不一致："
+            f"expected={expected_time:.12g} Gyr, HDF={token} Gyr, "
+            f"rounding_tolerance={rounding_tolerance:.3g} Gyr。"
+            "拒绝用错误时间选择日志中的 mbh/dt。"
+        )
 
 
 def _validate_half_open_range(value, config_key: str) -> tuple[int, int]:
@@ -213,7 +265,45 @@ def _build_snapshot_schedule(hdfra_paths: List[str], gal_config: dict) -> tuple[
             f"found {len(hdfra_paths)} files but generated {len(physical_indices)} indices. "
             "Use filename_index mode for flattened data with missing snapshots."
         )
-    time_seq = physical_indices.astype(np.float64) * snapshot_dt + offset
+    time_mapping = gal_config.get("time_mapping")
+    if time_mapping is None:
+        time_seq = physical_indices.astype(np.float64) * snapshot_dt + offset
+    else:
+        if mode != "filename_index":
+            raise ValueError("'time_mapping' 当前只支持 filename_index 模式。")
+        if not isinstance(time_mapping, dict):
+            raise ValueError("'time_mapping' 必须是 JSON 对象。")
+        mapping_mode = time_mapping.get("mode")
+        if mapping_mode != "segmented_restart_absolute":
+            raise ValueError(
+                "Unsupported time_mapping mode; expected "
+                "'segmented_restart_absolute'."
+            )
+        try:
+            index_zero_time = float(time_mapping["index_zero_time"])
+            positive_index_offset = float(time_mapping["positive_index_offset"])
+            cycle_size = int(time_mapping["segment_cycle_size"])
+            extra_steps = int(time_mapping["extra_time_steps_per_segment"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "segmented_restart_absolute 需要 index_zero_time、"
+                "positive_index_offset、segment_cycle_size 和 "
+                "extra_time_steps_per_segment。"
+            ) from exc
+        if not np.isfinite(index_zero_time) or not np.isfinite(positive_index_offset):
+            raise ValueError("time_mapping 中的时间必须有限。")
+        if cycle_size <= 0 or extra_steps < 0:
+            raise ValueError(
+                "segment_cycle_size 必须为正，extra_time_steps_per_segment 不能为负。"
+            )
+        time_seq = np.full(physical_indices.shape, index_zero_time, dtype=np.float64)
+        positive = physical_indices > 0
+        completed_segments = (physical_indices[positive] - 1) // cycle_size
+        effective_steps = physical_indices[positive] + completed_segments * extra_steps
+        time_seq[positive] = (
+            positive_index_offset
+            + effective_steps.astype(np.float64) * snapshot_dt
+        )
     if not np.all(np.isfinite(time_seq)):
         raise ValueError("Computed snapshot times contain NaN or infinity.")
     return time_seq, output_indices
@@ -736,7 +826,14 @@ class GalData:
         datasets_to_validate.add("Data-Set-15")
         if target_config is not None:
             datasets_to_validate.add(str(target_config["dataset"]))
-        _validate_macer_dataset_labels(self._data_hdfra, datasets_to_validate)
+        try:
+            _validate_macer_dataset_labels(self._data_hdfra, datasets_to_validate)
+            if target_config is not None and str(target_config["dataset"]) == "Data-Set-11":
+                _validate_macer_snapshot_time(self._data_hdfra, self.time)
+        except Exception:
+            self._data_hdfra.end()
+            self._data_hdfra = None
+            raise
         self._load_log(log_path, func_parse_log, scope)
         self._pending_source_metadata = dict(source_metadata) if source_metadata is not None else None
         if target_config is not None:
@@ -810,6 +907,11 @@ class GalData:
             if key in target_config:
                 self._target_metadata[key] = float(target_config[key])
         return self
+
+    def read_athdf(self, path, **kwargs):
+        """返回 (r,theta,phi) 契约的三维对象；调用方需接收返回值。"""
+        from raw_data_processing.galaxy_data_3d import GalData3D
+        return GalData3D.from_raw(path, **kwargs)
 
     def _as_coarsening_input(self):
         """Build the pure-array input contract used by all coarsening modules."""
@@ -1192,6 +1294,9 @@ class GalData:
             file_path (str): Path to the input HDF5 file.
         """
         with h5py.File(file_path, "r") as f:
+            if f.attrs.get("macnet_3d_format") == 1:
+                from raw_data_processing.galaxy_data_3d import GalData3D
+                return GalData3D.load_h5(file_path)
             ndim = f["coordinates"].attrs["ndim"]
             coordinate_mode = f["coordinates"].attrs["coordinate_mode"]
             if isinstance(coordinate_mode, bytes):
@@ -1516,6 +1621,7 @@ class GalDataSet:
         self._target_metadata = {}
         self._coarsening_signature = None
         self._coordinate_reference = None
+        self._geometry_input_mode = "none"
 
     # --------- Properties -------- 将零散的天体物理快照数据，无缝转化为 Python 机器学习框架可以直接摄入的标准张量格式
 
@@ -1537,6 +1643,18 @@ class GalDataSet:
         """Names of the physical-field channels, in the same order as ``x``."""
         self.__verify_data_loaded()
         return tuple(self._x_keys)
+
+    @property
+    def geometry_input_mode(self) -> str:
+        """返回追加物理尺度输入的消融模式。"""
+
+        return self._geometry_input_mode
+
+    @property
+    def geometry_input_contract(self) -> dict:
+        """返回尺度通道契约；configured channels 不受后续通道排除影响。"""
+
+        return geometry_input_contract(self._geometry_input_mode)
 
     @property
     def target_metadata(self) -> dict:
@@ -1705,6 +1823,8 @@ class GalDataSet:
                 raise ValueError("Cannot combine datasets defined on different coordinate grids.")
         if self._x_keys != other._x_keys or self._coord_keys != other._coord_keys:
             raise ValueError("Cannot combine datasets with different input channels or coordinates.")
+        if self.geometry_input_contract != other.geometry_input_contract:
+            raise ValueError("不能合并 geometry_input_mode 不同的数据集。")
 
         new_dataset = GalDataSet()
         new_dataset._x_keys = self._x_keys
@@ -1712,6 +1832,7 @@ class GalDataSet:
         new_dataset._target_metadata = self._target_metadata.copy()
         new_dataset._coarsening_signature = self._coarsening_signature
         new_dataset._coordinate_reference = self._coordinate_reference
+        new_dataset._geometry_input_mode = self._geometry_input_mode
 
         new_dataset._raw_data = {}
         for key in self._raw_data:
@@ -1766,6 +1887,7 @@ class GalDataSet:
         allow_mixed_coarsening: bool = False,
         require_complete_metadata: bool = False,
         show_progress: bool = False,
+        geometry_input_mode: str = "none",
     ) -> "GalDataSet":
         """
         整个数据集的入口。它接收一个或多个文件夹路径，遍历里面所有的 HDF5 数据文件。
@@ -1778,6 +1900,8 @@ class GalDataSet:
             folder_path (str | list[str]): Path to the folder(s) containing the data files.
             show_progress (bool): 是否显示跨输入目录的逐 snapshot 加载进度，默认关闭。
         """
+        geometry_channels = geometry_input_channels(geometry_input_mode)
+        self._geometry_input_mode = geometry_input_mode
         # Handle folder paths
         folder_path = folder_path if isinstance(folder_path, list) else [folder_path]
         
@@ -1805,7 +1929,9 @@ class GalDataSet:
         )[0]
         data_path = os.path.join(self.folder_path[0], first_file)
         
-        data.load_h5(data_path)
+        data = data.load_h5(data_path)
+        if data.ndim == 3:
+            raise ValueError("三维 processed 数据请使用 GalData3D；当前 GalDataSet/二维训练缓存尚未支持三维。")
         self._target_metadata = data.target_metadata
         def processing_signature(sample: GalData) -> tuple:
             derivation = sample.metadata.get("derivation", {})
@@ -1829,6 +1955,9 @@ class GalDataSet:
         self._x_keys = list(data.snapshot.keys())
         self._coord_keys = [f"coordinate_{i}" for i in range(len(data.coordinate))]
         self._x_keys += ["gas_mass", "grid_volume"] 
+        if set(geometry_channels).intersection(self._x_keys):
+            raise ValueError("processed snapshot 字段与派生几何输入通道重名，拒绝覆盖。")
+        self._x_keys += list(geometry_channels)
         keys = (
             self._x_keys
             + self._coord_keys
@@ -1919,6 +2048,16 @@ class GalDataSet:
                     self._raw_data[f"coordinate_{i}"].append(coord)
                 self._raw_data["gas_mass"].append(data.gas_mass)
                 self._raw_data["grid_volume"].append(data.grid_volume)
+                geometry_fields = build_geometry_input_features(
+                    axes=data.raw_axes,
+                    axis_edges=data._axis_edges,
+                    coordinate_mode=data._coordinate_mode,
+                    ndim=data.ndim,
+                    shape=data.grid_volume.shape,
+                    mode=self._geometry_input_mode,
+                )
+                for name, values in geometry_fields.items():
+                    self._raw_data[name].append(values)
                 # self._raw_data["mbh"].append(data.mbh)
                 self._raw_data["sfr_target"].append(data.sfr_target)
                 # self._raw_data["mdot_edd"].append(data.mdot_edd)
@@ -2095,8 +2234,8 @@ class GalDataSet:
 
         if not 0 < train_size < 1:
             raise ValueError("train_size must be between 0 and 1.")
-        if validation_size < 0 or train_size + validation_size >= 1:
-            raise ValueError("validation_size must be non-negative and train_size + validation_size < 1.")
+        if validation_size < 0 or train_size + validation_size > 1:
+            raise ValueError("validation_size must be non-negative and train_size + validation_size <= 1.")
 
         rng = np.random.default_rng(random_state)
         indices = np.arange(len(self))
@@ -2173,8 +2312,13 @@ class GalDataSet:
         return (train_set, val_set, test_set) if validation_size > 0 else (train_set, test_set)
 
     def standardize( #消除不同物理量量纲差异带来的影响，加速神经网络收敛。
-        self, mean: np.ndarray = None, std: np.ndarray = None, log_transform: bool = True
-    ) -> np.ndarray | Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self,
+        mean: np.ndarray = None,
+        std: np.ndarray = None,
+        log_transform: bool = True,
+        log_transform_mask: np.ndarray = None,
+        return_log_transform_mask: bool = False,
+    ) -> np.ndarray | tuple:
         """
         Standardizes the input features x to have zero mean and unit variance.
         Args:
@@ -2185,22 +2329,57 @@ class GalDataSet:
         self.__verify_data_loaded()
         x = self.x.copy()  # Use copy to avoid modifying original data
         if log_transform: # 对非负物理场应用log（1+x）变换，压缩极端数值
-            # Safely apply log1p only to non-negative channels (scalars like density, temperature, etc.)
-            # Velocities and other signed quantities should remain linear.
-            # We check the minimum value across all samples for each channel.
-            for i in range(x.shape[1]):
-                if np.min(x[:, i]) >= 0:
-                    x[:, i] = np.log1p(x[:, i])
+            if log_transform_mask is None:
+                # 只有训练集可以决定 log1p 通道；验证/测试必须复用训练掩码。
+                log_transform_mask = np.asarray(
+                    [
+                        name not in GEOMETRY_INPUT_CHANNELS and np.min(x[:, i]) >= 0
+                        for i, name in enumerate(self._x_keys)
+                    ],
+                    dtype=bool,
+                )
+            else:
+                log_transform_mask = np.asarray(
+                    log_transform_mask, dtype=bool
+                ).reshape(-1)
+                if log_transform_mask.size != x.shape[1]:
+                    raise ValueError(
+                        "log_transform_mask 长度必须等于输入通道数："
+                        f"{log_transform_mask.size} != {x.shape[1]}。"
+                    )
+                if any(
+                    name in GEOMETRY_INPUT_CHANNELS and log_transform_mask[i]
+                    for i, name in enumerate(self._x_keys)
+                ):
+                    raise ValueError("已做固定参考 log10 的几何通道不能再次应用 log1p。")
+            for i, use_log in enumerate(log_transform_mask):
+                if not use_log:
+                    continue
+                minimum = float(np.min(x[:, i]))
+                if minimum < 0:
+                    raise ValueError(
+                        "训练集声明为非负并使用 log1p 的通道在当前 split 出现负值："
+                        f"channel={i}, min={minimum:.6e}。请检查坏帧和字段语义。"
+                    )
+                x[:, i] = np.log1p(x[:, i])
+        else:
+            if log_transform_mask is not None and np.any(log_transform_mask):
+                raise ValueError("log_transform=False 时不能提供启用项的 log_transform_mask。")
+            log_transform_mask = np.zeros(x.shape[1], dtype=bool)
 
         if mean is None or std is None:
             mean = np.mean(x, axis=(0, 2, 3), keepdims=True)
             std = np.std(x, axis=(0, 2, 3), keepdims=True)
             std_safe = np.where(std == 0, 1.0, std)
             x = (x - mean) / std_safe
+            if return_log_transform_mask:
+                return x, mean, std_safe, log_transform_mask
             return x, mean, std_safe
         elif mean is not None and std is not None: # 标准化，使得测试集上应用完全相同的缩放比例。
             std_safe = np.where(std == 0, 1, std)
             x = (x - mean) / std_safe
+            if return_log_transform_mask:
+                return x, log_transform_mask
             return x
         else:
             raise ValueError("Both mean and std must be provided for standardization.")
@@ -2317,6 +2496,12 @@ class GalDataSet:
         n = len(group_idx)
         n_train = int(train_size * n)
         n_val = int(validation_size * n) if validation_size > 0 else 0
+        # 当 train+validation 恰好覆盖全集时，把整数取整余数交给 validation，
+        # 避免 75/25 等二路划分意外遗留一个未使用的 test 样本。
+        if validation_size > 0 and np.isclose(
+            train_size + validation_size, 1.0, rtol=0.0, atol=1e-12
+        ):
+            n_val = n - n_train
 
         # guard against rounding overflow
         excess = n_train + n_val - n
@@ -2357,6 +2542,7 @@ class GalDataSet:
         ds._target_metadata = self._target_metadata.copy()
         ds._coarsening_signature = self._coarsening_signature
         ds._coordinate_reference = self._coordinate_reference
+        ds._geometry_input_mode = self._geometry_input_mode
         ds._raw_data = {k: [self._raw_data[k][i] for i in idx] for k in self._raw_data}
         ds._group_labels = [self._group_labels[i] for i in idx]
         ds.folder_path = self.folder_path.copy() if self.folder_path is not None else None
@@ -2441,6 +2627,9 @@ if __name__ == "__main__":
     coordinate_mode = "polar" # 采用极坐标系
 
     for gal_type, gal_group in configs["RawDataConfig"].items(): # 便利所有星系类型和组
+        if configs["HdfraConfig"].get(gal_type, {}).get("format") == "athdf":
+            print("[三维] 请使用 build_fine_from_raw.py 与 build_coarse_from_fine.py。")
+            continue
         # if gal_type == "elliptical_galaxy":
         #     continue  # Skip elliptical galaxies for 2D processing
         for gal_nickname, gal_config in gal_group.items():
@@ -2536,6 +2725,14 @@ if __name__ == "__main__":
                         "source_file_size_bytes": int(os.path.getsize(file_path)),
                         "time": float(time_seq[index]),
                         "time_units": "Gyr",
+                        "time_mapping": gal_config.get(
+                            "time_mapping",
+                            {
+                                "mode": "linear_index",
+                                "snapshot_dt": float(gal_config["snapshot_dt"]),
+                                "offset": float(gal_config.get("offset", 0.0)),
+                            },
+                        ),
                     },
                 )
                 file.set_coord(["fakeDim2", "fakeDim1"]) # 创建坐标轴，并用set_coord重新指定物理网格的坐标轴映射

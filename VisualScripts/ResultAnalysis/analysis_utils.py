@@ -65,6 +65,8 @@ PROJECT_ROOT = setup_project_env()
 
 # Project Imports
 try:
+    from Experiment.geometry_contract import validate_geometry_contract
+    from raw_data_processing.geometry_features import geometry_input_contract
     from raw_data_processing.galaxy_data import GalDataSet
     from Experiment.target_transform import (
         inverse_transform_sfr,
@@ -333,6 +335,10 @@ def load_norm_stats(norm_path):
         for key in scalar_keys:
             if key in data:
                 result[key] = data[key].item()
+        if "log_transform_mask" in data:
+            result["log_transform_mask"] = np.asarray(data["log_transform_mask"], dtype=bool)
+        if "geometry_input_contract_json" in data:
+            result["geometry_input_contract"] = json.loads(data["geometry_input_contract_json"].item())
         return result
 
 
@@ -380,8 +386,25 @@ class CachedPTDataset:
         if isinstance(loaded, dict):
             schema = loaded.get("schema", {})
             schema_version = int(schema.get("version", -1))
-            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4, 5}:
+            if schema.get("name") != "macnet_sfr_cache" or schema_version not in {3, 4, 5, 6}:
                 raise RuntimeError(f"Unsupported cache schema in '{pt_path}': {schema!r}")
+            model_contract = loaded.get("model_input_contract", {})
+            self.log_transform_mask = loaded.get("preprocessing_contract", {}).get("log_transform_mask")
+            if schema_version == 6:
+                raw_geometry = model_contract.get("geometry_inputs")
+                if not isinstance(raw_geometry, dict) or raw_geometry.get("mode") == "none":
+                    raise RuntimeError("Version-6 分析 cache 必须声明活动几何输入。")
+                payload_names = tuple(model_contract.get("input_channels", ()))
+                if self.input_channels and self.input_channels != payload_names:
+                    raise RuntimeError("分析 cache 的 payload 与 sidecar 通道不一致。")
+                self.input_channels = payload_names
+                self.geometry_input_contract = validate_geometry_contract(
+                    model_contract.get("geometry_inputs"), payload_names,
+                    loaded.get("preprocessing_contract", {}).get("log_transform_mask"),
+                )
+                sidecar_geometry = channel_metadata.get("geometry_input_contract")
+                if sidecar_geometry is not None and sidecar_geometry != self.geometry_input_contract:
+                    raise RuntimeError("分析 cache 的 payload 与 sidecar 几何契约不一致。")
             tensors = loaded["tensors"]
             self.x = tensors["x"]
             self.coord = tensors["coord"]
@@ -576,6 +599,8 @@ class HDF5Dataset:
         reference_dataset=None,
         target_metadata=None,
         exclude_raw_snapshot_indices=None,
+        geometry_input_mode=None,
+        log_transform_mask=None,
     ):
         if isinstance(hdf5_conf, (list, tuple)):
             self.folder_path = hdf5_conf[0]
@@ -584,7 +609,12 @@ class HDF5Dataset:
 
         self.type = os.path.basename(os.path.dirname(self.folder_path)).lower()
 
-        loaded = GalDataSet().load_data((self.folder_path, 0))
+        reference_geometry = getattr(reference_dataset, "geometry_input_contract", None)
+        mode = geometry_input_mode if geometry_input_mode is not None else (reference_geometry or {}).get("mode", "none")
+        if reference_geometry is not None and mode != reference_geometry["mode"]:
+            raise RuntimeError("HDF5 分析指定的几何模式与 reference cache 不一致。")
+        loaded = GalDataSet().load_data((self.folder_path, 0), geometry_input_mode=mode)
+        self.geometry_input_contract = geometry_input_contract(mode)
         loaded.drop_invalid(require_positive_targets=False, require_positive_ks=False)
         if exclude_raw_snapshot_indices:
             loaded.exclude_raw_snapshot_indices(exclude_raw_snapshot_indices)
@@ -602,6 +632,12 @@ class HDF5Dataset:
         loaded.select_input_channels(include=input_channels, exclude=exclude_channels)
         self.input_channels = loaded.input_channels
         self.excluded_channels = tuple(exclude_channels or ())
+        if log_transform_mask is None:
+            log_transform_mask = getattr(reference_dataset, "log_transform_mask", None)
+        if mode != "none":
+            if mean is None or std is None:
+                raise RuntimeError("几何消融 HDF5 分析必须复用训练集 mean/std，不能在测试域估计。")
+            validate_geometry_contract(self.geometry_input_contract, self.input_channels, log_transform_mask)
 
         native_shape = tuple(loaded.x.shape[-2:])
         reference_shape = (
@@ -628,9 +664,9 @@ class HDF5Dataset:
                     f"{len(self.input_channels)} ({self.input_channels}). Pass input_channels, "
                     "exclude_channels, or reference_dataset from the matching cached experiment."
                 )
-            self.x = loaded.standardize(mean, std, log_transform=log_transform)
+            self.x = loaded.standardize(mean, std, log_transform=log_transform, log_transform_mask=log_transform_mask)
         else:
-            self.x, _, _ = loaded.standardize(log_transform=log_transform)
+            self.x, _, _ = loaded.standardize(log_transform=log_transform, log_transform_mask=log_transform_mask)
         self.coord = loaded.coordinate
         if reference_shape is not None and tuple(self.x.shape[-2:]) != reference_shape:
             raise RuntimeError(
@@ -808,6 +844,13 @@ def load_analysis_model(model_path, device, datasets_dict=None):
                     f"{dataset_n_channels}."
                 )
             dataset_channels = tuple(getattr(ref_ds, "input_channels", ()))
+            checkpoint_geometry = state.get("geometry_input_contract") if isinstance(state, dict) else None
+            configured_geometry = loaded_params.get("geometry_input_contract") if loaded_params else None
+            if checkpoint_geometry is not None and configured_geometry is not None and checkpoint_geometry != configured_geometry:
+                raise ValueError("Checkpoint 与 hyperparameters 的几何输入契约不一致。")
+            expected_geometry = checkpoint_geometry if checkpoint_geometry is not None else configured_geometry
+            if expected_geometry is not None and expected_geometry.get("mode") != "none" and expected_geometry != getattr(ref_ds, "geometry_input_contract", None):
+                raise ValueError("Checkpoint 与分析 cache 的几何输入契约不一致。")
             if checkpoint_channels and dataset_channels and checkpoint_channels != dataset_channels:
                 raise ValueError(
                     f"Model channels {checkpoint_channels} do not match dataset channels "
@@ -1134,6 +1177,22 @@ def predict_dataset(ds, model, device, model_type, batch_size=32, return_feats=F
     if hasattr(ds, "mdot_edd") and ds.mdot_edd is not None:
         df["mdot_edd"] = ensure_numpy(ds.mdot_edd).reshape(-1)
 
+    # 保留版本化 cache 中的样本身份，供多个 split 合并后按物理 snapshot 去重。
+    # 特别是 oversample 后的 train cache 会重复同一个 sample_uid；若不传播 UID，
+    # 完整时间历史与累计 SFR 会对这些 snapshot 重复计数。
+    for identity_name in ("sample_uid", "parent_hr_uid"):
+        identity = getattr(ds, identity_name, None)
+        if identity is None:
+            continue
+        identity = np.asarray(identity, dtype=str).reshape(-1)
+        if identity.size == 0:
+            continue
+        if identity.size != len(df):
+            raise RuntimeError(
+                f"{identity_name} has {identity.size} entries but prediction has {len(df)} rows."
+            )
+        df[identity_name] = identity
+
     df["error"] = df["y_pred"] - df["y_true"]
     df["sfr_error"] = df["sfr_pred"] - df["sfr_true"]
 
@@ -1166,7 +1225,10 @@ def save_to_h5(path, df, feats, x_data, ds_type):
             f.attrs["closure_scale"] = float(df.attrs["closure_scale"])
         for key, value in _target_metadata_from(df).items():
             f.attrs[f"target_{key}"] = value
-        f.create_dataset("x", data=x_data, compression="gzip")
+        # 结果分析通常只需要预测表。允许省略体积很大的输入张量与 latent，
+        # 避免把 cache 中已有的 x 再次 gzip 压缩并写入 prediction_data。
+        if x_data is not None:
+            f.create_dataset("x", data=x_data, compression="gzip")
         f.create_dataset("y_true", data=df["y_true"].values)
         f.create_dataset("y_pred", data=df["y_pred"].values)
         for column in (
@@ -1184,6 +1246,14 @@ def save_to_h5(path, df, feats, x_data, ds_type):
         if "type" in df.columns:
             dt = h5py.special_dtype(vlen=str)
             f.create_dataset("label", data=df["type"].values.astype(object), dtype=dt)
+        for identity_name in ("sample_uid", "parent_hr_uid", "split"):
+            if identity_name in df.columns:
+                dt = h5py.special_dtype(vlen=str)
+                f.create_dataset(
+                    identity_name,
+                    data=df[identity_name].values.astype(object),
+                    dtype=dt,
+                )
         if feats is not None:
             f.create_dataset("latent", data=feats)
         if "y_baseline" in df.columns:

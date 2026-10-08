@@ -18,6 +18,10 @@ print(os.getcwd())
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from raw_data_processing.galaxy_data import GalDataSet
+from raw_data_processing.geometry_features import (
+    SUPPORTED_GEOMETRY_INPUT_MODES,
+    geometry_input_contract,
+)
 from raw_data_processing.parse_log_file import load_config
 from Experiment.target_transform import (
     SUPPORTED_CLOSURE_TRANSFORMS,
@@ -25,6 +29,7 @@ from Experiment.target_transform import (
     transform_sfr,
     transform_signed_closure,
 )
+from Experiment.geometry_contract import validate_geometry_contract
 
 
 def _optional_sample_array(data, names):
@@ -50,6 +55,15 @@ _RM_OPERATOR_IDS = {
     "axisymmetric_rm_v0",
     "axisymmetric_rm_v1",
 }
+
+_ZOU_FIVE_GROUPS = (
+    "disk_galaxy_fiducial",
+    "disk_galaxy_fiducial_4",
+    "disk_galaxy_fiducial_7",
+    "disk_galaxy_model_0_75",
+    "disk_galaxy_model_1_1",
+)
+_TORUS_TEST_GROUP = "disk_galaxy_torus_100yr"
 
 
 def _resolve_conditioning_contract(data):
@@ -131,6 +145,8 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         self._dataset = dataset
         self._last_cache_schema_version = None
         self._last_conditioning_contract = None
+        self._last_log_transform_mask = None
+        self._last_geometry_input_contract = None
 
     # ------------ Properties -----------
 
@@ -151,6 +167,16 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         if self._last_conditioning_contract is None:
             return None
         return dict(self._last_conditioning_contract)
+
+    @property
+    def last_log_transform_mask(self):
+        if self._last_log_transform_mask is None:
+            return None
+        return np.asarray(self._last_log_transform_mask, dtype=bool).copy()
+
+    @property
+    def last_geometry_input_contract(self):
+        return self._last_geometry_input_contract
 
     # ------------ Dunder Methods ------------
 
@@ -177,12 +203,14 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         require_complete_metadata: bool = False,
         exclude_raw_snapshot_indices=(),
         show_progress: bool = False,
+        geometry_input_mode: str = "none",
     ):
         self._dataset = GalDataSet().load_data(
             path,
             allow_mixed_coarsening=allow_mixed_coarsening,
             require_complete_metadata=require_complete_metadata,
             show_progress=show_progress,
+            geometry_input_mode=geometry_input_mode,
         )
         target_quantity = self._dataset.target_metadata.get("quantity")
         if require_target_quantity and target_quantity != require_target_quantity:
@@ -239,12 +267,34 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         objective_mode: str = "direct_sfr",
         closure_transform: str = "signed_asinh",
         closure_scale: float = 1.0,
+        log_transform_mask=None,
     ):
         data = self._dataset
+        geometry_contract = getattr(
+            data, "geometry_input_contract", geometry_input_contract("none")
+        )
+        geometry_active = geometry_contract["mode"] != "none"
+        if geometry_active and os.path.exists(save_path):
+            raise FileExistsError(f"拒绝覆盖已有几何消融 cache：{save_path}")
         if mean is not None and std is not None: # 验证集&测试集
-            x = data.standardize(mean, std)
+            x, resolved_log_mask = data.standardize(
+                mean,
+                std,
+                log_transform_mask=log_transform_mask,
+                return_log_transform_mask=True,
+            )
         else: # 训练集
-            x, mean, std = data.standardize()
+            x, mean, std, resolved_log_mask = data.standardize(
+                log_transform_mask=log_transform_mask,
+                return_log_transform_mask=True,
+            )
+        self._last_log_transform_mask = np.asarray(
+            resolved_log_mask, dtype=bool
+        ).reshape(-1)
+        validate_geometry_contract(
+            geometry_contract, getattr(data, "input_channels", ()),
+            self._last_log_transform_mask,
+        )
         target_sfr_physical = np.asarray(data.sfr_target, dtype=np.float64).reshape(-1)
         y = transform_sfr(
             target_sfr_physical,
@@ -261,6 +311,8 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
         )
         conditioning_scalar, conditioning_contract = _resolve_conditioning_contract(data)
         is_legacy_rm_contract = conditioning_contract["name"] == "log_mass_filter"
+        if geometry_active and is_legacy_rm_contract:
+            raise ValueError("当前几何输入消融只支持固定 R_h，不复用 R_m FiLM 条件。")
         baseline_physical = _optional_sample_array(
             data,
             ("sfr_macer_baseline", "sfr_baseline", "macer_sfr_baseline", "baseline_sfr"),
@@ -341,9 +393,12 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
             # v3/v4 的 conditioning 语义已经固定为 log_mass_filter；R_h 使用
             # v5，避免在不提升版本的情况下改变历史 schema 含义。
             cache_version = 5
+        if geometry_active:
+            cache_version = 6
         has_closure_payload = baseline_physical is not None
         self._last_cache_schema_version = cache_version
         self._last_conditioning_contract = dict(conditioning_contract)
+        self._last_geometry_input_contract = geometry_contract
         resolution_features = (
             ["log_mass_filter"] if is_legacy_rm_contract else []
         )
@@ -355,6 +410,15 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                     "sample_uid": data.sample_uid.tolist(),
                     "parent_hr_uid": data.parent_hr_uid.tolist(),
                 },
+                "preprocessing_contract": {
+                    "input_transform": (
+                        "physical_log1p_and_fixed_reference_log10_geometry_then_standardize"
+                        if geometry_active else "per_channel_log1p_then_standardize"
+                    ),
+                    "log_transform_mask": self._last_log_transform_mask.tolist(),
+                    "log_transform_mask_source": "training_split",
+                    "normalization_source": "training_split",
+                },
                 "model_input_contract": {
                     "physical_fields": "x",
                     "conditioning": conditioning_contract,
@@ -362,6 +426,8 @@ class CachePt: # 特征过滤、数据集划分、镜像扩增、样本平衡、
                     "reserved_resolution_features": ["h_eff", "n_eff"],
                     "baseline_is_model_input": False,
                     "baseline_is_output_composition": has_closure_payload,
+                    "geometry_inputs": geometry_contract,
+                    "input_channels": list(getattr(data, "input_channels", ())),
                 },
                 "learning_contract": {
                     "available_objectives": (
@@ -405,6 +471,8 @@ def _save_norm_stats(
     oversample_groups=True,
     split_metadata=None,
     closure_scale_selection=None,
+    log_transform_mask=None,
+    geometry_inputs=None,
 ): # 接收CachePt处理训练集时算出来的mean和std，打包保存成npz文件
     norm_path = f"{save_path}norm.npz"
     channel_names = np.asarray(tuple(input_channels), dtype=str)
@@ -438,7 +506,7 @@ def _save_norm_stats(
         else []
     )
     metadata = {
-        "format_version": 2,
+        "format_version": 3 if resolved_cache_schema_version >= 6 else 2,
         "input_channels": channel_names.tolist(),
         "excluded_channels": excluded_names.tolist(),
         "n_input_channels": int(len(channel_names)),
@@ -480,6 +548,16 @@ def _save_norm_stats(
         "baseline_transform": target_transform,
         "resolution_features": resolution_features,
         "reserved_resolution_features": ["h_eff", "n_eff"],
+        "log_transform_mask": (
+            np.asarray(log_transform_mask, dtype=bool).reshape(-1).tolist()
+            if log_transform_mask is not None
+            else []
+        ),
+        "log_transform_mask_source": "training_split",
+        "geometry_input_contract": (
+            geometry_inputs if geometry_inputs is not None
+            else geometry_input_contract("none")
+        ),
     }
     if split_metadata:
         overlap = set(split_metadata.get("train_groups", ())).intersection(
@@ -517,6 +595,10 @@ def _save_norm_stats(
         closure_scale_mode=np.asarray(metadata["closure_scale_selection"]["mode"]),
         closure_scale_method=np.asarray(metadata["closure_scale_selection"]["method"]),
         cache_schema_version=np.asarray(metadata["cache_schema_version"]),
+        log_transform_mask=np.asarray(metadata["log_transform_mask"], dtype=bool),
+        geometry_input_contract_json=np.asarray(
+            json.dumps(metadata["geometry_input_contract"], sort_keys=True)
+        ),
     )
     metadata_path = f"{save_path}metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -636,6 +718,7 @@ def _write_train_cache_with_resolved_closure_scale(
     if requested_scale != "auto":
         resolved_options["closure_scale"] = float(requested_scale)
         mean, std = train_cache.to_pt(final_train_path, **resolved_options)
+        resolved_options["log_transform_mask"] = train_cache.last_log_transform_mask
         selection = {
             "mode": "explicit",
             "source_split": None,
@@ -655,6 +738,7 @@ def _write_train_cache_with_resolved_closure_scale(
     print(f"[INFO] 写入临时训练 cache 以估计 closure scale: {temporary_train_path}")
     try:
         train_cache.to_pt(temporary_train_path, **provisional_options)
+        resolved_options["log_transform_mask"] = train_cache.last_log_transform_mask
         scale, selection = _estimate_closure_scale_from_pt(temporary_train_path)
     finally:
         if os.path.exists(temporary_train_path):
@@ -677,10 +761,10 @@ def _parse_experiment_tokens(values):
             token = token.strip().lower()
             if not token:
                 continue
-            match = re.fullmatch(r"(?:exp)?([1-4])", token)
+            match = re.fullmatch(r"(?:exp)?(1|2|3|4|8)", token)
             if not match:
                 raise argparse.ArgumentTypeError(
-                    f"Unsupported experiment {token!r}; choose exp1, exp2, exp3, or exp4."
+                    f"Unsupported experiment {token!r}; choose exp1, exp2, exp3, exp4, or exp8."
                 )
             name = f"exp{match.group(1)}"
             if name not in normalized:
@@ -792,6 +876,13 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--geometry-input-mode",
+        choices=SUPPORTED_GEOMETRY_INPUT_MODES,
+        default="none",
+        help=("none 保持原输入；absolute_radius 为 Exp3.1；"
+              "absolute_radius_widths 为 Exp3.2。几何 log10 通道只做训练集标准化。"),
+    )
+    parser.add_argument(
         "--target-transform",
         choices=SUPPORTED_TARGET_TRANSFORMS,
         default="log10_1p",
@@ -862,8 +953,8 @@ def _parse_args():
         default=None,
         metavar="EXP",
         help=(
-            "Experiments to prepare, for example --experiments exp2 or "
-            "--experiments exp1 exp2. Defaults to exp1-exp4 for backward compatibility."
+            "Experiments to prepare, for example --experiments exp3 or "
+            "--experiments exp1 exp2. Defaults to exp1-exp4 plus exp8."
         ),
     )
     parser.add_argument(
@@ -871,7 +962,7 @@ def _parse_args():
         action="append",
         default=None,
         metavar="EXP",
-        help="Repeatable singular alias, for example --experiment exp3 --experiment exp4.",
+        help="Repeatable singular alias, for example --experiment exp3 --experiment exp8.",
     )
     parser.add_argument(
         "--held-out-galaxy",
@@ -910,6 +1001,8 @@ def _parse_args():
     )
     args = parser.parse_args()
     args.exclude_channels = _parse_channel_list(args.exclude_channels)
+    if args.geometry_input_mode != "none" and args.cache_tag == "InstantSFR_NoInitialStellarDensity":
+        parser.error("几何消融必须使用独立 --cache-tag，不能覆盖原 Exp3 cache。")
     if args.target_scale <= 0:
         parser.error("--target-scale must be positive.")
     if args.target_floor <= 0:
@@ -924,17 +1017,27 @@ def _parse_args():
         if requested and requested != ("exp1",):
             parser.error("--only-exp1 cannot be combined with experiments other than exp1.")
         requested = ("exp1",)
-    args.experiments = requested or ("exp1", "exp2", "exp3", "exp4")
+    args.experiments = requested or ("exp1", "exp2", "exp3", "exp4", "exp8")
     return args
 
 
-def get_folder_paths(configs_path, gal_type, resolution): # 读取config文件，返回指定类型和分辨率的文件夹绝对路径列表。这样代码路径就直接从config文件中读取，不需要硬编码在代码里了。
+def get_folder_paths(
+    configs_path,
+    gal_type,
+    resolution,
+    *,
+    include_roles=("train",),
+): # 读取config文件，返回指定类型和分辨率的文件夹绝对路径列表。这样代码路径就直接从config文件中读取，不需要硬编码在代码里了。
     configs = load_config(configs_path)
     data_dir = configs["BaseConfig"]["data_dir"]
     raw_data_config = configs["RawDataConfig"]
 
     folder_abs_paths = []
-    for gal_nickname in raw_data_config[gal_type]:
+    allowed_roles = None if include_roles is None else set(include_roles)
+    for gal_nickname, gal_config in raw_data_config[gal_type].items():
+        role = str(gal_config.get("role", "train"))
+        if allowed_roles is not None and role not in allowed_roles:
+            continue
         gal_name = f"{gal_type}_{gal_nickname}"
         folder_abs_path = os.path.join(data_dir, gal_name, resolution)
         folder_abs_paths.append([folder_abs_path, gal_name])
@@ -999,6 +1102,7 @@ def _prepare_random_snapshot_experiment(
         oversample_groups=args.oversample,
         cache_schema_version=train_cache.last_cache_schema_version,
         conditioning_contract=train_cache.last_conditioning_contract,
+        geometry_inputs=train_cache.last_geometry_input_contract,
         closure_scale_selection=scale_selection,
         split_metadata={
             "experiment": f"exp{experiment_number}",
@@ -1018,6 +1122,187 @@ def _prepare_random_snapshot_experiment(
             },
             "cache_prefix": os.path.basename(save_path),
         },
+        **resolved_transform_options,
+    )
+    val_cache.to_pt(save_path + "val.pt", mean, std, **resolved_transform_options)
+    test_cache.to_pt(save_path + "test.pt", mean, std, **resolved_transform_options)
+    return save_path
+
+
+def _require_group_entries(folder_paths, required_groups, *, purpose):
+    """按显式 allowlist 解析 processed 目录；缺少任何一组时立即停止。"""
+
+    by_name = {str(entry[1]): entry for entry in folder_paths}
+    missing_config = [name for name in required_groups if name not in by_name]
+    if missing_config:
+        raise ValueError(
+            f"{purpose} 缺少数据配置：{missing_config}。"
+        )
+    selected = [by_name[name] for name in required_groups]
+    valid, missing_data = _valid_group_paths(selected)
+    if missing_data:
+        details = {entry[1]: entry[0] for entry in missing_data}
+        raise ValueError(
+            f"{purpose} 缺少 processed HDF5；请先生成对应 resolution：{details}"
+        )
+    return valid
+
+
+def _assert_disjoint_cache_identities(caches):
+    """检查各 split 的样本和母 snapshot 身份均无交叉。"""
+
+    for identity_name in ("sample_uid", "parent_hr_uid"):
+        values = {}
+        for split_name, cache in caches.items():
+            array = np.asarray(
+                getattr(cache.dataset, identity_name), dtype=str
+            ).reshape(-1)
+            if np.any(array == ""):
+                raise RuntimeError(
+                    f"Exp3 {split_name} 缺少 {identity_name}，无法验证数据隔离。"
+                )
+            values[split_name] = set(array.tolist())
+        names = tuple(values)
+        for left_index, left in enumerate(names):
+            for right in names[left_index + 1:]:
+                overlap = values[left].intersection(values[right])
+                if overlap:
+                    preview = sorted(overlap)[:3]
+                    raise RuntimeError(
+                        f"Exp3 {left}/{right} 的 {identity_name} 存在交叉：{preview}"
+                    )
+
+
+def _prepare_exp3_torus_ood(
+    train_folder_paths,
+    test_only_folder_paths,
+    *,
+    args,
+    load_options,
+    transform_options,
+):
+    """Zou 五组随机 75/25 train/val，torus 固定为唯一测试域。"""
+
+    train_entries = _require_group_entries(
+        train_folder_paths,
+        _ZOU_FIVE_GROUPS,
+        purpose="Exp3 Zou train/validation",
+    )
+    test_entries = _require_group_entries(
+        test_only_folder_paths,
+        (_TORUS_TEST_GROUP,),
+        purpose="Exp3 torus test",
+    )
+
+    cache_in = CachePt().load(train_entries, **load_options)
+    train_cache, val_cache, unused_test_cache = cache_in.split(
+        train_size=0.75,
+        validation_size=0.25,
+        stratify="groups",
+        random_state=args.seed,
+    )
+    if len(unused_test_cache) != 0:
+        raise RuntimeError(
+            "Exp3 的 75/25 二路划分意外产生了未分配的 Zou test 样本。"
+        )
+    # Exp3 不在 CachePT 中复制少样本运行。正式训练由
+    # run_time_balanced sampler 实现运行等权和运行内物理时间加权。
+    train_cache = train_cache.process(mirror=False, balance=None)
+    val_cache = val_cache.process(mirror=False)
+    test_cache = CachePt().load(test_entries, **load_options).process(mirror=False)
+
+    expected_train_groups = set(_ZOU_FIVE_GROUPS)
+    actual_groups = {
+        "train": set(_cache_groups(train_cache)),
+        "val": set(_cache_groups(val_cache)),
+        "test": set(_cache_groups(test_cache)),
+    }
+    for split_name in ("train", "val"):
+        if actual_groups[split_name] != expected_train_groups:
+            raise RuntimeError(
+                f"Exp3 {split_name} groups={sorted(actual_groups[split_name])}，"
+                f"预期为 {sorted(expected_train_groups)}。"
+            )
+    if actual_groups["test"] != {_TORUS_TEST_GROUP}:
+        raise RuntimeError(
+            f"Exp3 test groups={sorted(actual_groups['test'])}，"
+            f"预期仅为 {_TORUS_TEST_GROUP!r}。"
+        )
+    if train_cache.input_channels != test_cache.input_channels:
+        raise RuntimeError(
+            "Exp3 Zou 与 torus 的输入通道不一致："
+            f"{train_cache.input_channels} != {test_cache.input_channels}"
+        )
+    if train_cache.dataset.target_metadata != test_cache.dataset.target_metadata:
+        raise RuntimeError(
+            "Exp3 Zou 与 torus 的 SFR target 语义或单位不一致："
+            f"{train_cache.dataset.target_metadata} != "
+            f"{test_cache.dataset.target_metadata}"
+        )
+    _assert_disjoint_cache_identities(
+        {"train": train_cache, "val": val_cache, "test": test_cache}
+    )
+
+    print(f"  Training set size:   {len(train_cache)}")
+    print(f"  Validation set size: {len(val_cache)}")
+    print(f"  Torus test set size: {len(test_cache)}")
+    print("  [PASS] Exp3 train/val/test groups and UID isolation verified.")
+
+    save_path = os.path.join(".cache", _cache_prefix(3, args.cache_tag))
+    if train_cache.dataset.geometry_input_contract["mode"] != "none":
+        for suffix in ("train.pt", "val.pt", "test.pt", "norm.npz", "metadata.json", "train.auto_scale_tmp.pt"):
+            if os.path.exists(save_path + suffix):
+                raise FileExistsError(f"拒绝覆盖已有消融产物：{save_path + suffix}")
+    mean, std, resolved_transform_options, scale_selection = (
+        _write_train_cache_with_resolved_closure_scale(
+            train_cache,
+            save_path,
+            transform_options,
+        )
+    )
+    group_paths = {
+        entry[1]: entry[0] for entry in train_entries + test_entries
+    }
+    split_metadata = {
+        "experiment": "exp3",
+        "split_strategy": "random_snapshot_75_25_torus_test",
+        "split_seed": int(args.seed),
+        "available_groups": list(_ZOU_FIVE_GROUPS) + [_TORUS_TEST_GROUP],
+        "train_groups": list(_ZOU_FIVE_GROUPS),
+        "validation_groups": list(_ZOU_FIVE_GROUPS),
+        "test_groups": [_TORUS_TEST_GROUP],
+        "held_out_groups": [_TORUS_TEST_GROUP],
+        "test_only_groups": [_TORUS_TEST_GROUP],
+        "split_groups": {
+            key: sorted(value) for key, value in actual_groups.items()
+        },
+        "group_paths": group_paths,
+        "sample_counts": {
+            "train": len(train_cache),
+            "val": len(val_cache),
+            "test": len(test_cache),
+            "out": 0,
+        },
+        "train_fraction": 0.75,
+        "validation_fraction": 0.25,
+        "cache_group_balance": "none",
+        "training_sampling": "run_time_balanced",
+        "cache_prefix": os.path.basename(save_path),
+    }
+    _save_norm_stats(
+        save_path,
+        mean,
+        std,
+        input_channels=train_cache.input_channels,
+        excluded_channels=args.exclude_channels,
+        target_metadata=train_cache.dataset.target_metadata,
+        includes_zero_targets=not args.drop_zero_targets,
+        oversample_groups=False,
+        cache_schema_version=train_cache.last_cache_schema_version,
+        conditioning_contract=train_cache.last_conditioning_contract,
+        geometry_inputs=train_cache.last_geometry_input_contract,
+        closure_scale_selection=scale_selection,
+        split_metadata=split_metadata,
         **resolved_transform_options,
     )
     val_cache.to_pt(save_path + "val.pt", mean, std, **resolved_transform_options)
@@ -1139,6 +1424,7 @@ def _prepare_exp2_logo_folds(
             oversample_groups=args.oversample,
             cache_schema_version=train_cache.last_cache_schema_version,
             conditioning_contract=train_cache.last_conditioning_contract,
+            geometry_inputs=train_cache.last_geometry_input_contract,
             closure_scale_selection=scale_selection,
             split_metadata=split_metadata,
             **resolved_transform_options,
@@ -1194,6 +1480,7 @@ if __name__ == "__main__":
         "require_target_quantity": "instantaneous_sfr",
         "exclude_raw_snapshot_indices": tuple(args.exclude_raw_snapshot_index),
         "show_progress": args.progress,
+        "geometry_input_mode": args.geometry_input_mode,
     }
     transform_options = {
         "target_transform": args.target_transform,
@@ -1214,7 +1501,10 @@ if __name__ == "__main__":
         configs_dir, "elliptical_galaxy", resolution
     )
     exp_dg_folder_paths = get_folder_paths(
-        configs_dir, "disk_galaxy", resolution
+        configs_dir, "disk_galaxy", resolution, include_roles=("train",)
+    )
+    exp_dg_test_only_paths = get_folder_paths(
+        configs_dir, "disk_galaxy", resolution, include_roles=("test_only",)
     )
 
     print(f"Requested experiments: {', '.join(args.experiments)}")
@@ -1242,13 +1532,27 @@ if __name__ == "__main__":
             train_balance=train_balance,
         )
 
-    # Preserve legacy Exp3 semantics while making selection explicit.
+    # Exp3: Zou 五组只进入随机 75/25 train/validation，torus 是唯一 test。
     if "exp3" in args.experiments:
-        print("\nProcessing Experiment 3...")
-        exp3_paths = [entry for entry in exp_dg_folder_paths if entry[1] != "disk_galaxy_low"]
+        print("\nProcessing Experiment 3 (Zou 75/25 train/val; torus test-only)...")
+        _prepare_exp3_torus_ood(
+            exp_dg_folder_paths,
+            exp_dg_test_only_paths,
+            args=args,
+            load_options=load_options,
+            transform_options=transform_options,
+        )
+
+    # 旧 Exp3（删除 low 后随机 60/20/20）迁移为 Exp8。
+    if "exp8" in args.experiments:
+        print("\nProcessing Experiment 8 (legacy Exp3 semantics)...")
+        exp8_paths = [
+            entry for entry in exp_dg_folder_paths
+            if entry[1] != "disk_galaxy_low"
+        ]
         _prepare_random_snapshot_experiment(
-            3,
-            exp3_paths,
+            8,
+            exp8_paths,
             args=args,
             load_options=load_options,
             transform_options=transform_options,
@@ -1314,6 +1618,7 @@ if __name__ == "__main__":
             oversample_groups=args.oversample,
             cache_schema_version=train_cache.last_cache_schema_version,
             conditioning_contract=train_cache.last_conditioning_contract,
+            geometry_inputs=train_cache.last_geometry_input_contract,
             closure_scale_selection=scale_selection,
             split_metadata={
                 "experiment": "exp4",
