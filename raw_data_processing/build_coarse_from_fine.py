@@ -181,9 +181,12 @@ def build_coarse_from_fine(
     v1_solver_max_iterations: int = 300,
     v1_polish_max_iterations: int = 500,
     prediction_mode: str = "direct",
+    require_cell_supervision: bool = False,
 ) -> list[Path]:
     """从 fine 目录构建 coarse 数据，并返回本次写出的文件路径。"""
 
+    if require_cell_supervision and coarsener != "spatial_block":
+        raise ValueError("逐格监督目前只支持二维 spatial_block。")
     if coarsener == "spatial_3d":
         if mass_filter is not None or kernel is not None or initial_neighbors is not None:
             raise ValueError("三维空间块算子不接受 R_m 参数。")
@@ -275,8 +278,12 @@ def build_coarse_from_fine(
         for source_path in input_paths:
             fine = GalData().load_h5(str(source_path))
             _validate_fine_input(fine, source_path)
-            coarse = fine.coarsen(coarsener, new_shape=coarse_shape, **kwargs)
+            if require_cell_supervision and not fine.has_cell_sfr_supervision:
+                raise ValueError(f"{source_path} 缺少逐格真值，请先补齐 Data-Set-11。")
             output_path = output_dir / source_path.name
+            if require_cell_supervision and output_path.exists():
+                raise ValueError(f"逐格生产模式拒绝覆盖已有产品：{output_path}")
+            coarse = fine.coarsen(coarsener, new_shape=coarse_shape, **kwargs)
             coarse.save_h5(str(output_path))
             written.append(output_path)
 
@@ -292,6 +299,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--galaxy", action="append", default=[])
     parser.add_argument("--config-dir", default=".config")
     parser.add_argument("--fine-dirname", default="fine")
+    parser.add_argument("--require-cell-supervision", action="store_true", help="要求二维 R_h 逐格标签完整，并拒绝覆盖输出；默认关闭。")
     parser.add_argument("--prediction-mode", choices=("direct", "residual"), default="direct", help="三维 Direct/Residual；二维行为不变。")
     parser.add_argument("--snapshot-index", action="append", default=[], type=int)
     parser.add_argument("--max-snapshots", type=int, default=None)
@@ -331,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
             coarsener=args.coarsener,
             coarse_shape=None if args.coarse_shape is None else tuple(args.coarse_shape),
             prediction_mode=args.prediction_mode,
+            require_cell_supervision=args.require_cell_supervision,
             mass_filter=args.mass_filter,
             kernel=args.kernel,
             coarse_dirname=args.coarse_dirname,

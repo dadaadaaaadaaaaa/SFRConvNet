@@ -1,5 +1,10 @@
 # MACNet：面向宇宙学模拟的 MACER 小尺度物理闭合模型
 
+> **2026-11-02：方案 C 已完成二维逐格监督数据层。** 新 raw→fine→R_h 可保存逐格 Y/B/C；
+> [旧产品补齐入口](raw_data_processing/build_cell_sfr_supervision.md) 与
+> [原 cache 的逐格监督附加文件](Experiment/build_cell_supervision_cache.md) 已接通。
+> 原标量模型和训练逻辑不变；逐格 CNN、局部 loss、3D/R_m 局部标签尚未实现。
+
 > 本文档是本项目面向 AI、代码协作者和课题组成员的总入口。接手任务时应先阅读本文，再按“必读顺序”加载更详细的研究与代码文档。本文同时概述已核验的 MACER2D 盘星系流程与 MACER3D 矮星系数据/预处理流程；三维训练尚未接通，不能凭二维经验自行补写或宣称可用。
 
 ## 1. 项目目标

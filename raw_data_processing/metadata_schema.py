@@ -315,6 +315,8 @@ def build_derived_metadata(
     """继承 HR 身份并为一个粗粒化结果生成新的 sample_uid。"""
 
     metadata = deepcopy(dict(source_metadata))
+    # 逐格标签取决于当前空间映射，不能随源 metadata 无条件继承。
+    metadata.pop("cell_supervision", None)
     identity = metadata.get("identity", {})
     parent_hr_uid = identity.get("parent_hr_uid")
     if not parent_hr_uid:
@@ -388,4 +390,12 @@ def validate_complete_metadata(metadata: Mapping[str, Any]) -> None:
     )
     if identity["sample_uid"] != expected_sample_uid:
         raise ValueError("sample_uid 与 derivation/geometry 字段不一致。")
+    cell = metadata.get("cell_supervision")
+    if cell is not None:
+        if (cell.get("schema_name") != "macnet_cell_sfr_supervision"
+                or cell.get("schema_version") != 1
+                or cell.get("identity") != identity
+                or cell.get("operator_id") != derivation.get("operator_id")
+                or cell.get("is_model_input") is not False):
+            raise ValueError("逐格监督附加 metadata 契约不匹配。")
     canonical_json(metadata)

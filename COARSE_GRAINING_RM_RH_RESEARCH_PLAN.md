@@ -2892,3 +2892,66 @@ python -m py_compile raw_data_processing/geometry_features.py raw_data_processin
 迁移脚本、日志脚本和新测试的 3 个源文件内存编译检查通过，未写入 pyc。现场只读检查
 发现 Fiducial 的 `fine_sfr_v7` 已有 raw 重建产物（核验时 261 帧），没有修改或清理。
 全量迁移命令因此使用尚未生成的独立 `fine_sfr_v7_timefix`，不要向旧 v7 混写。
+
+## 2026-11-02：方案 C 的二维逐格 baseline 与监督数据层
+
+本次用户范围仅为逐格 baseline/监督及前置适配，不修改原非逐格 CNN。
+实现依据是当前源码、Data-Set-11 既有单位契约、合成 HDF4 集成测试及已有真实 processed 产品；
+没有改变 MACER 物理参数，也没有重新以 HR 算子替代标签。
+
+### 定义与实现
+
+对每个 R_h coarse cell：`Y_i=sum(DataSet11_j)`，`B_i=S_i[R_h(U_HR)]`，
+`C_i=Y_i-B_i`。数组形状为 `(N_theta,N_r)`；每格已经积分，单位 code SFR，不能再乘体积。
+默认数据兼容 baseline 和论文物理 baseline 都保留，分别生成 signed closure。
+验证三张图求和等于原标量 Y/B/C；零标签和负 closure 均保留。
+
+- `cell_sfr_supervision.py`：纯数组物理检查、摘要和独立逐格 product UID。
+- `GalData`：raw→fine 保留局部真值，R_h 使用与气体相同的索引分块求和，HDF5 保存/回读校验。
+- format-version 6 及原标量契约保持不变；新增可选 `metadata.cell_supervision/version=1`。
+  canonical 新增 `Y_alpha_cell/B_alpha_cell/C_alpha_true_cell`；每种物理模式新增局部 closure。
+  监督字段不进入 snapshot 输入或 GalDataSet 通道。
+- `build_cell_sfr_supervision.py`：已有 fine/R_h 可直接从原 HDF4 补齐并另存。核验 raw SHA256、
+  shape、权威体积映射和标签总量；保留 gas、日志、时间、sample UID、原总量和已存 baseline。
+- `build_coarse_from_fine.py --require-cell-supervision`：可选严格模式，缺失标签即报错，拒绝覆盖。
+  默认关闭，不破坏旧 scalar fine 产品的使用。
+- `Experiment/build_cell_supervision_cache.py`：按原标量 cache UID/顺序生成独立监督 sidecar，
+  保留过采样重复项，并核验 parent UID、坐标、shape、时间和总量。源 cache SHA256 绑定附加文件。
+  不重新 split/标准化、不改原 cache，不把格子单独随机划分。
+
+目前局部标签只支持二维 identity_fine/R_h。R_m 仍支持原标量流程，但缺乏真实输运权重时不
+传播逐格标签。三维、新逐格 CNN、局部 loss/scale、HPO 和空间结果分析不在本次实现范围。
+原 `prepare_data.py/models.py/train.py/run_train.py/run_optuna.py` 均未修改。
+局部监督 sidecar 不能直接作为旧 `run_train.py` 的完整数据集；后续需独立空间 dataset/model。
+局部 closure scale 应在后续仅用训练集确定，不能直接套原总量 scale。
+
+### 验证记录与限制
+
+使用现有 `D:/conda_envs/physics_ai/python.exe`，未安装新依赖；该环境没有 pytest，使用 unittest。
+
+```powershell
+& 'D:/conda_envs/physics_ai/python.exe' -m unittest tests.test_cell_sfr_supervision tests.test_split_snapshot_builders tests.test_metadata_contract tests.test_fine_time_context_migration tests.test_spatial_coarsening_module tests.test_thermodynamic_semantics tests.test_sfr_supervision_products tests.test_signed_closure_training tests.test_rh_training_conditioning -q
+```
+
+以上 62 项通过：包括非均匀体积下避免重复积分、两套 baseline、HDF5 round-trip、
+零 SFR/负 closure、局部错位但总量不变的拒绝、缺失/非法数组、旧 scalar/R_m 兼容、
+过采样 UID 顺序、源 cache 不变，以及两帧合成 HDF4 的 raw→fine→R_h 和旧 fine/coarse 补齐。
+旧 direct/closure CachePT 与原 SFRConvNet 前向接口的回归通过；没有进行正式训练。
+
+只读抽查五组真实 `coarse_rh_12x20_sfr_v7` 各 3 帧，共 15 个旧产品：
+
+| 运行 | 原始 snapshot index |
+|---|---|
+| fiducial | 46、5206、9531 |
+| fiducial_4 | 46、4640、9531 |
+| fiducial_7 | 46、3558、9531 |
+| model_0_75 | 46、523、999 |
+| model_1_1 | 46、523、999 |
+
+均可加载，两套 baseline 地图求和与原总量一致，原 Y=B+C 成立。
+本次 E 盘未挂载，无法读取真实 raw Data-Set-11，因此**没有完成真实数据的逐格补齐或全量 cache**，
+不能将合成测试称为真实 HR 标签验证。挂载后先少量补齐并核验，再批量执行。
+未覆盖用户已有产品/cache/checkpoint，不向 Train_history 登记任何训练结果。
+
+完整命令及参数见 `raw_data_processing/build_cell_sfr_supervision.md` 与
+`Experiment/build_cell_supervision_cache.md`。

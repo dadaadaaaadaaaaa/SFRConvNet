@@ -1,5 +1,13 @@
 # `galaxy_data.py` 使用说明
 
+## 二维逐格监督扩展（2026-11-02）
+
+新增 `has_cell_sfr_supervision`、`cell_sfr_supervision(mode="data_compatible")` 接口。
+逐格数组在独立监督组，原 snapshot、scalar Y/B/C、输入通道与模型接口保持兼容。
+原始 Data-Set-11 在 raw→fine 保留，在 R_h 中按同一规则块求和；R_m 不伪造局部标签。
+完整定义、存储契约和旧产品补齐入口见
+[build_cell_sfr_supervision.md](build_cell_sfr_supervision.md)。
+
 ## 1. 功能概述
 
 `galaxy_data.py` 是 MACNet 数据预处理的总入口，负责把 MACER HDF4 snapshot、Parquet 日志、粗粒化算子和训练数据契约连接起来。其主要职责为：

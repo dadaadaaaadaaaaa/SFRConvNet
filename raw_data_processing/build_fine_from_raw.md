@@ -1,5 +1,11 @@
 # `build_fine_from_raw.py` 使用说明
 
+## 二维逐格监督扩展（2026-11-02）
+
+新生成的二维 fine 自动保留 Data-Set-11 逐格积分 SFR，作为独立监督数组，不加入气体输入。
+命令参数和标量目标不变，请使用新输出目录。旧 fine 的补齐方法见
+[build_cell_sfr_supervision.md](build_cell_sfr_supervision.md)。三维行为不变。
+
 ## MACER3D 入口（2026-09-10 新增）
 
 已支持 `RawDataConfig.dwarf_galaxy.fullFB_inflow`，直接读取 ATHDF 的物理时间，不需要先 parse hst。

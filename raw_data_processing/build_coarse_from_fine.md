@@ -1,5 +1,13 @@
 # `build_coarse_from_fine.py` 使用说明
 
+## 二维逐格监督扩展（2026-11-02）
+
+fine 含逐格 Data-Set-11 时，`spatial_block` 自动保守求和生成局部真值，并保存当前 LR baseline
+和 signed closure。新增 `--require-cell-supervision`（默认关闭）：开启后要求 fine 标签完整，
+仅支持二维 `spatial_block`，且拒绝覆盖已有输出。旧 fine 仍支持原标量流程。
+R_m 暂不传播局部标签，不能用规则块代替输运映射。详见
+[build_cell_sfr_supervision.md](build_cell_sfr_supervision.md)。
+
 ## MACER3D 空间降采样（2026-09-10 新增）
 
 ```powershell

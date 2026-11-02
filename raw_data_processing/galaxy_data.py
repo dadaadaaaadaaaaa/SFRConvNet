@@ -360,6 +360,7 @@ class GalData:
         self._data_log = None
         self._target_metadata = {}
         self._sfr_products = {}
+        self._sfr_target_map = None
         self._corr = None
         self._axes = None
         self._axis_edges = None
@@ -422,6 +423,39 @@ class GalData:
         """默认数据兼容 MACER 算子在当前分辨率上的总 SFR。"""
 
         return float(self._sfr_products["data_compatible"]["baseline_total"])
+
+    @property
+    def has_cell_sfr_supervision(self) -> bool:
+        """旧标量产品仍可加载，但不得把缺失的逐格标签伪造为零。"""
+        return self._sfr_target_map is not None
+
+    def cell_sfr_supervision(self, mode: str = "data_compatible") -> dict:
+        """返回独立于 snapshot 输入通道的逐格物理量副本。"""
+        if not self.has_cell_sfr_supervision:
+            raise ValueError("该产品没有逐格 SFR 真值，请从 Data-Set-11 补齐。")
+        self._refresh_cell_sfr_contract()
+        target = self._sfr_target_map.copy()
+        baseline = self._sfr_products[mode]["cell_sfr_baseline"].copy()
+        return {"Y": target, "B": baseline, "C_true": target - baseline}
+
+    def attach_cell_sfr_target(self, values) -> "GalData":
+        """绑定来自原始标签的当前网格贡献；不允许按 baseline 分配全局真值。"""
+        from raw_data_processing.cell_sfr_supervision import build_cell_contract
+        target = np.asarray(values, dtype=np.float64).copy()
+        contract = build_cell_contract(
+            self._metadata, target, self._sfr_products,
+            shape=self.grid_volume.shape, target_total=self.sfr_target,
+        )
+        self._sfr_target_map = target
+        self._metadata["cell_supervision"] = contract
+        return self
+
+    def _refresh_cell_sfr_contract(self):
+        """baseline 重算或迁移后更新附加契约，不改变标量学习契约。"""
+        if self.has_cell_sfr_supervision:
+            self.attach_cell_sfr_target(self._sfr_target_map)
+        else:
+            self._metadata.pop("cell_supervision", None)
 
     @property
     def sfr_closure_true(self) -> float:
@@ -792,6 +826,7 @@ class GalData:
                 ),
                 "sfr_operators": metadata_operators,
             }
+            self._refresh_cell_sfr_contract()
             validate_complete_metadata(self._metadata)
         return self
 
@@ -906,6 +941,11 @@ class GalData:
         for key in ("mass_unit_msun", "time_unit_gyr", "to_msun_per_yr"):
             if key in target_config:
                 self._target_metadata[key] = float(target_config[key])
+        self._sfr_target_map = None
+        if self.ndim == 2 and dataset_name == "Data-Set-11" and reduction == "sum":
+            if target_field.shape != self.snapshot["density"].shape or np.any(target_field < 0):
+                raise ValueError("Data-Set-11 必须是与气体场同形的非负逐格 SFR 贡献。")
+            self._sfr_target_map = target_field.copy()
         return self
 
     def read_athdf(self, path, **kwargs):
@@ -973,6 +1013,11 @@ class GalData:
             coordinate_mode=coarse._coordinate_mode,
             volume_source=coarse._volume_source,
         )
+        # 逐格标签必须走与气体一致的空间映射；R_m 尚未导出标签输运权重。
+        coarse._metadata.pop("cell_supervision", None)
+        if self.has_cell_sfr_supervision and result.metadata.get("operator") == "spatial_block":
+            from raw_data_processing.coarsening_common import block_reduce_sum
+            coarse._sfr_target_map = block_reduce_sum(self._sfr_target_map, coarse.grid_volume.shape)
         if {
             "cooling_time", "radial_acceleration"
         }.issubset(coarse.snapshot) and coarse._data_log is not None and {
@@ -1157,6 +1202,7 @@ class GalData:
             "mbh", "sfr_target"
         }.issubset(self._data_log):
             self.compute_macer_sfr_products()
+        self._refresh_cell_sfr_contract()
         with h5py.File(file_path, "w") as f:
             f.attrs["processed_format_version"] = 6
             snap_grp = f.create_group("snapshot")
@@ -1260,6 +1306,13 @@ class GalData:
                     "C_alpha_true", data=float(canonical["closure_true"])
                 )
                 canonical_grp.attrs["definition"] = "C_alpha_true=Y_alpha-B_alpha"
+                if self.has_cell_sfr_supervision:
+                    maps = self.cell_sfr_supervision()
+                    for name, key in (("Y_alpha_cell", "Y"), ("B_alpha_cell", "B"),
+                                      ("C_alpha_true_cell", "C_true")):
+                        ds = canonical_grp.create_dataset(name, data=maps[key])
+                        ds.attrs["units"] = "MACER_mass_code/Gyr"
+                        ds.attrs["quantity"] = "cell_integrated_instantaneous_sfr"
                 for mode, product in self._sfr_products.items():
                     mode_grp = sfr_grp.create_group(mode)
                     mode_grp.attrs["baseline_total"] = float(product["baseline_total"])
@@ -1273,6 +1326,9 @@ class GalData:
                         "cell_sfr_baseline",
                         data=np.asarray(product["cell_sfr_baseline"], dtype=np.float64),
                     )
+                    if self.has_cell_sfr_supervision:
+                        mode_grp.create_dataset("cell_sfr_closure_true", data=(
+                            self._sfr_target_map - product["cell_sfr_baseline"]))
                     mode_grp.create_dataset(
                         "parameters_json",
                         data=metadata_to_json(product["parameters"]),
@@ -1309,6 +1365,7 @@ class GalData:
             self.time = f.attrs["time"]
             self._metadata = {}
             self._sfr_products = {}
+            self._sfr_target_map = None
             self._pending_source_metadata = None
             if "metadata" in f and "contract_json" in f["metadata"]:
                 payload = f["metadata"]["contract_json"][()]
@@ -1325,6 +1382,12 @@ class GalData:
                 canonical_y = float(canonical_grp["Y_alpha"][()])
                 canonical_b = float(canonical_grp["B_alpha"][()])
                 canonical_c = float(canonical_grp["C_alpha_true"][()])
+                cell_keys = {"Y_alpha_cell", "B_alpha_cell", "C_alpha_true_cell"}
+                present = cell_keys.intersection(canonical_grp)
+                if present:
+                    if present != cell_keys:
+                        raise ValueError("逐格 canonical Y/B/C 不完整。")
+                    self._sfr_target_map = canonical_grp["Y_alpha_cell"][()]
                 if not np.isclose(
                     canonical_c, canonical_y - canonical_b, rtol=1e-12, atol=1e-12
                 ):
@@ -1509,6 +1572,29 @@ class GalData:
                 self._coarsening_diagnostics = {
                     name: coarse_grp[name][()] for name in coarse_grp
                 }
+
+            if self.has_cell_sfr_supervision:
+                from raw_data_processing.cell_sfr_supervision import build_cell_contract, validate_cell_arrays
+                expected = build_cell_contract(
+                    self._metadata, self._sfr_target_map, self._sfr_products,
+                    shape=self.grid_volume.shape, target_total=self.sfr_target,
+                )
+                if self._metadata.get("cell_supervision") != expected:
+                    raise ValueError("逐格监督数组与 metadata/UID/摘要不一致。")
+                validate_cell_arrays(self._sfr_target_map, canonical_grp["B_alpha_cell"][()],
+                                     canonical_grp["C_alpha_true_cell"][()],
+                                     shape=self.grid_volume.shape,
+                                     totals=(canonical_y, canonical_b, canonical_c))
+                if not np.array_equal(canonical_grp["B_alpha_cell"][()],
+                                      self._sfr_products["data_compatible"]["cell_sfr_baseline"]):
+                    raise ValueError("canonical 逐格 baseline 与默认物理模式不一致。")
+                for mode, product in self._sfr_products.items():
+                    validate_cell_arrays(self._sfr_target_map, product["cell_sfr_baseline"],
+                                         sfr_grp[mode]["cell_sfr_closure_true"][()],
+                                         shape=self.grid_volume.shape,
+                                         totals=(self.sfr_target, product["baseline_total"], product["closure_true"]))
+            elif "cell_supervision" in self._metadata:
+                raise ValueError("metadata 声明了逐格监督，但 HDF5 缺少逐格数组。")
 
         # print(f"GalData loaded from HDF5: {file_path}")
         return self

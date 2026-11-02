@@ -371,6 +371,36 @@ class RawBuilderIntegrationTests(unittest.TestCase):
                     restored.sfr_macer_baseline + restored.sfr_closure_true,
                     places=11,
                 )
+                self.assertTrue(restored.has_cell_sfr_supervision)
+                np.testing.assert_array_equal(
+                    restored.cell_sfr_supervision()["Y"], np.full((4, 6), 0.125))
+
+            # 新入口自动保留逐格标签，并且旧 fine/coarse 可从原始文件补齐。
+            from raw_data_processing.build_cell_sfr_supervision import augment_product, attach_from_raw
+            from raw_data_processing.metadata_schema import sha256_file
+            coarse_paths = build_coarse_from_fine(
+                config_dir=config_dir, galaxies=("disk_galaxy_fiducial",),
+                coarse_shape=(2, 3), coarse_dirname="coarse_cell", require_cell_supervision=True)
+            for output in [outputs[0], coarse_paths[0]]:
+                expected = GalData().load_h5(output)
+                expected_maps = expected.cell_sfr_supervision()
+                legacy = root / ("legacy_" + output.parent.name + ".h5")
+                expected._sfr_target_map = None
+                expected.save_h5(legacy)
+                before = sha256_file(legacy)
+                migrated = root / ("migrated_" + output.parent.name + ".h5")
+                augment_product(legacy, migrated, raw_root=raw_dir)
+                actual = GalData().load_h5(migrated)
+                self.assertEqual(sha256_file(legacy), before)
+                self.assertEqual(actual.sample_uid, expected.sample_uid)
+                for name in ("Y", "B", "C_true"):
+                    np.testing.assert_array_equal(actual.cell_sfr_supervision()[name], expected_maps[name])
+                for name, values in expected.snapshot.items():
+                    np.testing.assert_array_equal(actual.snapshot[name], values)
+                with self.assertRaises(FileExistsError):
+                    augment_product(legacy, migrated, raw_root=raw_dir)
+                with self.assertRaisesRegex(ValueError, "SHA256"):
+                    attach_from_raw(expected, source_dir / "hdfra.00001")
 
 
 if __name__ == "__main__":
