@@ -1552,13 +1552,13 @@ def plot_sfr_history(df, title, fig_dir, model_label="Model"):
     sfr_pred = _sfr_series(df_plot, "sfr_pred", "y_pred")
 
     plt.figure(figsize=(10, 5), dpi=120)
-    plt.plot(times, sfr_true, "k-", lw=2, label="True", alpha=0.8)
-    plt.plot(times, sfr_pred, "r--", lw=2, label=f"Predicted ({model_label})", alpha=0.8)
+    plt.plot(times, sfr_true, "k-", lw=1.2, label="True", alpha=0.8)
+    plt.plot(times, sfr_pred, "r-", lw=1.2, label=f"Predicted ({model_label})", alpha=0.8)
 
     baseline_col = get_baseline_column(df_plot)
     if baseline_col is not None:
         sfr_baseline = _sfr_series(df_plot, "sfr_baseline", baseline_col)
-        plt.plot(times, sfr_baseline, "g:", lw=1.5, label=get_baseline_label(df_plot), alpha=0.7)
+        plt.plot(times, sfr_baseline, "g-", lw=1.0, label=get_baseline_label(df_plot), alpha=0.7)
 
     positive = np.concatenate([sfr_true[sfr_true > 0], sfr_pred[sfr_pred > 0]])
     linthresh = max(float(np.nanmin(positive)) if positive.size else 1e-9, 1e-12)

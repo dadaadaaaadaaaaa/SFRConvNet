@@ -1,0 +1,36 @@
+{
+  "cache_prefix": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_",
+  "groups": [
+    "disk_galaxy_fiducial",
+    "disk_galaxy_fiducial_4",
+    "disk_galaxy_fiducial_7",
+    "disk_galaxy_model_0_75",
+    "disk_galaxy_model_1_1"
+  ],
+  "input_channels": [
+    "cooling_rate_density",
+    "cooling_time",
+    "density",
+    "gas_energy",
+    "radial_acceleration",
+    "temperature",
+    "theta_acceleration",
+    "v1",
+    "v2",
+    "v3",
+    "gas_mass",
+    "grid_volume"
+  ],
+  "unique_snapshots": 26132,
+  "samples_per_run": 192,
+  "reference_time_gap_gyr": 0.25,
+  "distance_threshold": "reference-query nearest-distance p95; same-run +/-0.25 Gyr excluded",
+  "local_distance": "same (theta,r) cell; reference per-cell standardization, std floor 0.05 global std",
+  "exploratory_reference": "other four runs, all splits; no model training or performance claim",
+  "actual_reference": "existing fiducial fold train split only; unique UID; time-uniform subset per run",
+  "labels_used_only_after_neighbor_search": true,
+  "hr_context_is_deployment_input": false,
+  "raw_hdf4_available": true,
+  "local_true_sfr_available": true,
+  "elapsed_seconds": 1850.9133530999825
+}

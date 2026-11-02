@@ -1,0 +1,135 @@
+{
+  "units": "Msun/yr",
+  "device": "cuda",
+  "split_checks": {
+    "Exp2_LOO": {
+      "train__val": 0,
+      "test__train": 0,
+      "test__val": 0,
+      "out__train": 0,
+      "out__val": 0,
+      "out__test": 0
+    },
+    "Exp1_random": {
+      "train__val": 0,
+      "test__train": 0,
+      "test__val": 0
+    },
+    "Exp3.2_random": {
+      "train__val": 0,
+      "test__train": 0,
+      "test__val": 0
+    }
+  },
+  "sources": [
+    {
+      "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp1_Rh8x8_Closure_auto_train.pt",
+      "size": 180702968,
+      "mtime_ns": 1788783619932222900
+    },
+    {
+      "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp1_Rh12x20_Closure_train.pt",
+      "size": 667276204,
+      "mtime_ns": 1788978144343274600
+    },
+    {
+      "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_train.pt",
+      "size": 966948732,
+      "mtime_ns": 1789200952363311200
+    },
+    {
+      "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_train.pt",
+      "size": 961067840,
+      "mtime_ns": 1792907169837331700
+    },
+    {
+      "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp3_Rh12x20_FiveRuns_Closure_Exp3.2_train.pt",
+      "size": 1074452076,
+      "mtime_ns": 1791435393126537200
+    }
+  ],
+  "max_prediction_reproduction_error_msunyr": 0.0266005544748964,
+  "max_prediction_relative_difference": 0.001991112313815964,
+  "mae_relative_reproduction_difference": 3.861411669565766e-06,
+  "numerical_reproduction_note": "不是逐位复现；当前 checkpoint 推理与旧 CSV 的微小差异已量化，旧 held-out 图和阶段统计保留原 CSV，跨模型表使用新推理。",
+  "heldout_used_for_plots": "archived raw_held_out_predictions.csv, verified against checkpoint inference",
+  "heldout_distribution": {
+    "n": 954,
+    "zero_C": 0,
+    "negative_C": 0,
+    "C_abs_p10": 1.1995380870258527,
+    "C_abs_p50": 4.455591625679468,
+    "C_abs_p90": 13.692612382738146,
+    "C_abs_p99": 19.056865503602456,
+    "C_abs_max": 34.102467482571804,
+    "median_C_over_Y": 0.8283117921512904,
+    "frac_C_small_vs_Y": 0.0,
+    "relative_denominator_n": 954
+  },
+  "heldout_closure_peak": {
+    "time_production_gyr": 6.1000000000000005,
+    "C_max": 34.102467482571804,
+    "Chat_at_true_C_peak": 2.40847633105893,
+    "Chat_max": 30.079411025882713,
+    "Chat_peak_time_production_gyr": 6.3875,
+    "C_min": 0.15331197480077813,
+    "largest_adjacent_C_change": 25.5898691414076,
+    "cadence_gyr": 0.012500000000000178
+  },
+  "bootstrap": [
+    {
+      "block_width_gyr": 0.25,
+      "repetitions": 600,
+      "mae_high_minus_middle_ci95": [
+        5.331628682296274,
+        8.258772296012028
+      ],
+      "bias_high_ci95": [
+        -8.257820983385674,
+        -4.704134381515079
+      ],
+      "median_relative_C_high_minus_middle_ci95": [
+        0.1612973222353972,
+        0.5106855315329051
+      ]
+    },
+    {
+      "block_width_gyr": 0.5,
+      "repetitions": 600,
+      "mae_high_minus_middle_ci95": [
+        5.162115443554018,
+        8.374702232725122
+      ],
+      "bias_high_ci95": [
+        -8.484875537679725,
+        -4.330347329927238
+      ],
+      "median_relative_C_high_minus_middle_ci95": [
+        0.14503007687829636,
+        0.5171914868830171
+      ]
+    },
+    {
+      "block_width_gyr": 1.0,
+      "repetitions": 600,
+      "mae_high_minus_middle_ci95": [
+        4.8158495065178215,
+        8.666843836766775
+      ],
+      "bias_high_ci95": [
+        -8.73616958352081,
+        -3.7408198436345597
+      ],
+      "median_relative_C_high_minus_middle_ci95": [
+        0.10774779245985548,
+        0.5320949905579052
+      ]
+    }
+  ],
+  "existing_burst_timing_reproduced": true,
+  "existing_burst_metrics_reproduced": true,
+  "heldout_tail_above_training_max_n": 0,
+  "heldout_tail_learnability_warning": "分层误差是描述性关联；幅值、时间阶段和输入域偏移相互混杂。",
+  "historical_contract_warning": "Exp2/Exp1 v6 的三个 Fiducial 运行早于时间与日志上下文修复；Model0.75 时间无此问题。",
+  "bootstrap_limitation": "单轨迹固定时间块重采样；不是多独立 burst 或多随机种子的置信区间。"
+}

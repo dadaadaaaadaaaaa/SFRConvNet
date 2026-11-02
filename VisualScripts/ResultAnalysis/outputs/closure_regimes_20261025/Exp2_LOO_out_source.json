@@ -1,0 +1,22 @@
+[
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_out.pt",
+    "size": 43582516,
+    "mtime_ns": 1789200966998905600
+  },
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\Results\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_best_model.pth",
+    "size": 46167106,
+    "mtime_ns": 1789232797455137100
+  },
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\Results\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906\\hyperparameters.json",
+    "size": 7749,
+    "mtime_ns": 1789232332692673500
+  },
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_metadata.json",
+    "size": 4711,
+    "mtime_ns": 1789200952607843100
+  }
+]

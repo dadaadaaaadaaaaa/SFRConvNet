@@ -1,0 +1,18 @@
+{
+  "galaxy": "disk_galaxy_fiducial",
+  "n_snapshots": 8475,
+  "mass_source": "fine_plus_log",
+  "mass_rtol": 0.001,
+  "max_total_mass_relative_error": 7.1762657859343e-07,
+  "median_total_mass_relative_error": 1.8616960372023207e-09,
+  "fine_background_mass_msun": 98200856013.1093,
+  "max_background_relative_error": 8.341627566556623e-10,
+  "fine_source": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\data\\disk_galaxy_fiducial\\fine_sfr_v7\\00046.h5",
+  "log_source": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\data\\disk_galaxy_fiducial.parquet",
+  "raw_source": "E:\\科研项目与原始数据\\ai+MACERsimulation\\MACNet-v1\\RawData\\DiskGalaxy\\Fiducial_flat",
+  "time_min_gyr": 0.0,
+  "time_max_gyr": 12.4875,
+  "endpoint_clamped_count": 1,
+  "snapshots_with_negative_new_star_cells": 0,
+  "max_negative_new_star_fraction": -0.0
+}

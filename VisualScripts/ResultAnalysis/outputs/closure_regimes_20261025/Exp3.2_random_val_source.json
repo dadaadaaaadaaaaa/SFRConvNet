@@ -1,0 +1,22 @@
+[
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp3_Rh12x20_FiveRuns_Closure_Exp3.2_val.pt",
+    "size": 358383460,
+    "mtime_ns": 1791435398644735900
+  },
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\Results\\Exp3.2_Closure_Trial23_seed42_20261013_142007\\Exp3.2_Closure_Trial23_seed42_best_model.pth",
+    "size": 11792422,
+    "mtime_ns": 1791874400740605600
+  },
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\Results\\Exp3.2_Closure_Trial23_seed42_20261013_142007\\hyperparameters.json",
+    "size": 10796,
+    "mtime_ns": 1791872417569280800
+  },
+  {
+    "path": "D:\\research\\ai+MACERsimulation\\MACNet-v1\\.cache\\Exp3_Rh12x20_FiveRuns_Closure_Exp3.2_metadata.json",
+    "size": 6079,
+    "mtime_ns": 1791435393232106300
+  }
+]
