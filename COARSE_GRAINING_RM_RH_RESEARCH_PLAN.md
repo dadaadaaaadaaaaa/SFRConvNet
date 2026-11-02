@@ -2955,3 +2955,60 @@ python -m py_compile raw_data_processing/geometry_features.py raw_data_processin
 
 完整命令及参数见 `raw_data_processing/build_cell_sfr_supervision.md` 与
 `Experiment/build_cell_supervision_cache.md`。
+
+## 2026-11-02：独立逐格 SFRUNet、物理损失与数据适配器
+
+本节更新上一条“逐格 CNN、局部 loss 尚未实现”的状态。原标量模型/训练入口保持不变。
+
+### 已实现的模型与目标
+
+- 新增 `Experiment/SFRUNet.py`：两次下采样、三尺度 32/64/128 通道的残差 U-Net。
+  默认 E1/E2/瓶颈/D2/D1 各两块；对应 12×20→6×10→3×5→6×10→12×20。
+  双线性隐藏特征上采样、1×1 通道投影、Concat 跳跃连接，线性逐格头。
+  复用现有残差块、SE、BN、Fourier 坐标编码；固定 R_h 关闭 FiLM。
+  默认 4 bands、max_freq=4、p_drop=0；12 物理输入通道时参数量 1,156,097。
+  瓶颈可减至一块（852,321 参数）；未因参数量更少宣称效果更好。
+- 新增 `cell_sfr_objective.py`：输出 z 经 `C_hat=s_C*sinh(z)` 后计算 `Y_hat=B+C_hat`。
+  最终总 SFR 为地图求和，不重复乘体积。baseline 不作为网络输入。
+- 损失为归一化物理空间的逐格 MSE、总 SFR MSE、逐格负 SFR 平方惩罚之和。
+  后两项权重默认均为 1，可消融；零标签纳入监督；不增加重复 closure MSE，不裁剪预测。
+  这不是变换域 z 的 MSE，signed-asinh 仅定义输出参数化。
+- closure scale 为训练集非零 |Y-B| 中位数；cell/total loss 尺度分别为训练 Y 地图和总量 RMS。
+  训练过采样重复项保留，全零尺度显式回退到 1 code SFR；验证/test/out 不能重新估计。
+  新增独立 scales/loss/model 契约，原 HDF5/scalar metadata schema 不变。
+- 新增 `cell_sfr_dataset.py`：原 scalar cache + 逐格 sidecar→字典 batch。
+  校验源 SHA256、样本/母帧 UID 顺序、地图摘要、Y=B+C、原标量总和及输入通道。
+  当前限定二维 R_h、data_compatible baseline、conditioning=none；跨 split 检查 UID/parent 隔离。
+  支持已有 Direct 或 Closure scalar cache，只要完整物理监督及契约存在。
+
+### 验证及证据
+
+```powershell
+python Experiment/SFRUNet.py --smoke-test
+python -m unittest tests.test_sfr_unet tests.test_cell_sfr_supervision tests.test_split_snapshot_builders tests.test_metadata_contract tests.test_fine_time_context_migration tests.test_spatial_coarsening_module tests.test_thermodynamic_semantics tests.test_sfr_supervision_products tests.test_signed_closure_training tests.test_rh_training_conditioning -q
+```
+
+使用本机 physics_ai 环境，CPU 上合计 **71 项测试通过**（新测试 9 项）。
+包含奇数尺寸、完整参数反向传播、state_dict 恢复、负 closure/零真值、手算损失、
+总量相同而局部分布错误的区分、物理单位缩放不变性、拒绝非有限损失/隐式广播、
+训练尺度隔离、sidecar 篡改与跨 split UID 重叠检测、旧标量 Direct/Closure 回归。
+
+本次 E 盘已挂载，额外在临时目录完成五组真实盘星系各 3 帧，共 15 帧的
+raw Data-Set-11→旧 R_h 产品逐格补齐→HDF5 回读→scalar smoke cache→sidecar→Dataset→网络/loss。
+抽样 index 与上一节的 15 帧相同；逐帧核验原始文件 SHA256、体积映射，
+以及新旧 snapshot 所有气体字段逐元素完全相等。
+真实 Y 地图求和相对于原 scalar Y 的最大误差为 0；抽样总 Y 范围为
+5.744094974–1630.801167303 code SFR，**没有覆盖真实全零帧**，全零行为由合成测试覆盖。
+CPU、seed42、Adam lr=1e-4，全 15 帧 batch 仅做 3 步梯度 smoke：
+loss 为 0.7217402、0.7215835、0.7214270，所有可训练参数梯度均存在且有限。
+此数值只表明接口/反向传播跑通，不能说明拟合、泛化或 burst 预测能力。
+临时数据自动清理，未修改原产品/cache/checkpoint，未生成全量 cache，未登记 Train_history。
+
+### 尚未完成与下一步
+
+网络/损失/数据 API 已可组合使用；正式逐格训练、断点恢复、HPO、地图评估入口尚未接通。
+旧 `run_train.py/run_optuna.py` 仍仅适用于原标量模型，不能直接替换模型名运行。
+后续建立独立空间训练入口，保存模型/损失/尺度/输入归一化/split 完整契约，
+先在固定 split 验证，再比较逐格、总量与 burst 分段误差。
+未验证 CUDA/AMP 性能、全量数据适配、R_m 局部标签、3D 或真实 GIZMO 泛化。
+详细接口、参数和使用示例见 `Experiment/SFRUNet.md`。

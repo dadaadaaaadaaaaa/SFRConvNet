@@ -41,8 +41,8 @@ cache 标量不符会停止，不填零回退。
 - `cell_product_uid/cell_contracts`：逐样本身份及去重后的局部契约。
 
 单位为 code SFR，尚未 log/asinh/标准化，零标签保留。**原总量 closure scale 不自动复用为
-逐格 scale**；未来局部 loss/scale 需要单独设计，只能由训练集估计。
+逐格 scale**；局部 loss/scale 已在 [SFRUNet 配套模块](SFRUNet.md) 实现，只能由训练集估计。
 
-sidecar 不含 x，不能单独交给旧 `run_train.py`。下一阶段新空间模型/dataset 应联合读取原 cache
-与 sidecar，验证源 SHA256/UID，逐格预测后求和供原总量评估使用。
+sidecar 不含 x，不能单独交给旧 `run_train.py`。`CellSFRDataset` 联合读取原 cache
+与 sidecar，验证源 SHA256/UID；新模型逐格预测后求和供总量评估使用。正式空间训练入口尚未接通。
 本次未修改 `prepare_data.py`、`models.py`、`train.py`、`run_train.py`、`run_optuna.py`。
