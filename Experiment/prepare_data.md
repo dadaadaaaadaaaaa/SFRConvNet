@@ -5,7 +5,8 @@
 本脚本仍生成原标量 cache，不自动启用逐格模型。已补齐局部标签的二维 R_h HDF5 也可正常
 走原标量流程。为了复用相同 split/UID/标准化，可通过
 [build_cell_supervision_cache.md](build_cell_supervision_cache.md) 生成逐格监督 sidecar；
-原 cache 和 `closure_scale` 不改。逐格模型及训练损失尚未接通。
+原 cache 和 `closure_scale` 不改。逐格模型使用独立训练尺度；Exp1/Exp2 的新训练入口见
+[run_train_sfr_unet.md](run_train_sfr_unet.md)，不改变本脚本的标量 cache 接口。
 
 ## 1. 功能概述
 

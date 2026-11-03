@@ -4,7 +4,9 @@
 > [旧产品补齐入口](raw_data_processing/build_cell_sfr_supervision.md) 与
 > [原 cache 的逐格监督附加文件](Experiment/build_cell_supervision_cache.md) 已接通。
 > 独立的 [SFRUNet、逐格损失和数据适配器](Experiment/SFRUNet.md) 已通过合成及真实数据 smoke。
-> 原标量模型和训练逻辑不变；逐格正式训练/HPO 入口、3D/R_m 局部标签尚未接通。
+> **2026-11-03：Exp1/Exp2 逐格训练与 HPO 入口已接通**，见
+> [正式训练](Experiment/run_train_sfr_unet.md)、[Optuna](Experiment/run_optuna_sfr_unet.md)。
+> 原标量流程不变；3D/R_m 局部标签及其他 Exp 的逐格训练尚未接通。
 
 > 本文档是本项目面向 AI、代码协作者和课题组成员的总入口。接手任务时应先阅读本文，再按“必读顺序”加载更详细的研究与代码文档。本文同时概述已核验的 MACER2D 盘星系流程与 MACER3D 矮星系数据/预处理流程；三维训练尚未接通，不能凭二维经验自行补写或宣称可用。
 

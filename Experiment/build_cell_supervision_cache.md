@@ -44,5 +44,6 @@ cache 标量不符会停止，不填零回退。
 逐格 scale**；局部 loss/scale 已在 [SFRUNet 配套模块](SFRUNet.md) 实现，只能由训练集估计。
 
 sidecar 不含 x，不能单独交给旧 `run_train.py`。`CellSFRDataset` 联合读取原 cache
-与 sidecar，验证源 SHA256/UID；新模型逐格预测后求和供总量评估使用。正式空间训练入口尚未接通。
+与 sidecar，验证源 SHA256/UID；新模型逐格预测后求和供总量评估使用。
+Exp1/Exp2 已可使用独立 [run_train_sfr_unet.py](run_train_sfr_unet.md) 训练。
 本次未修改 `prepare_data.py`、`models.py`、`train.py`、`run_train.py`、`run_optuna.py`。

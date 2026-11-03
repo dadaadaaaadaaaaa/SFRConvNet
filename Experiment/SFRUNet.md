@@ -1,8 +1,9 @@
 # SFRUNet：二维逐格 signed-closure 模型
 
 此模块实现方案 C 的**逐格预测与逐格监督**，独立于 `models.py` 的标量 SFRConvNet。
-网络、损失和数据适配器已经接通；现有 `run_train.py/run_optuna.py` 仍是标量入口，
-不能只更改模型名称就用它们训练本模型。目前未接入正式空间训练 CLI、HPO 或结果分析。
+网络、损失和数据适配器已经接通；现有 `run_train.py/run_optuna.py` 仍是标量入口。
+2026-11-03 新增独立 [run_train_sfr_unet.py](run_train_sfr_unet.md) 和
+[run_optuna_sfr_unet.py](run_optuna_sfr_unet.md)，支持 Exp1/Exp2。旧分析 notebook 尚未适配空间结果。
 
 ## 1. 文件职责与结构
 
@@ -132,7 +133,7 @@ loss.backward()
 
 返回字典的 `sfr_map_physical` 为 N1HW，`sfr_total_physical` 为 N。
 独立推断可以使用 `compose_cell_sfr(z, baseline, closure_scale=scales['closure_scale'])`。
-上述代码仅演示一次前向/反向，不是正式训练器。
+上述代码仅演示一次前向/反向；正式训练使用独立 SFRUNet 入口。
 
 适配器验证源 cache SHA256、UID/parent 顺序、产品契约摘要、各地图摘要、Y=B+C、
 地图与原标量求和一致、无监督量输入、固定 R_h、相同坐标 shape。
@@ -149,7 +150,7 @@ loss.backward()
 恢复模型时 `SFRUNet(**model_contract['config'])` 后加载 state_dict；
 验证/测试复用训练 scales，禁止重新估计。
 
-下一步可添加独立空间训练入口，复用旧调度/早停机制，但不能将 N1HW 输出广播给旧标量 loss。
+独立空间训练入口已实现调度/早停及恢复，不将 N1HW 输出广播给旧标量 loss。
 HPO 仅使用验证集，空间模型与标量模型应固定输入/split/预算，并明确损失差异。
 评估同时报告逐格、每帧总量、低/高 SFR 与 burst 指标；正式效果须经过训练才能判断。
 
@@ -163,4 +164,5 @@ python -m unittest tests.test_sfr_unet -q
 CLI 仅支持 `--smoke-test`、`--c-in`（默认12）、`--shape H W`（默认12 20）、
 `--device cpu|cuda`（默认cpu），不会写训练结果。
 2026-11-02 已通过 CPU 合成测试和五组真实盘星系共 15 帧的三步梯度 smoke；
-未进行正式训练、CUDA 性能验证或全量 sidecar 生成。
+未进行正式训练或全量 sidecar 生成。2026-11-03 补充了 CPU 恢复及 CUDA/BF16 smoke，
+并用五组真实盘星系的15帧跑通 Exp1/Exp2 角色的小规模训练，详见研究计划；未验证 A100 吞吐量。

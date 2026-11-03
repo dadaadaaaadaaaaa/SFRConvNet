@@ -3012,3 +3012,74 @@ loss 为 0.7217402、0.7215835、0.7214270，所有可训练参数梯度均存�
 先在固定 split 验证，再比较逐格、总量与 burst 分段误差。
 未验证 CUDA/AMP 性能、全量数据适配、R_m 局部标签、3D 或真实 GIZMO 泛化。
 详细接口、参数和使用示例见 `Experiment/SFRUNet.md`。
+
+## 2026-11-03：Exp1/Exp2 独立逐格训练与 Optuna
+
+### 实现范围
+
+- 新增 `Experiment/train_sfr_unet.py`：统一训练/验证核心，独立 TrainConfig JSON，
+  AdamW、warmup+cosine、梯度裁剪、早停、整批 tensor 索引、TensorBoard、best/last 原子保存和恢复。
+- 新增 `run_train_sfr_unet.py`：支持 Exp1 单实验、Exp2 单折或原 folds.json 多折、指定 held-out、多 seed。
+  每折单独训练尺度；多个 seed 复用同折数据但分别初始化模型。原 `ExperimentSetting.json` 不被隐式继承。
+- 新增 `run_optuna_sfr_unet.py`：共用上述核心，只加载 train/val，复用 dataset/训练尺度；
+  独立 SQLite study，TPE/Grid、剪枝、恢复 study、保存 sampler 状态和完整 best_config.json。
+- 不修改旧 `train.py/run_train.py/run_optuna.py/models.py`，不改变原 Direct/Closure 或其他 Exp 的行为。
+  当前只接受 Exp1/random_snapshot_within_group 和 Exp2/leave_one_galaxy_out，不适配其他 Exp。
+
+### 数据、损失和选模约定
+
+原 scalar cache + 独立逐格 sidecar 联合使用，文件名为 `<cell_exp><split>_cells.pt`。
+正式训练检查 train/val/test（Exp2 还有 out）的运行身份、UID/parent 隔离和地图契约。
+HPO 不打开 test/out；部署到服务器调参只需代码、train/val 两类 cache、metadata、norm.npz。
+保留已有 cache 内过采样和训练输入统计，不叠加新的采样平衡，不启用 mirror/旋转。
+
+新模型始终执行逐格 signed closure；原 scalar cache 的 prepared_objective 不决定新模型目标。
+损失保持上一节的物理空间三项定义，训练权重允许配置。
+早停/HPO/best 使用固定系数指标：各运行内部平均 `Lcell+Ltotal+Lnegative` 后再对运行等权平均。
+因此搜索训练损失系数不会同时改变选模尺子。记录逐格/总量 MAE、RMSE、总量 bias、负预测比例，
+以及 MACER-LR baseline 的同类指标；全部使用 code SFR，总量不再次乘体积。
+
+默认 HPO 搜索六项：lr 对数 `[1e-5,3e-3]`、weight_decay 对数 `[1e-7,1e-3]`、
+batch_size `{32,64,128,256}`、base_ch `{16,32,64}`、p_drop `{0,.1,.2,.3}`、bottleneck_depth `{1,2}`。
+可选择性搜索 bands、最高频率、SE reduction、total_weight、negative_weight；不把 seed 当搜索参数。
+默认训练100轮、patience20，HPO 50个新增trial，每折8小时预算，不强制中断正在运行的trial。
+契约绑定数据、统计、源实现文本摘要、软件版本、搜索空间、固定参数和训练/选模规则。
+
+恢复 last.pt 保存并核对优化器、scheduler、随机数、早停计数、完整配置和数据身份；
+不允许静默改变原总epochs。`stop_after_epochs` 只暂停本次执行，不改变预设学习率日程。
+HPO study 续跑不等于恢复一个被中断的trial：重启后新增trial，未完成训练只能另行检查last.pt。
+非有限损失/梯度、CUDA OOM 会标记该trial剪枝并记录原因，其他错误直接报告。
+修复开发测试中发现的 Windows SQLite 连接未释放导致临时目录无法清理问题。
+
+### 验证证据
+
+```powershell
+python -m unittest tests.test_sfr_unet_training tests.test_sfr_unet tests.test_cell_sfr_supervision tests.test_split_snapshot_builders tests.test_metadata_contract tests.test_fine_time_context_migration tests.test_spatial_coarsening_module tests.test_thermodynamic_semantics tests.test_sfr_supervision_products tests.test_signed_closure_training tests.test_rh_training_conditioning tests.test_optuna_objective_contract -q
+```
+
+本机 physics_ai 环境合计 **102 项测试通过**，包含9项新训练测试及旧标量/HPO回归。
+新测试覆盖 Exp1、Exp2 manifest、留出集分组、JSON/CLI覆盖、多seed、
+删除 test/out 后 HPO 仍可运行、两次 study 续接、最佳配置导出、固定指标不依赖训练权重、
+尾批处理、错误实验/分组/norm拒绝、剪枝仍保留last，以及 CPU 连续训练/暂停恢复的模型参数逐项完全相等。
+本机 RTX4060 Laptop GPU 的 CUDA FP32/BF16 合成训练均通过，TensorBoard 写入另做 smoke。
+三个入口的 `--help` 均可执行。未测试服务器 A100 性能或分布式训练。
+
+E盘重新挂载后，使用上一节相同的五组盘星系共15帧原始 Data-Set-11，在独立临时目录补齐逐格标签，
+生成小型 scalar cache 和 sidecar，完成 CUDA 上各两轮的端到端训练与预测导出：
+
+- Exp1 角色：五组各1帧train、1帧val、1帧test，共5/5/5。
+- Exp2 角色：留出Model0.75的3帧作out，其他四组各1帧train/val/test，共4/4/4/3。
+- 默认base_ch32，batch4，seed42；smoke保留数据可用的13个输入通道，包含initial_stellar_density，
+  不冒充此前12通道正式实验的对照结果。
+- 两种训练均完成，输出有限，test/out地图和总量文件成功写入。Exp1/2最佳联合val指标分别约
+  46.715与40.245；仅用于说明流程可执行，不解释为科学性能。
+
+这些帧按角色人工分配，只是接口 smoke，**没有实施正式 Exp1 的随机60/20/20实验或完整Exp2训练**。
+不同split使用独立UID，尺度由各自train计算；原数据、正式cache和Results均未覆盖。
+临时产品与权重由临时目录清理；不向 Train_history 登记。
+
+### 后续使用
+
+先为目标原cache每个split生成逐格sidecar，再跑新HPO，最后使用导出的best_config.json正式多seed训练。
+新结果目录保存逐格及总量预测，但旧空间分析notebook尚未接通，不能直接认为旧标量可视化支持新checkpoint。
+详细参数、默认值、命令、前缀映射与恢复说明见三个入口同名 `.md`。
