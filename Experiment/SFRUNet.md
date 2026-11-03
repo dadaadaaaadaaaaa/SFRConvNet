@@ -4,6 +4,8 @@
 网络、损失和数据适配器已经接通；现有 `run_train.py/run_optuna.py` 仍是标量入口。
 2026-11-03 新增独立 [run_train_sfr_unet.py](run_train_sfr_unet.md) 和
 [run_optuna_sfr_unet.py](run_optuna_sfr_unet.md)，支持 Exp1/Exp2。旧分析 notebook 尚未适配空间结果。
+新结果使用 [analyze_sfr_unet.py 与 Exp2 notebook](../VisualScripts/ResultAnalysis/analyze_sfr_unet.md)，
+直接读取导出的 test/out 预测文件。
 
 ## 1. 文件职责与结构
 

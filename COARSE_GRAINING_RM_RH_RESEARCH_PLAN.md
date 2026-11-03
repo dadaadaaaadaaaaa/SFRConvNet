@@ -3083,3 +3083,32 @@ E盘重新挂载后，使用上一节相同的五组盘星系共15帧原始 Data
 先为目标原cache每个split生成逐格sidecar，再跑新HPO，最后使用导出的best_config.json正式多seed训练。
 新结果目录保存逐格及总量预测，但旧空间分析notebook尚未接通，不能直接认为旧标量可视化支持新checkpoint。
 详细参数、默认值、命令、前缀映射与恢复说明见三个入口同名 `.md`。
+
+## 2026-11-03：SFRUNet 独立分析脚本与 Exp2 notebook
+
+新增 `VisualScripts/ResultAnalysis/analyze_sfr_unet.py`、同名说明文档，及
+`Results_stat_Exp2_SFRUNet.ipynb`。直接读取正式训练的 summary、contract、split_manifest、
+test/out_predictions.pt，可选history；不重新推理，不访问raw/cache，不修改旧标量分析入口。
+
+已实现总量与逐格MAE/RMSE/R2/Bias、非零真值中位相对误差、负预测比例，
+Model/Baseline对照、瞬时SFR、逐时间误差、局部抵消图、逐格空间对比和训练曲线。
+累计质量仅对Exp2 out在缓存实际覆盖区间积分；test是域内随机稀疏样本，不冒称完整历史。
+积分使用Msun/yr×Gyr×1e9，每格SFR不再乘体积。累计从首帧置零，不等同日志NEWstar。
+`Model Error all time`和`Baseline Error all time`定义为100*(预测积分-真值积分)/真值积分，
+负数表示低估；同时记录起止时间、覆盖时长及被排除大间隙数量。
+空间图明确使用theta/r索引，共享色标；没有几何数据时不绘制伪物理坐标或密度。
+
+burst默认关闭，窗口、时间平移和事件阈值显式配置，不硬编码任何星系论文窗口。
+窗口内提供SFR误差、质量积分误差、峰值幅度与时刻误差；边界插值，不外推或跨明显缺口。
+可选阈值测量窗口内首个事件；未检出或左右删失时相应时刻误差留空，多个事件数额外记录。
+这不是完整的多事件匹配算法；fiducial具体论文窗口和时间映射尚需独立核对。
+
+加载时检查预测schema、单位、身份、跨split隔离、运行集合、B+C_hat恒等式和地图求和。
+输出到新建分析目录，保留源文件SHA256、参数和单位；不覆盖已有分析。
+
+验证：`python -m unittest tests.test_analyze_sfr_unet -q`，5项测试覆盖单位积分、缺口/重复时间、
+零真值、负预测、事件交叉/删失、窗口端点、绘图和拒绝覆盖、地图求和篡改、notebook语法/中文注释。
+另从小型合成Exp2实际训练输出，按顺序执行notebook全部代码cell，生成统计表和图像；
+人工查看SFR历史及六联空间图，并修复色条/标签重叠。未开展新的正式训练，未将smoke登记Train_history。
+最终联合运行 `tests.test_analyze_sfr_unet tests.test_sfr_unet` 共14项通过，CLI帮助可执行。
+本机未安装nbformat，未调用其schema验证器；notebook已做JSON/代码语法检查并实际逐cell执行。

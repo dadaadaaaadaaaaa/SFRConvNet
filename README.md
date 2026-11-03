@@ -7,6 +7,8 @@
 > **2026-11-03：Exp1/Exp2 逐格训练与 HPO 入口已接通**，见
 > [正式训练](Experiment/run_train_sfr_unet.md)、[Optuna](Experiment/run_optuna_sfr_unet.md)。
 > 原标量流程不变；3D/R_m 局部标签及其他 Exp 的逐格训练尚未接通。
+> SFRUNet 已导出结果可使用 [独立结果分析](VisualScripts/ResultAnalysis/analyze_sfr_unet.md) 与
+> `VisualScripts/ResultAnalysis/Results_stat_Exp2_SFRUNet.ipynb`，无需重新推理。
 
 > 本文档是本项目面向 AI、代码协作者和课题组成员的总入口。接手任务时应先阅读本文，再按“必读顺序”加载更详细的研究与代码文档。本文同时概述已核验的 MACER2D 盘星系流程与 MACER3D 矮星系数据/预处理流程；三维训练尚未接通，不能凭二维经验自行补写或宣称可用。
 
