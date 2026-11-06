@@ -96,3 +96,16 @@ Ctrl+C 中断后重新运行原 HPO 命令，会继续新增 trial；**不会自
 强制杀进程可能留下 RUNNING 记录，本入口不擅自把它算成完成结果；最佳结果只从 COMPLETE 中选择。
 正常关闭释放 SQLite 连接，数据库可移动。不要对同一 SQLite study 启动并行写入；当前仅串行单进程 HPO。
 若所有 trial 均剪枝，则报告 completed_trials=0，best_config 为 null，不能继续假定有最佳模型。
+
+
+## 2026-11-06：非负逐格输出
+
+新增 `--output-constraint relu --candidate-weight 1`：训练内计算
+`q=B+s_C*sinh(z)`、`Y_hat=ReLU(q)`、`C_hat_final=Y_hat-B`；
+主损失作用于最终Y_hat，候选辅助MSE作用于q（含零标签），使用已有训练cell_scale。
+默认仍为 `none/0`，保留旧输出行为；relu要求正辅助权重，旧negative_weight在relu下停用。
+不需要重建cache，但需要重新训练；不能给旧权重后处理裁剪后冒充新训练。
+Optuna可显式搜索candidate_weight={0.1,0.3,1}，默认六项搜索不变；relu禁止搜索negative_weight。
+选择指标仅使用最终物理预测，辅助损失不加入固定选模分数。
+新预测v2包含候选与最终地图，旧v1分析继续兼容；新旧study和恢复契约分开。
+完整公式、参数、启动命令及跨版本恢复限制见 [训练核心文档](train_sfr_unet.md#2026-11-06训练内非负输出与候选辅助监督)。

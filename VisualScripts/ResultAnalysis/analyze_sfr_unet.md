@@ -82,3 +82,12 @@ python -m unittest tests.test_analyze_sfr_unet -q
 覆盖单位积分、缺口、重复时间、零真值、负预测、阈值交叉/删失、窗口端点、地图与总量一致性、
 绘图、拒绝覆盖、notebook语法和注释。另用小型Exp2训练输出按顺序实际执行notebook。
 未将smoke结果当作科学性能；未验证真实fiducial的论文burst窗口。
+
+
+## 2026-11-06：非负输出兼容
+
+同时读取旧 predictions_v1 与新 predictions_v2。v2 保存投影前 candidate_map=q、
+candidate_closure_map=Delta 和最终 prediction_map=Y_hat、closure_map=Y_hat−B。
+分析仍使用最终输出，不再做二次裁剪；新 ReLU 模式检查逐格非负、候选组成、投影关系和训练loss契约。
+旧v1继续保留负预测用于诊断。analysis.json新增 output_constraint/loss_contract。
+notebook无需更改结构，改 RESULT_DIR 即可。新训练参数详见 Experiment/train_sfr_unet.md。

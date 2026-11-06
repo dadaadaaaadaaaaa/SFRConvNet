@@ -26,7 +26,8 @@ DEFAULT_SEARCH = ("lr", "weight_decay", "batch_size", "base_ch", "p_drop", "bott
 CATEGORICAL = {"batch_size": [32, 64, 128, 256], "base_ch": [16, 32, 64],
                "p_drop": [0., .1, .2, .3], "bottleneck_depth": [1, 2],
                "pos_num_bands": [2, 4, 8], "pos_max_freq": [2., 4., 8., 16.],
-               "se_reduction": [4, 8, 16], "total_weight": [0., .3, 1., 3.], "negative_weight": [.3, 1., 3.]}
+               "se_reduction": [4, 8, 16], "total_weight": [0., .3, 1., 3.], "negative_weight": [.3, 1., 3.],
+               "candidate_weight": [.1, .3, 1.]}
 LOG_RANGES = {"lr": [1e-5, 3e-3], "weight_decay": [1e-7, 1e-3]}
 
 
@@ -56,6 +57,11 @@ def optimize(config, *, search=DEFAULT_SEARCH, n_trials=50, timeout=28800,
              sampler="tpe", sampler_seed=42, pruning=True, held_out=None):
     """每折独立 study；n_trials 是本次新增尝试次数，timeout 是每折的秒数。"""
     search = parse_search(search)
+    config.validate()
+    if config.output_constraint == "relu" and "negative_weight" in search:
+        raise ValueError("relu 下负值惩罚已停用，不能搜索 negative_weight。")
+    if config.output_constraint != "relu" and "candidate_weight" in search:
+        raise ValueError("candidate_weight 搜索仅用于 relu 模式。")
     if n_trials <= 0 or timeout <= 0:
         raise ValueError("n_trials/timeout 必须为正。")
     if not 0 <= sampler_seed < 2**32:

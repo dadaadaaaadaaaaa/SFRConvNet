@@ -59,6 +59,8 @@ class TrainConfig:
     se_reduction: int = 4
     total_weight: float = 1.0
     negative_weight: float = 1.0
+    output_constraint: str = "none"  # relu：在训练内投影最终 SFR，候选值仍可负。
+    candidate_weight: float = 0.0  # relu 模式必须显式设置正辅助权重。
     amp: str = "none"
     tensorboard: bool = True
     resume: str = ""
@@ -85,10 +87,15 @@ class TrainConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须为有限正数。")
-        for name in ("weight_decay", "total_weight", "negative_weight"):
+        for name in ("weight_decay", "total_weight", "negative_weight", "candidate_weight"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} 必须为有限非负数。")
+        if self.output_constraint not in {"none", "relu"}:
+            raise ValueError("output_constraint 只能为 none/relu。")
+        if ((self.output_constraint == "relu" and self.candidate_weight <= 0)
+                or (self.output_constraint == "none" and self.candidate_weight != 0)):
+            raise ValueError("relu 要求 candidate_weight>0；none 要求 candidate_weight=0。")
         if not 0 <= self.warmup_ratio < 1 or not 0 <= self.min_lr_ratio <= 1 or not 0 <= self.p_drop < 1:
             raise ValueError("warmup_ratio/p_drop 范围 [0,1)，min_lr_ratio 范围 [0,1]。")
         if self.pos_max_freq < 1 or self.amp not in {"none", "bfloat16"}:
@@ -231,7 +238,7 @@ def summarize_statistics(rows):
 def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none", save_predictions=False):
     """固定系数联合指标，先各运行内部平均再等权平均；不随训练 loss 权重变化。"""
     model.eval()
-    stats, baseline_stats, maps = [], [], []
+    stats, baseline_stats, maps, candidates, candidate_corrections = [], [], [], [], []
     for indices in batch_indices(len(dataset), batch_size):
         x, coord, b, y = move_batch(dataset, indices, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp == "bfloat16"):
@@ -242,6 +249,8 @@ def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none
         baseline_stats.append(_statistics(b, y, scales).cpu())
         if save_predictions:
             maps.append(p.cpu())
+            candidates.append(detail["candidate_sfr_map_physical"].cpu())
+            candidate_corrections.append(detail["candidate_closure_map_physical"].cpu())
     stats, baseline_stats = torch.cat(stats), torch.cat(baseline_stats)
     groups = dataset.base.groups.flatten()
     def aggregate(rows):
@@ -252,7 +261,9 @@ def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none
     predictions = None
     if save_predictions:
         p = torch.cat(maps)
-        predictions = {"schema": "macnet_sfr_unet_predictions_v1", "sample_uid": dataset.sample_uid,
+        predictions = {"schema": "macnet_sfr_unet_predictions_v2", "sample_uid": dataset.sample_uid,
+                       "output_constraint": objective.output_constraint, "loss_contract": objective.loss_contract(),
+                       "candidate_map": torch.cat(candidates), "candidate_closure_map": torch.cat(candidate_corrections),
                        "parent_hr_uid": dataset.parent_hr_uid, "time": dataset.base.time,
                        "groups": [dataset.base.group_names[i] for i in groups.tolist()],
                        "prediction_map": p, "target_map": dataset.target, "baseline_map": dataset.baseline,
@@ -298,7 +309,9 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                     "pos_num_bands", "pos_max_freq", "p_drop", "se_reduction")}
     model = SFRUNet(len(ds.input_channels), **config_model).to(device)
     objective = CellSFRLoss.from_scale_contract(bundle.scales, total_weight=config.total_weight,
-                                               negative_weight=config.negative_weight).to(device)
+                                               negative_weight=config.negative_weight,
+                                               output_constraint=config.output_constraint,
+                                               candidate_weight=config.candidate_weight).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     warmup = math.ceil(config.epochs * config.warmup_ratio)
     def schedule(epoch):
@@ -342,6 +355,8 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(str(output / "tensorboard"), purge_step=start+1 if start else None)
     print(f"SFRUNet: objective=signed_closure; loss_space=physical_sfr; conditioning=none; device={device}")
+    print(f"Output constraint={config.output_constraint}; candidate_weight={config.candidate_weight}; "
+          f"effective negative_weight={objective.loss_contract()['negative_weight']}; selection excludes candidate loss")
     print(f"Input channels: {ds.input_channels}; shape={ds.spatial_shape}; scales={bundle.scales['closure_scale']:.6g},"
           f"{bundle.scales['cell_scale']:.6g},{bundle.scales['total_scale']:.6g}; CPU threads={torch.get_num_threads()}")
     print(f"Output: {output}", flush=True)
@@ -353,7 +368,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                 break
             begin = time.perf_counter()
             model.train()
-            sums = torch.zeros(4, device=device, dtype=torch.float64)
+            sums = torch.zeros(5, device=device, dtype=torch.float64)
             lr = optimizer.param_groups[0]["lr"]
             for indices in batch_indices(len(ds), config.batch_size, shuffle=True):
                 x, coord, b, y = move_batch(ds, indices, device)
@@ -370,7 +385,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                     raise
                 optimizer.step()
                 sums += torch.stack([loss.detach(), detail["cell_loss"].detach(), detail["total_sfr_loss"].detach(),
-                                     detail["negative_penalty"].detach()]) * len(indices)
+                                     detail["negative_penalty"].detach(), detail["candidate_loss"].detach()]) * len(indices)
             validation, _ = evaluate(model, bundle.datasets["val"], objective, bundle.scales, device=device,
                                      batch_size=config.batch_size, amp=config.amp)
             score = validation["model"]["macro_joint_score"]
@@ -399,7 +414,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
             print(f"Epoch {epoch+1:03d} train={row['train_loss'][0]:.6g} val_macro={score:.6g} "
                   f"lr={lr:.3g} time={row['seconds']:.2f}s", flush=True)
             if writer:
-                for key, value in zip(("total", "cell", "global", "negative"), row["train_loss"]):
+                for key, value in zip(("total", "cell", "global", "negative", "candidate"), row["train_loss"]):
                     writer.add_scalar(f"train/{key}", value, epoch+1)
                 writer.add_scalar("val/macro_joint", score, epoch+1)
                 for group, metrics in validation["model"]["per_run"].items():

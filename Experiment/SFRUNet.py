@@ -1,7 +1,8 @@
 """二维逐格 signed-closure 残差 U-Net；与原 models.py 的标量网络独立。
 
 输入是已标准化的 LR 气体场及原坐标，输出是 (N,1,theta,r) 的变换域
-closure。物理 baseline、反变换及损失放在 cell_sfr_objective.py 中。
+候选修正 z。none 模式它也是变换域 closure；relu 模式最终 closure=ReLU(B+s*sinh(z))-B。
+物理 baseline、反变换、输出约束及损失放在 cell_sfr_objective.py 中。
 """
 
 from __future__ import annotations

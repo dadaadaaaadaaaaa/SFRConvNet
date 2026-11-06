@@ -132,3 +132,64 @@ python Experiment/train_sfr_unet.py --config Results/RUN/config.json --resume Re
 Ctrl+C 后可从已写好的 last.pt 恢复，未完成 epoch 会重新执行。CPU 小测试已验证逐参数一致；
 不保证跨硬件 CUDA 逐位一致。更改 epochs 会改变余弦日程，因此不允许通过 resume 延长原实验。
 输入文件只读；写文件使用同目录临时文件后原子替换。
+
+
+## 2026-11-06：训练内非负输出与候选辅助监督
+
+原模式默认保留：`--output-constraint none --candidate-weight 0`。
+新增 `--output-constraint relu --candidate-weight 1`（1 是初始对照值，尚未正式优化）：
+
+```text
+Delta = closure_scale * sinh(z)
+q = B + Delta
+Y_hat = ReLU(q)
+C_hat_final = Y_hat - B
+L = mean(((Y_hat-Y)/cell_scale)^2)
+    + total_weight * mean(((sum(Y_hat)-sum(Y))/total_scale)^2)
+    + candidate_weight * mean(((q-Y)/cell_scale)^2)
+```
+
+全部格子（含零标签）参与辅助监督。它绕过 ReLU 的负区间，给 q<0、Y>0 的错误预测提供梯度；
+不是修改 Y/B/C_true 标签，也不是对旧 checkpoint 后处理裁剪。最终 closure 仍可为负，且不小于 -B。
+ReLU 模式要求 candidate_weight 为有限正数；none 要求它为0。候选及所有损失必须有限，
+不允许 ReLU 将负无穷隐藏为零。辅助项使用已有训练集 cell_scale，不再估计测试集尺度。
+
+`negative_weight` 仍保存在配置中供旧模式使用，但 relu 下有效权重固定为0；启动日志和 loss 契约
+明确报告有效值。逐格与总量主损失都使用最终 Y_hat，候选辅助项直接使用 q。
+选模指标仍为各运行等权的 `cell + total + negative`（系数固定1）；candidate loss 不参与该指标，
+避免搜索辅助权重时改变评分口径。非负模式下 negative 项自然为0。
+
+无需重建已有 scalar cache/逐格 sidecar；必须重新训练，使用独立结果目录。
+模型卷积结构和参数数量不变；本次只扩展物理组成与损失。原标量CNN/Direct入口不变。
+
+### 参数与启动方式
+
+- `output_constraint` / `--output-constraint`：默认 `none`；可选 `none, relu`。
+- `candidate_weight` / `--candidate-weight`：默认0；relu时显式设置正数，例如1、0.3、0.1。
+- 不使用 Softplus，不需要 epsilon，没有正值背景。
+
+```powershell
+# 用上次最优配置固定其他条件，重新训练一个非负对照；将路径替换为实际 best_config.json
+python Experiment/run_train_sfr_unet.py --config .cache/STUDY/best_config.json --output-constraint relu --candidate-weight 1 --run-name SFRUNet_ReLU_Candidate1 --device cuda
+
+# 或同一个 Exp2 cache 新开 HPO（默认仍搜索原六个参数，辅助权重固定1）
+python Experiment/run_optuna_sfr_unet.py --data-exp Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_ --output-constraint relu --candidate-weight 1 --device cuda --n-trials 100
+```
+
+若显式搜索辅助权重，在 `--search-params` 的完整列表中加入 `candidate_weight`，范围为 `{0.1,0.3,1}`；
+`--search-params` 会替换默认列表。该搜索仅允许 relu，relu 禁止搜索已经停用的 negative_weight。
+输出模式与权重进入配置/恢复/HPO身份；新实验不会续接旧study。旧JSON缺少新字段时默认旧模式。
+同版本暂停恢复可以继续；**跨本次代码修改的旧 last.pt 仍会因严格代码/配置契约检查而拒绝直接续训**。
+旧模型权重结构和旧预测分析仍兼容，不允许靠更改旧checkpoint的模式字段将其冒充重训结果。
+
+### 导出与分析
+
+新 loss contract 为 v2，新 prediction schema 为 `macnet_sfr_unet_predictions_v2`，包含：
+- `prediction_map`：最终 Y_hat；`closure_map`：最终 Y_hat−B。
+- `candidate_map`：投影前 q；`candidate_closure_map`：投影前 Delta，不能冒充最终 closure。
+- `output_constraint` 和完整 `loss_contract`。
+
+history.train_loss 保留前4项（总损失、cell、global、negative），追加第5项原始 candidate loss；
+TensorBoard `train/candidate` 为未乘权重的辅助损失，`train/total` 已包含其加权贡献。
+分析器同时支持旧v1与新v2；v2额外检查 q=B+Delta、Y_hat=ReLU(q)/q、非负性以及与训练loss契约一致。
+现有 Results_stat_Exp2_SFRUNet.ipynb 无需改结构，切换 RESULT_DIR 即可分析新结果。

@@ -34,10 +34,10 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def load_predictions(path, *, identity, expected_groups):
+def load_predictions(path, *, identity, expected_groups, expected_loss=None):
     """核对文件 schema、单位、逐格恒等式、总和、UID、运行及时间，不猜测旧标量格式。"""
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if (payload.get("schema") != "macnet_sfr_unet_predictions_v1"
+    if (payload.get("schema") not in {"macnet_sfr_unet_predictions_v1", "macnet_sfr_unet_predictions_v2"}
             or payload.get("units") != "MACER_mass_code/Gyr" or payload.get("to_msun_per_yr") != SFR_FACTOR):
         raise ValueError("预测 schema/单位不匹配。")
     result = {k: array(payload[k]).astype(np.float64) for k in
@@ -52,6 +52,30 @@ def load_predictions(path, *, identity, expected_groups):
         raise ValueError("Y/B 必须非负；预测负值保留用于诊断。")
     if not np.allclose(result["prediction_map"], result["baseline_map"]+result["closure_map"], rtol=1e-10, atol=1e-10):
         raise ValueError("预测不满足 B+C_hat。")
+    constraint = payload.get("output_constraint", "none")
+    if constraint not in {"none", "relu"}:
+        raise ValueError("未知输出约束。")
+    if expected_loss is not None and constraint != expected_loss.get("output_constraint", "none"):
+        raise ValueError("预测输出约束与训练 loss 契约不一致。")
+    if payload["schema"] == "macnet_sfr_unet_predictions_v2":
+        if "output_constraint" not in payload or payload.get("loss_contract", {}).get("output_constraint") != constraint:
+            raise ValueError("v2 缺少一致的输出约束契约。")
+        if expected_loss is not None and payload["loss_contract"] != expected_loss:
+            raise ValueError("预测与训练 loss 契约不一致。")
+        for key in ("candidate_map", "candidate_closure_map"):
+            value = array(payload[key]).astype(np.float64)
+            if value.shape != shape or not np.isfinite(value).all():
+                raise ValueError("候选地图形状/有限性不合法。")
+            result[key] = value
+        if not np.allclose(result["candidate_map"], result["baseline_map"]+result["candidate_closure_map"], rtol=1e-10, atol=1e-10):
+            raise ValueError("候选 SFR 与候选修正不一致。")
+        expected = np.maximum(result["candidate_map"], 0) if constraint == "relu" else result["candidate_map"]
+        if not np.allclose(result["prediction_map"], expected, rtol=1e-10, atol=1e-10):
+            raise ValueError("最终预测与候选值的输出映射不一致。")
+    elif constraint != "none":
+        raise ValueError("v1 只支持旧无约束输出。")
+    if constraint == "relu" and (result["prediction_map"] < 0).any():
+        raise ValueError("relu 模式的最终 SFR 不得为负。")
     for name in ("prediction", "target", "baseline"):
         total = array(payload[name+"_total"]).reshape(-1)
         if total.shape != (shape[0],) or not np.isfinite(total).all() or not np.allclose(
@@ -289,7 +313,7 @@ def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., bu
                 if set(manifest[left][key])&set(manifest[right][key]):
                     raise ValueError(f"{left}/{right} {key} 交叉。")
     loaded={s:load_predictions(root/f"{s}_predictions.pt",identity=manifest[s],
-                              expected_groups=held if s=="out" else train_groups)
+                              expected_groups=held if s=="out" else train_groups, expected_loss=contract.get("loss"))
             for s in (["test","out"] if exp=="exp2" else ["test"])}
     if burst_window and exp!="exp2":
         raise ValueError("burst 分析仅对 Exp2 held-out 轨迹启用。")
@@ -327,6 +351,8 @@ def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., bu
     metrics.to_csv(output/"metrics.csv",index=False)
     integrated.to_csv(output/"integrated_metrics.csv",index=False)
     audit={"schema":"macnet_sfr_unet_analysis_v1","result_dir":str(root),"best_epoch":summary["best_epoch"],
+           "output_constraint":contract.get("loss",{}).get("output_constraint","none"),
+           "loss_contract":contract.get("loss"),
            "units":{"SFR":"Msun/yr","time":"Gyr","mass":"Msun"},"integral_error_convention":"100*(prediction-true)/true",
            "gap_factor":gap_factor,"burst_window":burst_window,"time_offset_gyr":time_offset,
            "burst_threshold_msun_per_yr":burst_threshold,"burst_metrics":bursts,

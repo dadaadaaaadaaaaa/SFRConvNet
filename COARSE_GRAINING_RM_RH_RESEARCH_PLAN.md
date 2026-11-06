@@ -3112,3 +3112,46 @@ burst默认关闭，窗口、时间平移和事件阈值显式配置，不硬编
 人工查看SFR历史及六联空间图，并修复色条/标签重叠。未开展新的正式训练，未将smoke登记Train_history。
 最终联合运行 `tests.test_analyze_sfr_unet tests.test_sfr_unet` 共14项通过，CLI帮助可执行。
 本机未安装nbformat，未调用其schema验证器；notebook已做JSON/代码语法检查并实际逐cell执行。
+
+
+## 2026-11-06：SFRUNet 非负输出与候选辅助监督
+
+按讨论新增训练内非负模式，不修改原标量CNN、Direct接口、气体输入、baseline与Y/C_true标签。
+`q=B+s_C*sinh(z)`，`Y_hat=ReLU(q)`，最终closure为`Y_hat-B`；输出允许精确零，
+最终closure可负但必须>=−B。原none模式保留为默认，启用命令为
+`--output-constraint relu --candidate-weight 1`，1仅为初始对照值，不是已优化结论。
+
+损失使用最终Y_hat的逐格/总量归一化MSE，并添加
+`candidate_weight * mean(((q−Y)/cell_scale)^2)`；辅助项含零格子，尺度复用train-only RMS。
+relu下旧negative_weight有效值为0，日志/契约明确声明；none要求candidate_weight=0，relu要求正数。
+候选值有限性单独检查，禁止通过ReLU掩盖负无穷。HPO固定选模指标仍是最终预测的run-macro
+cell+total+negative，不把可调权重的辅助损失直接放入评分。
+
+三个训练入口共享新参数；Optuna可显式搜索candidate_weight={0.1,0.3,1}，默认六参数不变，
+禁止在relu搜索已停用negative_weight。配置与源码摘要区分study，恢复也拒绝切换模式/权重。
+旧JSON缺字段时保持none/0；由于已有严格代码摘要，旧版本last.pt不能跨此次代码改动直接续训，
+但旧模型结构与已导出的结果分析保持可用。新模式必须重新训练，不等同于旧权重的后处理裁剪。
+
+loss schema升级v2；prediction schema升级macnet_sfr_unet_predictions_v2，额外保存candidate_map、
+candidate_closure_map、output_constraint、loss_contract。prediction_map/closure_map仍分别为
+最终SFR/最终closure，满足逐格相加及总量求和。分析器接受v1/v2，v2检查投影与候选关系及loss一致性。
+训练history前四项不变，追加candidate loss，TensorBoard记录未加权candidate分量。
+现有分析notebook无需改结构；本次未修改用户已有notebook输出和Train_history内容。
+
+验证命令（physics_ai Python）：
+
+```powershell
+python -m unittest tests.test_sfr_unet_nonnegative tests.test_sfr_unet tests.test_sfr_unet_training tests.test_analyze_sfr_unet -q
+python -m unittest tests.test_sfr_unet_nonnegative tests.test_signed_closure_training tests.test_optuna_objective_contract -q
+```
+
+首轮28项通过；补充CUDA非负测试后第二轮36项通过（两轮有5项重叠，共59个不同测试）。
+覆盖手算loss/梯度、零标签、负closure、单位缩放、负无穷拒绝；Exp2端到端小型训练/分析、
+CPU暂停恢复逐参数相等、恢复换模式拒绝、候选篡改拒绝；HPO候选权重搜索/最佳配置导出、
+固定评分不随辅助权重改变；CUDA FP32与BF16小型非负训练；旧标量Direct/closure及HPO回归。
+新增测试文件tests/test_sfr_unet_nonnegative.py；两个启动器--help显示新参数。
+只读核验既有fiducial SFRUNet的8429帧v1 out文件通过，未覆盖原结果。
+
+未启动正式训练或批量生成cache，未验证A100性能，尚不能宣称泛化误差改善。
+建议先固定此前正式模型的其他参数，重训relu+candidate1作为对照，再在in-domain验证中比较
+辅助权重；不能根据held-out fiducial结果挑选权重。训练说明见Experiment/train_sfr_unet.md。

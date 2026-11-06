@@ -42,3 +42,16 @@ CLI 覆盖 JSON；新训练总是创建独立输出目录。同一折的 dataset
 额外参数只有 `--held-out-galaxy`（默认无，可重复）、`--seeds`（默认配置 seed）；
 其余默认值、参数范围、输出与恢复见训练核心文档。`--resume` 只允许单折、单 seed。
 首版遇到错误即停止，保留此前已完成的结果；不默默跳过失败折。
+
+
+## 2026-11-06：非负逐格输出
+
+新增 `--output-constraint relu --candidate-weight 1`：训练内计算
+`q=B+s_C*sinh(z)`、`Y_hat=ReLU(q)`、`C_hat_final=Y_hat-B`；
+主损失作用于最终Y_hat，候选辅助MSE作用于q（含零标签），使用已有训练cell_scale。
+默认仍为 `none/0`，保留旧输出行为；relu要求正辅助权重，旧negative_weight在relu下停用。
+不需要重建cache，但需要重新训练；不能给旧权重后处理裁剪后冒充新训练。
+Optuna可显式搜索candidate_weight={0.1,0.3,1}，默认六项搜索不变；relu禁止搜索negative_weight。
+选择指标仅使用最终物理预测，辅助损失不加入固定选模分数。
+新预测v2包含候选与最终地图，旧v1分析继续兼容；新旧study和恢复契约分开。
+完整公式、参数、启动命令及跨版本恢复限制见 [训练核心文档](train_sfr_unet.md#2026-11-06训练内非负输出与候选辅助监督)。

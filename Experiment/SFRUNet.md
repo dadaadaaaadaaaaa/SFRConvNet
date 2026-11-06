@@ -168,3 +168,16 @@ CLI 仅支持 `--smoke-test`、`--c-in`（默认12）、`--shape H W`（默认12
 2026-11-02 已通过 CPU 合成测试和五组真实盘星系共 15 帧的三步梯度 smoke；
 未进行正式训练或全量 sidecar 生成。2026-11-03 补充了 CPU 恢复及 CUDA/BF16 smoke，
 并用五组真实盘星系的15帧跑通 Exp1/Exp2 角色的小规模训练，详见研究计划；未验证 A100 吞吐量。
+
+
+## 2026-11-06：非负逐格输出
+
+新增 `--output-constraint relu --candidate-weight 1`：训练内计算
+`q=B+s_C*sinh(z)`、`Y_hat=ReLU(q)`、`C_hat_final=Y_hat-B`；
+主损失作用于最终Y_hat，候选辅助MSE作用于q（含零标签），使用已有训练cell_scale。
+默认仍为 `none/0`，保留旧输出行为；relu要求正辅助权重，旧negative_weight在relu下停用。
+不需要重建cache，但需要重新训练；不能给旧权重后处理裁剪后冒充新训练。
+Optuna可显式搜索candidate_weight={0.1,0.3,1}，默认六项搜索不变；relu禁止搜索negative_weight。
+选择指标仅使用最终物理预测，辅助损失不加入固定选模分数。
+新预测v2包含候选与最终地图，旧v1分析继续兼容；新旧study和恢复契约分开。
+完整公式、参数、启动命令及跨版本恢复限制见 [训练核心文档](train_sfr_unet.md#2026-11-06训练内非负输出与候选辅助监督)。
