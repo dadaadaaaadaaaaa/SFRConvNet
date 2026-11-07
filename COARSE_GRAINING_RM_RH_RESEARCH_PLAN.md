@@ -3155,3 +3155,22 @@ CPU暂停恢复逐参数相等、恢复换模式拒绝、候选篡改拒绝；HP
 未启动正式训练或批量生成cache，未验证A100性能，尚不能宣称泛化误差改善。
 建议先固定此前正式模型的其他参数，重训relu+candidate1作为对照，再在in-domain验证中比较
 辅助权重；不能根据held-out fiducial结果挑选权重。训练说明见Experiment/train_sfr_unet.md。
+
+
+## 2026-11-07：异常帧/邻帧cache输入与训练分布检查（功能1–3）
+
+新增VisualScripts/ResultAnalysis/inspect_sfr_unet_inputs.py及说明文档；Exp2 SFRUNet notebook
+末尾追加可选检查区，默认关闭。读取对应train/out标量cache，不读raw/HDF，不重新推理。
+按时间定位、UID与SHA256确认身份，输出中心及前后邻帧、实际时间差、格子坐标、Y/B/预测。
+默认选择中心帧绝对误差最大格子，也可手动固定(theta,r)；此选择仅用于事后检查，不是因果定位。
+输入空间图共享色标，时间图叠加训练同位置p01/p99。提供全局、同位置、3×3邻域分位与局部经验秩，
+以及全部输入通道同位置3×3 patch的训练近邻UID、时间、RMS距离。近邻距离不是OOD概率。
+训练分布按sample_uid去重，不让过采样重复改变参考，不使用val/out重新估计归一化。
+非有限值数量单列；全局经验秩留空，同位置/邻域给经验秩。cache行号不冒充raw snapshot编号。
+
+验证：python -m unittest tests.test_sfr_unet_input_inspection tests.test_analyze_sfr_unet -q，8项通过。
+覆盖邻帧边界/时间错误、经验分位/非有限值、最近patch、Exp2小型训练到检查绘图、篡改拒绝、旧notebook。
+真实20261107 Candidate1 seed42结果的3个目标、前后各5帧跑通，共33条；试查density/cooling_time，
+使用完整train去重参考及全部通道patch距离，人工查看共享色标图可读。
+真实产物在该结果目录input_review_be312b993c；未修改cache/模型，未重新训练。
+保留用户notebook现有配置和输出，只追加新cell；用户Train_history改动不纳入提交。

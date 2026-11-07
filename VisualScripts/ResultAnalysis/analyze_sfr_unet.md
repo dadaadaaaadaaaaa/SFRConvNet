@@ -91,3 +91,6 @@ candidate_closure_map=Delta 和最终 prediction_map=Y_hat、closure_map=Y_hat�
 分析仍使用最终输出，不再做二次裁剪；新 ReLU 模式检查逐格非负、候选组成、投影关系和训练loss契约。
 旧v1继续保留负预测用于诊断。analysis.json新增 output_constraint/loss_contract。
 notebook无需更改结构，改 RESULT_DIR 即可。新训练参数详见 Experiment/train_sfr_unet.md。
+
+
+异常时刻的cache气体输入、邻帧与训练分布检查，见 [inspect_sfr_unet_inputs.md](inspect_sfr_unet_inputs.md)。notebook末尾启用INSPECT_INPUTS即可；需要对应train/out cache。
