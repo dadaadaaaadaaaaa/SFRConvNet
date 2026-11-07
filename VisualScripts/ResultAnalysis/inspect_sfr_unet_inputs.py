@@ -51,6 +51,21 @@ def nearest_patches(train, query, theta, radial, radius=1, count=5):
     return [(int(i),float(distances[i])) for i in np.argsort(distances)[:count] if np.isfinite(distances[i])]
 
 
+def save_input_windows(destination, frames, x, coords, channels):
+    """默认保存完整邻帧输入；重叠事件保留各自条目，NPZ读取不需要pickle。"""
+    frame=pd.DataFrame(frames)
+    rows=frame['cache_row'].to_numpy(dtype=int)
+    destination=Path(destination)
+    path=destination/'input_windows.npz'
+    if path.exists():raise FileExistsError(path)
+    np.savez_compressed(path, x_standardized=x[rows], coordinates=coords[rows],
+                        channels=np.asarray(channels,dtype=str), event=frame.event.to_numpy(),
+                        time_gyr=frame.time.to_numpy(), offset=frame.offset.to_numpy(), cache_row=rows,
+                        sample_uid=frame.sample_uid.to_numpy(dtype=str),
+                        parent_hr_uid=frame.parent_hr_uid.to_numpy(dtype=str))
+    return path
+
+
 def inspect_inputs(result_dir, cache_dir, *, times=(8.99375,9.405,12.44125), neighbors=5,
                    time_tolerance=1e-6, cells=None, channels=None, plots=True, output_dir=None):
     """cells可指定每个目标的(theta,r)；默认采用该模型中心帧绝对误差最大格子。"""
@@ -138,12 +153,18 @@ def inspect_inputs(result_dir, cache_dir, *, times=(8.99375,9.405,12.44125), nei
             fig.savefig(folder/'input_history.png',dpi=110);plt.close(fig)
     for name,rows in [('frames',frames),('input_points',points),('input_fields',fieldstats),('nearest_train',nearest)]:
         pd.DataFrame(rows).to_csv(destination/f'{name}.csv',index=False)
-    audit=dict(result_dir=str(root),cache_hashes=hashes,channels=names,targets=list(times),neighbors=neighbors,
+    save_input_windows(destination,frames,x,coords,names)
+    audit=dict(result_dir=str(root),cache_hashes=hashes,channels=names,selected_channels=selected,targets=list(times),neighbors=neighbors,
                time_tolerance=time_tolerance,cells=cells,training_rows=len(train_ids),unique_training_rows=len(unique),
                normalization='原cache标准化值，不重新变换',reference='训练UID去重；不使用val/out估计范围',
                notes=['距离为全部输入通道同位置3x3 patch的RMS，边界截短；不是异常概率',
                       '空间图红叉为选定格子；默认由中心帧预测绝对误差选择，非因果归因',
                       '全局分位已计算，global percentile留空；局部经验秩包含并列值',
                       '坐标从cache读取，格子索引不是原始snapshot编号；未访问raw或重新推理'])
+    audit['saved_arrays']={'file':'input_windows.npz','sha256':file_hash(destination/'input_windows.npz'),
+                           'x_axis_order':['entry','channel','theta','r'],
+                           'x_semantics':'原cache标准化值；诊断存档，不是新训练数据'}
     (destination/'inspection.json').write_text(json.dumps(audit,ensure_ascii=False,indent=2),encoding='utf-8')
+    inventory={str(p.relative_to(destination)):file_hash(p) for p in destination.rglob('*') if p.is_file()}
+    (destination/'artifacts.json').write_text(json.dumps(inventory,ensure_ascii=False,indent=2),encoding='utf-8')
     return dict(output_dir=str(destination),frames=pd.DataFrame(frames),points=pd.DataFrame(points),nearest=pd.DataFrame(nearest))

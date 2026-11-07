@@ -59,3 +59,13 @@ PT只用于可信自有文件。cache中x已是模型使用的标准化输入，
 
 覆盖非排序时间的邻帧选择、时间不匹配/重复拒绝、分位与非有限参考、局部距离、
 Exp2小型训练导出→cache输入检查及绘图、cache摘要篡改拒绝、旧分析与notebook兼容。
+
+
+## 2026-11-07：完整输入默认存档
+
+每次检查除CSV/PNG外，默认写入`input_windows.npz`和`artifacts.json`，无需额外开关。
+NPZ包含所有输入通道的标准化数组、坐标、事件、时间、相对帧号、cache行与UID；
+即使只绘制部分通道，存档仍保留全部通道。重叠时间窗口按事件分别保留条目。
+使用`np.load(path, allow_pickle=False)`读取，x轴顺序为(entry,channel,theta,r)。
+这不是原始物理场，也不是新训练cache。`inspection.json`保存其SHA256和选择的绘图通道，
+`artifacts.json`列出本次已生成的文件摘要。输出目录不复用，不覆盖旧检查。

@@ -27,6 +27,11 @@ class InputInspectionTests(unittest.TestCase):
                              channels=['density'],plots=True)
             self.assertEqual(len(r['frames']),2)
             self.assertTrue(list(Path(r['output_dir']).glob('event0/*maps.png')))
+            with np.load(Path(r['output_dir'])/'input_windows.npz',allow_pickle=False) as saved:
+                self.assertEqual(saved['x_standardized'].shape[0],2)
+                self.assertEqual(saved['sample_uid'].tolist(),r['frames'].sample_uid.tolist())
+                self.assertEqual(saved['x_standardized'].shape[1],len(saved['channels']))
+            self.assertTrue((Path(r['output_dir'])/'artifacts.json').is_file())
             # 修改cache字节应在读取前拒绝，不能静默用其他实验输入。
             path=Path(directory)/f'{config.data_exp}out.pt'
             with path.open('ab') as f:f.write(b'bad')

@@ -3174,3 +3174,25 @@ CPU暂停恢复逐参数相等、恢复换模式拒绝、候选篡改拒绝；HP
 使用完整train去重参考及全部通道patch距离，人工查看共享色标图可读。
 真实产物在该结果目录input_review_be312b993c；未修改cache/模型，未重新训练。
 保留用户notebook现有配置和输出，只追加新cell；用户Train_history改动不纳入提交。
+
+
+## 2026-11-07：保存用户输入检查结果并完成三处状态分析
+
+用户运行结果位于Candidate1 seed44/20261107的input_review_19fec0b5da，固定格子为
+(6,0)、(9,2)、(9,1)。原检查已默认保存CSV和PNG；本次补存完整input_windows.npz、分析CSV、
+训练距离参考与RESULT_ANALYSIS.md，保留原inspection.json；saved_results_manifest.json记录产物摘要。
+默认检查入口新增完整NPZ和artifacts.json保存，33条×12通道×12×20（本次实际存档shape），
+包括坐标、UID、事件及时间；无需pickle。后续运行自动保存，不依赖notebook输出。
+
+实际数据：396条整图通道统计无NaN/Inf。8.99375的选定格子标准化v2≈−266.20，
+超出训练全局[−65.92,78.37]；12.44125的v1≈85.08，超出训练全局最大25.27，
+v2≈68.43超过同位置最大12.22，但尚在全局范围内。两者的局部patch距离主要由速度贡献。
+9.405中心的density/energy/cooling偏高，局部patch速度和密度均有贡献。
+对train去重10621样本，固定seed42抽128个anchor计算排除自身最近邻距离，
+三个out中心最近训练距离46.59、3.80、11.73，参考p95约0.30、0.36、0.29。
+这些是输入覆盖不足/尺度差异证据，不是数据错误或输入因果归因的证明；当前seed44第三处并未严重失败。
+后续优先追溯极低密度区速度及处理链，再做输入有符号压缩与输出线性候选的独立对照。
+
+验证：python -m unittest tests.test_sfr_unet_input_inspection tests.test_analyze_sfr_unet -q，8项通过。
+NPZ检查shape/UID/无pickle读取，真实33条存档全部有限。用户新增选帧cell补充中文首行注释以符合项目测试，
+不修改执行语句或输出；该用户cell及其他notebook输出不纳入源码提交。未训练，未修改物理或cache契约。
