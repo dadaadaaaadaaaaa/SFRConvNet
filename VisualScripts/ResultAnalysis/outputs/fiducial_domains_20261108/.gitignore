@@ -1,0 +1,2 @@
+# 逐帧明细可由分析脚本复算，本地保留，不提交。
+predictions_and_domains.csv

@@ -3196,3 +3196,38 @@ v2≈68.43超过同位置最大12.22，但尚在全局范围内。两者的局�
 验证：python -m unittest tests.test_sfr_unet_input_inspection tests.test_analyze_sfr_unet -q，8项通过。
 NPZ检查shape/UID/无pickle读取，真实33条存档全部有限。用户新增选帧cell补充中文首行注释以符合项目测试，
 不修改执行语句或输出；该用户cell及其他notebook输出不纳入源码提交。未训练，未修改物理或cache契约。
+
+## 2026-11-08：Fiducial Exp2 的标签范围与输入覆盖分层
+
+新增 `VisualScripts/ResultAnalysis/compare_fiducial_domains.py` 与同名说明，
+实际报告在 `VisualScripts/ResultAnalysis/outputs/fiducial_domains_20261108/report.md`。
+这是既有正式预测分析，不是新训练或纯网络结构消融；原始预测、用户notebook和Train_history保持原样。
+
+对同一v7、12×20留出折，核验CNN Trial43/Trial7、原始UNet seed42、首次ReLU Candidate1 seed42，
+以及后续同权重seed42/43/44的8429帧，按UID/parent配对并保留全部尖峰和负值。
+以实际hyperparameters而非Train_history相邻命令识别CNN：登记的Trial43旁命令实际对应Trial7。
+UNet来源cache SHA256、归一化、metadata、split隔离、逐格求和、Y=B+C与预测恒等式均核验。
+
+去重train共10621帧，SFR范围0.246136–84.088710 Msun/yr；Fiducial峰值34.078099，
+没有高端标签范围外帧。低端范围外1768帧；CNN43/原始UNet/baseline的MAE为
+3.09929/0.10139/0.03865。p01–p99敏感性也没有高端范围外。
+因此不能仅凭Fiducial发生高SFR爆发便认定超出了四个训练运行的SFR范围。
+
+独立重算实际train-only输入覆盖：每运行最多192时间锚点，校准时排除同运行±0.25 Gyr近邻，
+逐通道标准化全场RMS近邻距离的校准p95为阈值。6562帧覆盖，1867帧未覆盖；
+CNN43/原始UNet在覆盖内MAE为0.61523/0.12055，未覆盖为4.21287/0.49473。
+更换p90/p99或内盘空间窗口，UNet的MAE优势方向保持一致。
+但ReLU种子有明显尾部不稳定：后续seed42未覆盖RMSE=7.09475，高于CNN43的4.81375。
+其12.44125 Gyr的304.88341 Msun/yr假尖峰贡献全轨迹98.77%平方误差。
+
+标签范围内而输入未覆盖的1197帧中，CNN43/原始UNet MAE为4.13651/0.68110；
+另有1098帧标签范围外而全场输入距离在阈值内。标签范围与物理输入覆盖必须分别解释。
+全场距离仍只是有限参考库的覆盖代理，不能证明真实物理支持集，也不能将关联诊断写成因果归因。
+
+原始UNet在两种分层内外的MAE均优于CNN，0.25/0.5 Gyr配对时间块bootstrap方向一致。
+低端min–max范围外所有上述UNet仍劣于baseline；收益不能全部归因于UNet架构，
+因为逐格监督、损失空间、容量与优化设置同时改变，且只有一个CNN种子和一个留出运行。
+
+验证：本机 `C:/Users/augus/miniconda3/python.exe -m unittest tests.test_fiducial_domains tests.test_analyze_sfr_unet -q`，
+9项通过；全量CLI分析完成，人工检查两张PNG，数据大缺口断线。
+未开展新训练、其他留出星系或严格时间块重新训练，不外推到真实GIZMO。
