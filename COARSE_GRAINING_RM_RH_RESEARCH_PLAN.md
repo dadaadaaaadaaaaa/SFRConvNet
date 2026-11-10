@@ -3231,3 +3231,39 @@ CNN43/原始UNet在覆盖内MAE为0.61523/0.12055，未覆盖为4.21287/0.49473�
 验证：本机 `C:/Users/augus/miniconda3/python.exe -m unittest tests.test_fiducial_domains tests.test_analyze_sfr_unet -q`，
 9项通过；全量CLI分析完成，人工检查两张PNG，数据大缺口断线。
 未开展新训练、其他留出星系或严格时间块重新训练，不外推到真实GIZMO。
+
+## 2026-11-10：扩展 Model0.75 与 Fiducial7 的 Exp2 分层分析
+
+用户完成的两组ReLU Candidate1 Final均为正式complete、hpo=false、seed42，读取已导出的预测，未训练或推理。
+扩展 `compare_fiducial_domains.py --case model075/fiducial7`，默认Fiducial入口保持。
+合并报告为 `VisualScripts/ResultAnalysis/outputs/exp2_domains_20261110_report.md`，
+独立产物为同目录 `model075_domains_20261110_final`、`fiducial7_domains_20261110_final`。
+
+Fiducial7使用相同v7 metadata的CNN Trial68，out共7025帧。
+Model0.75使用已登记CNN Trial53作历史对照：新旧out的954个UID/parent、Y/B、时间、坐标相同，
+撤销标准化后的输入最大差3.64e-12；但旧/新train去重15187/15106，UID交集9192。
+程序只对这个显式case允许历史比较并记录差异，不能称为同训练数据或纯架构消融。
+
+按新UNet实际train独立定义阈值：Model0.75训练标签范围0–84.3584，out最大54.0787，
+min–max及p01–p99均无标签域外；输入全场p95下覆盖内842/外112帧，
+历史CNN→UNet MAE分别为3.2471→0.9302、6.0356→2.9085。
+但全场p99最远24帧的优势缩小为4.5019→4.2905，不能泛称所有域外状态改善一半。
+
+Fiducial7训练标签上限54.0787，out峰值84.3584；高端范围外532帧，位于绝对时间4.1325–5.0950 Gyr的多个观测段。
+标签范围内CNN→UNet MAE为6.9531→5.2176，高端范围外35.8266→23.3520，仍持续低估。
+输入全场p95下覆盖内6901/外124帧，MAE为9.0896→6.5736、11.9279→7.5513。
+532个高标签域外中525帧被全场判为覆盖内，内盘表示也有520帧被覆盖；
+真实峰时UNet仅49.4132，低估41.4%，而输入距离/阈值只有0.6191。
+这说明平均输入近邻覆盖不足以保证闭合映射准确，不能由覆盖率证明物理域内或映射非唯一。
+
+Model0.75观测积分误差UNet=-1.8786%、历史CNN=-17.1787%；
+Fiducial7积分剔除2处大缺口，仅覆盖8.785 Gyr，UNet=-34.1827%、CNN=-47.6507%。
+Fiducial7单帧最大平方误差占比仅0.231%，主要为持续幅值不足，与Fiducial某些种子的假尖峰模式不同。
+所有统计保留全部输出，不裁剪或排除离群预测。
+
+验证：`C:/Users/augus/miniconda3/python.exe -m unittest tests.test_fiducial_domains tests.test_analyze_sfr_unet -q`，10项通过。
+两个新case的全量CLI完成，与用户已有UNet分析的MAE/RMSE/积分一致；
+原Fiducial全量回归的304行metrics逐数值完全不变；四张PNG人工核验。
+新测试覆盖历史对照的输入/标签不匹配拒绝、UID隔离、空域外统计；不足5个时间块的CI留空。
+Fiducial7高标签组只有4个0.25Gyr块或2个0.5Gyr块，未伪造置信区间。
+新两折各只有一个UNet种子，未验证其他种子、严格时间块重新训练或真实GIZMO。

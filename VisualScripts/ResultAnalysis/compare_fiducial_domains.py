@@ -1,4 +1,4 @@
-"""比较已完成的 Fiducial Exp2：训练 SFR 范围与 LR 输入近邻覆盖分别分层。"""
+"""比较已完成的 Exp2：训练 SFR 范围与 LR 输入近邻覆盖分别分层。"""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from VisualScripts.ResultAnalysis.analyze_sfr_unet import file_hash, load_predictions, regression
+from VisualScripts.ResultAnalysis.analyze_sfr_unet import file_hash, load_predictions, regression, integrate_series
 from VisualScripts.DataAnalysis.check_disk_lr_generalization import anchors, global_distance, feature_sets
 
 PREFIX = "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_"
@@ -30,6 +30,17 @@ UNET = {
     "UNet_ReLU42": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19",
     "UNet_ReLU43": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
     "UNet_ReLU44": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372",
+}
+CASES = {
+    "fiducial": dict(prefix=PREFIX, held=HELD, cnn=CNN, unet=UNET, title="Fiducial"),
+    "fiducial7": dict(prefix="Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_",
+        held="disk_galaxy_fiducial_7", title="Fiducial7",
+        cnn={"CNN68": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202"},
+        unet={"UNet": "Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351"}),
+    "model075": dict(prefix="Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_",
+        held="disk_galaxy_model_0_75", title="Model0.75", historical_cnn=True,
+        cnn={"CNN53_historical": "Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906"},
+        unet={"UNet": "Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d"}),
 }
 
 
@@ -67,8 +78,8 @@ def block_delta_ci(time, truth, candidate, reference, mask, block_width, repeats
     return *np.quantile(values, [.025, .975]), int(np.count_nonzero(count))
 
 
-def load_cache(split):
-    path = ROOT/".cache"/f"{PREFIX}{split}.pt"
+def load_cache(split, prefix=PREFIX):
+    path = ROOT/".cache"/f"{prefix}{split}.pt"
     payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
     t = payload["tensors"]
     frame = pd.DataFrame({"uid": payload["sample_identity"]["sample_uid"],
@@ -87,10 +98,48 @@ def load_cache(split):
     return frame[keep].reset_index(drop=True), np.asarray(t["x"])[keep].copy(), np.asarray(t["coord"])[0].copy()
 
 
-def run(output, repeats=2000):
+def audit_historical_cnn(hyper, metadata, out, train, record, current_x, coord):
+    """历史对照只允许同一 out；训练差异显式存档，不能静默当成公平消融。"""
+    if set(train.uid) & set(out.uid) or set(train.parent) & set(out.parent):
+        raise ValueError("当前 train 与 out 身份交叉。")
+    if (hyper["data_split_metadata"]["train_groups"] != metadata["train_groups"]
+            or hyper["input_channels"] != metadata["input_channels"]):
+        raise ValueError("历史 CNN 的训练运行/输入通道不一致。")
+    old_prefix = hyper["data_exp"]
+    old_out, old_x, old_coord = load_cache("out", old_prefix)
+    validate_alignment(old_out, out)
+    old_order = pd.Index(old_out.uid).get_indexer(out.uid)
+    old_norm_path = ROOT/".cache"/f"{old_prefix}norm.npz"
+    old_norm = np.load(old_norm_path)
+    new_norm = np.load(ROOT/".cache"/f"{metadata['cache_prefix']}norm.npz")
+    old_transformed = old_x[old_order]*old_norm["std"]+old_norm["mean"]
+    new_transformed = current_x*new_norm["std"]+new_norm["mean"]
+    if (not np.allclose(old_coord, coord, rtol=1e-12, atol=1e-12)
+            or not np.allclose(old_transformed, new_transformed, rtol=1e-10, atol=1e-10)):
+        raise ValueError("历史 CNN 的测试坐标或撤销标准化后的输入不同。")
+    record(old_norm_path)
+    path = ROOT/".cache"/f"{old_prefix}train.pt"
+    payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    old_uids = set(payload["sample_identity"]["sample_uid"])
+    old_parents = set(payload["sample_identity"]["parent_hr_uid"])
+    if old_uids & set(out.uid) or old_parents & set(out.parent):
+        raise ValueError("历史 CNN train 与当前 out 身份交叉。")
+    record(path)
+    record(ROOT/".cache"/f"{old_prefix}out.pt")
+    return {"scope": "同一out的历史对照，训练样本与预处理统计不同，不能作纯架构消融",
+            "cache_prefix": old_prefix, "train_unique_N": len(old_uids),
+            "train_overlap_N": len(old_uids & set(train.uid)),
+            "historical_only_train_N": len(old_uids-set(train.uid)),
+            "current_only_train_N": len(set(train.uid)-old_uids),
+            "out_transformed_input_max_diff": float(np.max(abs(old_transformed-new_transformed)))}
+
+
+def run(output, repeats=2000, *, case="fiducial"):
     if output.exists():
         raise FileExistsError("输出目录已存在，拒绝覆盖。")
     torch.set_num_threads(4)
+    spec = CASES[case]
+    prefix, held, cnn, unet = (spec[k] for k in ["prefix", "held", "cnn", "unet"])
     hashes = {}
     def record(path):
         hashes[str(path.relative_to(ROOT))] = file_hash(path)
@@ -98,31 +147,36 @@ def run(output, repeats=2000):
     for path in [Path(__file__), ROOT/"VisualScripts/DataAnalysis/check_disk_lr_generalization.py",
                  ROOT/"VisualScripts/ResultAnalysis/analyze_sfr_unet.py"]:
         record(path)
-    train, tx, coord = load_cache("train")
-    out, ox, _ = load_cache("out")
+    train, tx, coord = load_cache("train", prefix)
+    out, ox, _ = load_cache("out", prefix)
     order = np.argsort(out.time.to_numpy())
     out, ox = out.iloc[order].reset_index(drop=True), ox[order]
-    if set(out.group) != {HELD} or HELD in set(train.group) or out.time.duplicated().any():
-        raise ValueError("不是唯一留出 Fiducial 的有效轨迹。")
-    cache_hash = {s: record(ROOT/".cache"/f"{PREFIX}{s}.pt") for s in ["train", "out"]}
-    meta_path = ROOT/".cache"/f"{PREFIX}metadata.json"
-    norm_path = ROOT/".cache"/f"{PREFIX}norm.npz"
+    if set(out.group) != {held} or held in set(train.group) or out.time.duplicated().any():
+        raise ValueError("不是指定唯一留出运行的有效轨迹。")
+    cache_hash = {s: record(ROOT/".cache"/f"{prefix}{s}.pt") for s in ["train", "out"]}
+    meta_path = ROOT/".cache"/f"{prefix}metadata.json"
+    norm_path = ROOT/".cache"/f"{prefix}norm.npz"
     meta_hash, norm_hash = record(meta_path), record(norm_path)
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     predictions = {"Baseline": out.B.to_numpy()}
     contracts = {}
-    for label, folder in CNN.items():
+    for label, folder in cnn.items():
         root = ROOT/"Results"/folder
         hpath = root/"hyperparameters.json"
         hyper = json.loads(hpath.read_text(encoding="utf-8"))
-        if (hyper["data_exp"] != PREFIX or hyper["objective_mode"] != "signed_closure"
-                or hyper["data_split_metadata"] != metadata):
+        if hyper["objective_mode"] != "signed_closure":
+            raise ValueError("CNN 目标契约不一致。")
+        historical = hyper["data_exp"] != prefix or hyper["data_split_metadata"] != metadata
+        audit = None
+        if historical and spec.get("historical_cnn"):
+            audit = audit_historical_cnn(hyper, metadata, out, train, record, ox, coord)
+        elif historical:
             raise ValueError("CNN 数据来源/目标契约不一致。")
         record(hpath)
         path = root/"held_out_test_predictions.csv"
         f = pd.read_csv(path)
-        if set(f["type"]) != {HELD}:
-            raise ValueError("CNN 预测不属于 Fiducial。")
+        if set(f["type"]) != {held}:
+            raise ValueError("CNN 预测不属于指定留出运行。")
         f = f.rename(columns={"sample_uid": "uid", "parent_hr_uid": "parent", "sfr_true": "Y",
                               "sfr_macer_baseline": "B", "sfr_pred": "prediction"})
         for col in ["Y", "B", "prediction"]:
@@ -134,14 +188,15 @@ def run(output, repeats=2000):
         predictions[label] = f.prediction.to_numpy()
         record(path)
         contracts[label] = {k: hyper.get(k) for k in ["seed", "loss", "base_ch", "batch_size", "lr", "pos_num_bands", "pos_max_freq"]}
-    for label, folder in UNET.items():
+        contracts[label]["comparison"] = audit or {"scope": "同一metadata和out的配对对照"}
+    for label, folder in unet.items():
         root = ROOT/"Results"/folder
         summary = json.loads((root/"summary.json").read_text(encoding="utf-8"))
         contract = json.loads((root/"contract.json").read_text(encoding="utf-8"))
         manifest = json.loads((root/"split_manifest.json").read_text(encoding="utf-8"))
         config = json.loads((root/"config.json").read_text(encoding="utf-8"))
         if (summary["status"] != "complete" or summary["hpo"] is not False
-                or contract["cache_metadata"] != metadata or config["data_exp"] != PREFIX):
+                or contract["cache_metadata"] != metadata or config["data_exp"] != prefix):
             raise ValueError("UNet 非正式完成训练或数据来源不匹配。")
         data = contract["data"]
         if (data["train_val"]["train"]["scalar_sha256"] != cache_hash["train"]
@@ -157,7 +212,7 @@ def run(output, repeats=2000):
             if set(manifest["train"][key]) != set(actual):
                 raise ValueError("实际训练身份与 manifest 不同。")
         path = root/"out_predictions.pt"
-        d = load_predictions(path, identity=manifest["out"], expected_groups={HELD}, expected_loss=contract["loss"])
+        d = load_predictions(path, identity=manifest["out"], expected_groups={held}, expected_loss=contract["loss"])
         f = pd.DataFrame({"uid": d["sample_uid"], "parent": d["parent_hr_uid"], "time": d["time"],
             "Y": d["target_total"]*.025, "B": d["baseline_total"]*.025, "prediction": d["prediction_total"]*.025})
         predictions[label] = validate_alignment(f, out).prediction.to_numpy()
@@ -208,9 +263,12 @@ def run(output, repeats=2000):
         for xi in [True, False]:
             masks[f"joint_Y{'in' if yi else 'out'}_X{'in' if xi else 'out'}"] = (
                 (out.Y_support.eq("inside").to_numpy() == yi) & (out.X_all_input_inside.to_numpy() == xi))
-    # 时间窗仅用于描述，不把它们称为已验证的吸积事件。
-    for label, mask in [("t_lt9", out.time < 9), ("t_9to10", (out.time >= 9) & (out.time < 10)), ("t_ge10", out.time >= 10)]:
-        masks[label] = np.asarray(mask)
+    # 时间窗仅用于描述，不把 Fiducial 的窗口移植为其他运行的物理事件边界。
+    if case == "fiducial":
+        for label, mask in [("t_lt9", out.time < 9), ("t_9to10", (out.time >= 9) & (out.time < 10)), ("t_ge10", out.time >= 10)]:
+            masks[label] = np.asarray(mask)
+    elif case == "model075":
+        masks["t_lt6"], masks["t_ge6"] = np.asarray(out.time < 6), np.asarray(out.time >= 6)
     rows, ci = [], []
     y, t = out.Y.to_numpy(), out.time.to_numpy()
     for regime, mask in masks.items():
@@ -218,11 +276,13 @@ def run(output, repeats=2000):
             rows.append({"regime": regime, "model": model, "N": int(mask.sum()),
                 **(regression(y[mask], pred[mask]) if mask.any() else {})})
         if regime in ["Y_support_inside", "Y_support_outside", "X_all_input_p95_inside", "X_all_input_p95_outside"]:
-            for model in UNET:
+            reference_model = next(iter(cnn))
+            for model in unet:
                 for width in [.25, .5]:
-                    low, high, nblock = block_delta_ci(t, y, predictions[model], predictions["CNN43"], mask, width, repeats)
+                    low, high, nblock = block_delta_ci(t, y, predictions[model], predictions[reference_model], mask, width, repeats)
                     ci.append({"regime": regime, "model": model, "block_gyr": width,
-                        "delta_MAE": float(np.mean(np.abs(predictions[model][mask]-y[mask])-np.abs(predictions["CNN43"][mask]-y[mask]))),
+                        "reference": reference_model,
+                        "delta_MAE": float(np.mean(np.abs(predictions[model][mask]-y[mask])-np.abs(predictions[reference_model][mask]-y[mask]))) if mask.any() else np.nan,
                         "CI025": low, "CI975": high, "nonempty_blocks": nblock})
     output.mkdir(parents=True)
     for model, pred in predictions.items():
@@ -231,6 +291,14 @@ def run(output, repeats=2000):
     metrics = pd.DataFrame(rows)
     metrics.to_csv(output/"metrics.csv", index=False)
     pd.DataFrame(ci).to_csv(output/"paired_block_bootstrap.csv", index=False)
+    true_mass, valid = integrate_series(t, y, 5)
+    integrals = []
+    for model, pred in predictions.items():
+        mass, _ = integrate_series(t, pred, 5)
+        integrals.append({"model": model, "true_mass_msun": true_mass[-1], "predicted_mass_msun": mass[-1],
+            "relative_error_percent": 100*(mass[-1]/true_mass[-1]-1) if true_mass[-1] else np.nan,
+            "excluded_gaps": int(np.sum(~valid)), "covered_duration_gyr": float(np.diff(t)[valid].sum())})
+    pd.DataFrame(integrals).to_csv(output/"integrated_metrics.csv", index=False)
     train.groupby("group").Y.agg(["count", "min", "median", "max"]).to_csv(output/"train_sfr_by_run.csv")
     # 连续段只连接相同类别的相邻有效帧；明显数据缺口会切段。
     segments = []
@@ -243,7 +311,8 @@ def run(output, repeats=2000):
             segments.append({"definition": column, "category": str(values[start]), "start_gyr": t[start],
                              "end_gyr": t[stop-1], "N": stop-start})
     pd.DataFrame(segments).to_csv(output/"time_segments.csv", index=False)
-    method = {"sources": {**CNN, **UNET}, "sha256": hashes, "contracts": contracts,
+    method = {"case": case, "cache_prefix": prefix, "held_out": held,
+        "sources": {**cnn, **unet}, "sha256": hashes, "contracts": contracts,
         "train_unique_N": len(train), "out_N": len(out), "label_thresholds": label_thresholds,
         "input_thresholds": input_method, "reference_N": len(ref), "calibration_N": len(cal),
         "input_method": "每训练运行最多192时间锚点；每运行最多64校准点；排除同运行±0.25Gyr近邻；参考通道标准化RMS；train-only阈值",
@@ -251,16 +320,18 @@ def run(output, repeats=2000):
         "units": "Msun/yr", "time": "snapshot绝对时间/Gyr；未减0.5625Gyr", "sfr_factor": .025,
         "interpretation": "Y分层依赖事后标签，不能当成部署OOD检测器；X覆盖依赖度量及空间窗口，不是物理支持集证明。全部原始预测保留，无裁剪或排除。"}
     (output/"method.json").write_text(json.dumps(method, ensure_ascii=False, indent=2), encoding="utf-8")
-    plot(out, metrics, output, label_thresholds)
-    print(metrics[metrics.regime.isin(["all", "Y_support_inside", "Y_support_low", "X_all_input_p95_inside", "X_all_input_p95_outside"])].to_string(index=False), flush=True)
+    plot(out, metrics, output, label_thresholds, title=spec["title"])
+    print(metrics[metrics.regime.isin(["all", "Y_support_inside", "Y_support_low", "Y_support_high", "X_all_input_p95_inside", "X_all_input_p95_outside"])].to_string(index=False), flush=True)
     return method
 
 
-def plot(frame, metrics, output, thresholds):
+def plot(frame, metrics, output, thresholds, *, title="Fiducial"):
     """保留离群值；symlog 同时显示低 SFR、负预测和大尖峰。"""
     plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False})
     colors = {"CNN43": "#cf594b", "UNet_original42": "#2377a4", "UNet_ReLU42": "#269080",
               "UNet_ReLU43": "#b28a27", "UNet_ReLU44": "#8056a0"}
+    if "UNet" in frame:
+        colors = {k: ("#269080" if k == "UNet" else "#cf594b") for k in frame.columns if k == "UNet" or k.startswith("CNN")}
     t = frame.time.to_numpy()
     fig, axes = plt.subplots(4, 1, figsize=(13, 10), sharex=True, layout="constrained",
                              gridspec_kw={"height_ratios": [3, 2, .65, 2]})
@@ -278,6 +349,8 @@ def plot(frame, metrics, output, thresholds):
     axes[0].set_yscale("symlog", linthresh=.1)
     axes[0].set_ylabel("SFR [Msun/yr]")
     axes[0].axhline(thresholds["support"]["low"], color="#666666", linestyle=":", linewidth=.8)
+    if thresholds["support"]["high"] < frame.Y.max():
+        axes[0].axhline(thresholds["support"]["high"], color="#666666", linestyle=":", linewidth=.8)
     axes[0].legend(ncol=4, fontsize=8)
     for model, color in colors.items():
         line(axes[1], np.abs(frame[model]-frame.Y), color=color, linewidth=.7, label=model)
@@ -294,16 +367,19 @@ def plot(frame, metrics, output, thresholds):
     axes[3].set_ylabel("Input distance / train p95")
     axes[3].set_xlabel("Snapshot absolute time [Gyr]")
     axes[3].legend(fontsize=8)
-    fig.suptitle("Exp2 held-out Fiducial: SFR interval and input-state coverage")
+    fig.suptitle(f"Exp2 held-out {title}: SFR interval and input-state coverage")
     fig.savefig(output/"domain_history.png", dpi=165)
     plt.close(fig)
-    regimes = ["Y_support_inside", "Y_support_low", "X_all_input_p95_inside", "X_all_input_p95_outside"]
+    regimes = ["Y_support_inside", "Y_support_outside", "X_all_input_p95_inside", "X_all_input_p95_outside"]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.7), layout="constrained")
     for ax, metric in zip(axes, ["MAE", "RMSE"]):
         for i, model in enumerate(["Baseline", *colors]):
             values = metrics[metrics.model.eq(model)].set_index("regime").loc[regimes, metric]
-            ax.bar(np.arange(4)+(i-2.5)*.12, values, width=.115, label=model, color=colors.get(model, "#999999"))
-        ax.set_xticks(range(4), ["SFR inside", "SFR low outside", "Input inside", "Input outside"], rotation=15)
+            nmodel = len(colors)+1
+            width = .75/nmodel
+            ax.bar(np.arange(4)+(i-(nmodel-1)/2)*width, values, width=width*.95, label=model, color=colors.get(model, "#999999"))
+        counts = metrics[metrics.model.eq("Baseline")].set_index("regime").loc[regimes, "N"]
+        ax.set_xticks(range(4), [f"{label}\nN={n}" for label, n in zip(["SFR inside", "SFR outside", "Input inside", "Input outside"], counts)], rotation=10)
         ax.set_ylabel(f"{metric} [Msun/yr]")
         ax.set_yscale("log")
     axes[1].legend(fontsize=8)
@@ -315,5 +391,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--bootstrap-repeats", type=int, default=2000)
+    parser.add_argument("--case", choices=CASES, default="fiducial")
     args = parser.parse_args()
-    run(args.output_dir, args.bootstrap_repeats)
+    run(args.output_dir, args.bootstrap_repeats, case=args.case)

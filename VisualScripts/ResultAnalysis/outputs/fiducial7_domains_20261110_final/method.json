@@ -1,0 +1,108 @@
+{
+  "case": "fiducial7",
+  "cache_prefix": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_",
+  "held_out": "disk_galaxy_fiducial_7",
+  "sources": {
+    "CNN68": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202",
+    "UNet": "Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351"
+  },
+  "sha256": {
+    "VisualScripts\\ResultAnalysis\\compare_fiducial_domains.py": "c3235f2c582ae679df157891227e9520f87a67191c001b07e8a263d9a16dc0ee",
+    "VisualScripts\\DataAnalysis\\check_disk_lr_generalization.py": "7fba160d14d76ce2bb54a7c71becab033c21fbb4ae19e43edfcf7f359efd2137",
+    "VisualScripts\\ResultAnalysis\\analyze_sfr_unet.py": "118bca753d961db73d50c2f5d8c135f2162e403c5a5beeb039c39f346b4de2e3",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_train.pt": "f02031e43a7396f2ee7e83150a74052d7bcdc6c323632a427803c02755ef8729",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_out.pt": "7f628abe45191f041e3db433ba57dd356cc9f17675d1072fb8eaa348248d1fda",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_metadata.json": "2153eb013084d8b8138f0445a287bda04eec2fce4d6cd82b4b5df76a9712af3f",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_norm.npz": "e40c6cf3b6b3899b8d7391ec4d468ac7338cc317304e108f9a2eca9eea993285",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202\\hyperparameters.json": "ec5b47c356f55634fc6ce4fcec983fc1125edff86087b6ec6e0d2f4eb8af3185",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202\\held_out_test_predictions.csv": "526c7d8adfa9a2d5fedacadb00ae240dce3ff7b210396715cebad6c5f94dbe8b",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\summary.json": "66f7f691a48fd64aa2c630baee86316a554960f3cc36d4f72af65ea78e648b21",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\contract.json": "2736b5ec51883ba9aa65301c8ef82409dd30a61b6faa4b3c9e04b85ee83bbcdd",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\split_manifest.json": "ebc285cde9d4d632b50dd60d144e91dc249c44360a452848a6ac7586843c9983",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\config.json": "64b59fe12e68d3c84979bd1f768f58ff8c5a78f9890f023781868875024d8fc5",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\out_predictions.pt": "1c990da05f783fe9b4e18d19f08665606153a4492297a8cbef950101f8c8bdb4"
+  },
+  "contracts": {
+    "CNN68": {
+      "seed": 42,
+      "loss": "l1",
+      "base_ch": 128,
+      "batch_size": 128,
+      "lr": 0.0037054504425998473,
+      "pos_num_bands": 16,
+      "pos_max_freq": 16.0,
+      "comparison": {
+        "scope": "同一metadata和out的配对对照"
+      }
+    },
+    "UNet": {
+      "seed": 42,
+      "epochs": 100,
+      "output_constraint": "relu",
+      "candidate_weight": 1.0,
+      "best_epoch": 94,
+      "best_score": 0.013649169196296787
+    }
+  },
+  "train_unique_N": 11463,
+  "out_N": 7025,
+  "label_thresholds": {
+    "support": {
+      "low": 0.0,
+      "high": 54.07873882874847,
+      "quantiles": [
+        0,
+        1
+      ]
+    },
+    "p01_p99": {
+      "low": 0.0028296700982082265,
+      "high": 29.886699982573912,
+      "quantiles": [
+        0.01,
+        0.99
+      ]
+    },
+    "p05_p95": {
+      "low": 0.04694579650562673,
+      "high": 19.898426322921573,
+      "quantiles": [
+        0.05,
+        0.95
+      ]
+    }
+  },
+  "input_thresholds": {
+    "all_input": {
+      "0.9": 0.708778454769642,
+      "0.95": 0.9218841336237241,
+      "0.99": 1.4554771470721348
+    },
+    "all_input_disk10": {
+      "0.9": 0.6796940883473029,
+      "0.95": 0.8142586155368204,
+      "0.99": 1.393379688506964
+    },
+    "thermo_inner30": {
+      "0.9": 0.7573261338291617,
+      "0.95": 1.1543397231206138,
+      "0.99": 1.9627137536891164
+    }
+  },
+  "reference_N": 744,
+  "calibration_N": 252,
+  "input_method": "每训练运行最多192时间锚点；每运行最多64校准点；排除同运行±0.25Gyr近邻；参考通道标准化RMS；train-only阈值",
+  "bootstrap": {
+    "repeats": 2000,
+    "seed": 42,
+    "block_gyr": [
+      0.25,
+      0.5
+    ],
+    "scope": "给定训练模型与单一留出运行的描述性配对区间，不包含训练/运行间不确定性"
+  },
+  "units": "Msun/yr",
+  "time": "snapshot绝对时间/Gyr；未减0.5625Gyr",
+  "sfr_factor": 0.025,
+  "interpretation": "Y分层依赖事后标签，不能当成部署OOD检测器；X覆盖依赖度量及空间窗口，不是物理支持集证明。全部原始预测保留，无裁剪或排除。"
+}

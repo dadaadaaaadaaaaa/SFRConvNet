@@ -1,0 +1,22 @@
+{
+  "true_peak": {
+    "time": 4.43,
+    "Y": 84.35839750382729,
+    "UNet": 49.41316926275412,
+    "CNN68": 32.04985102119135,
+    "Baseline": 28.620131613838534,
+    "X_all_input_ratio": 0.6190714502014852
+  },
+  "worst_absolute_error": {
+    "time": 4.285,
+    "Y": 64.34265051430698,
+    "UNet": 27.364457976791847,
+    "CNN68": 14.288338712216415,
+    "Baseline": 9.353705418718054,
+    "X_all_input_ratio": 0.6434301540506744
+  },
+  "top1_squared_error_fraction": 0.002312474991233737,
+  "top10_squared_error_fraction": 0.021880977217562665,
+  "zero_or_negative_prediction_count": 0,
+  "UNet_label_high_relative_bias": -0.3600954978854646
+}

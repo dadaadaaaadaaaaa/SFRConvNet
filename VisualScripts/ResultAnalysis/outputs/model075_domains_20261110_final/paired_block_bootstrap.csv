@@ -1,0 +1,9 @@
+regime,model,block_gyr,reference,delta_MAE,CI025,CI975,nonempty_blocks
+Y_support_inside,UNet,0.25,CNN53_historical,-2.412011161490784,-3.1272487437915473,-1.72133649330857,48
+Y_support_inside,UNet,0.5,CNN53_historical,-2.412011161490784,-3.3514283663413797,-1.5924861419637548,24
+Y_support_outside,UNet,0.25,CNN53_historical,,,,0
+Y_support_outside,UNet,0.5,CNN53_historical,,,,0
+X_all_input_p95_inside,UNet,0.25,CNN53_historical,-2.3168825427574955,-3.0787018185088346,-1.5987379358614977,48
+X_all_input_p95_inside,UNet,0.5,CNN53_historical,-2.3168825427574955,-3.308054420821552,-1.4771893987445774,24
+X_all_input_p95_outside,UNet,0.25,CNN53_historical,-3.127174527324965,-4.488333646895602,-1.2589438817295844,23
+X_all_input_p95_outside,UNet,0.5,CNN53_historical,-3.127174527324965,-4.268918023911243,-1.2025542929040105,15

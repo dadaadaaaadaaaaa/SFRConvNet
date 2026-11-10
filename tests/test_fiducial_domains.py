@@ -1,11 +1,15 @@
 """Fiducial 分层的训练阈值、身份配对及时间块误差检查。"""
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import torch
 
 from VisualScripts.ResultAnalysis.compare_fiducial_domains import (
-    sfr_partition, validate_alignment, block_delta_ci,
+    sfr_partition, validate_alignment, block_delta_ci, audit_historical_cnn, load_cache,
 )
 
 
@@ -42,6 +46,42 @@ class DomainTests(unittest.TestCase):
         low, high, count = block_delta_ci(t, t, t, t, np.ones(10, bool), .5, 100)
         self.assertTrue(np.isnan(low) and np.isnan(high))
         self.assertEqual(count, 1)
+        low, high, count = block_delta_ci(t, t, t, t, np.zeros(10, bool), .5, 100)
+        self.assertTrue(np.isnan(low) and np.isnan(high))
+        self.assertEqual(count, 0)
+
+    def test_historical_comparison_audits_inputs_and_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = root/".cache"
+            cache.mkdir()
+            tensors = {"x": np.zeros((2, 1, 1, 1)), "coord": np.zeros((2, 2, 1, 1)),
+                "groups": np.array(["held", "held"]), "time": np.array([1., 2.]),
+                "target_sfr_physical": np.array([40., 80.]),
+                "macer_sfr_baseline": np.array([20., 40.]), "closure_true_physical": np.array([20., 40.])}
+            torch.save({"tensors": tensors, "sample_identity": {"sample_uid": ["oa", "ob"],
+                "parent_hr_uid": ["pa", "pb"]}}, cache/"old_out.pt")
+            torch.save({"sample_identity": {"sample_uid": ["ta", "tb"],
+                "parent_hr_uid": ["pta", "ptb"]}}, cache/"old_train.pt")
+            for name in ["old_", "new_"]:
+                np.savez(cache/f"{name}norm.npz", mean=np.zeros((1, 1, 1, 1)), std=np.ones((1, 1, 1, 1)))
+            hyper = {"data_exp": "old_", "data_split_metadata": {"train_groups": ["train"]},
+                     "input_channels": ["density"]}
+            metadata = {"cache_prefix": "new_", "train_groups": ["train"], "input_channels": ["density"]}
+            train = pd.DataFrame({"uid": ["ta"], "parent": ["pta"]})
+            with patch("VisualScripts.ResultAnalysis.compare_fiducial_domains.ROOT", root):
+                out, x, coord = load_cache("out", "old_")
+                result = audit_historical_cnn(hyper, metadata, out, train, lambda _: None, x, coord)
+                self.assertEqual(result["train_overlap_N"], 1)
+                self.assertEqual(result["historical_only_train_N"], 1)
+                with self.assertRaises(ValueError):
+                    audit_historical_cnn(hyper, metadata, out, train, lambda _: None, x+1, coord)
+                wrong = out.copy()
+                wrong.loc[0, "Y"] += 1
+                with self.assertRaises(ValueError):
+                    audit_historical_cnn(hyper, metadata, wrong, train, lambda _: None, x, coord)
+                with self.assertRaises(ValueError):
+                    audit_historical_cnn(hyper, metadata, out, pd.DataFrame({"uid": ["oa"], "parent": ["pa"]}), lambda _: None, x, coord)
 
 
 if __name__ == "__main__":
