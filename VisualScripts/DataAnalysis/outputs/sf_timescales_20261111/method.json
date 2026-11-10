@@ -1,0 +1,50 @@
+{
+  "sources": [
+    {
+      "run": "fiducial",
+      "fine_directory": "data\\disk_galaxy_fiducial\\fine_sfr_v7",
+      "available": 8429
+    },
+    {
+      "run": "fiducial_4",
+      "fine_directory": "data\\disk_galaxy_fiducial_4\\fine_sfr_v7",
+      "available": 8770
+    },
+    {
+      "run": "fiducial_7",
+      "fine_directory": "data\\disk_galaxy_fiducial_7\\fine_sfr_v7",
+      "available": 7025
+    },
+    {
+      "run": "model_0_75",
+      "fine_directory": "data\\disk_galaxy_model_0_75\\fine_sfr_v6",
+      "available": 954
+    },
+    {
+      "run": "model_1_1",
+      "fine_directory": "data\\disk_galaxy_model_1_1\\fine_sfr_v6",
+      "available": 954
+    }
+  ],
+  "modes": [
+    "data_compatible",
+    "paper_physical"
+  ],
+  "branches": {
+    "1": "cooling",
+    "2": "freefall",
+    "3": "rotation"
+  },
+  "weighting": "saved data_compatible HR cell_sfr_baseline; NOT true HR cell labels",
+  "integration": "trapezoidal; intervals > 1.5 nominal cadence omitted",
+  "true_bounds": "true coarse labels; all/any HR limiter membership within each block",
+  "scope": "available post-initialization fine products; 2D Zou five runs only",
+  "nominal_dt_gyr": {
+    "fiducial": 0.00125,
+    "fiducial_4": 0.00125,
+    "fiducial_7": 0.00125,
+    "model_0_75": 0.0125,
+    "model_1_1": 0.0125
+  },
+  "true_sfr_to_msun_per_yr": 0.025
+}
