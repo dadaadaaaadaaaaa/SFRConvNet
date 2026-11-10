@@ -1,0 +1,161 @@
+{
+  "date": "2026-11-11",
+  "sha256": {
+    "VisualScripts\\ResultAnalysis\\compare_closure_reference.py": "4e3d9bcec9564595e5151d0e4f86d122d8c51f9323a542808b0c921951cb9736",
+    "VisualScripts\\ResultAnalysis\\analyze_sfr_unet.py": "118bca753d961db73d50c2f5d8c135f2162e403c5a5beeb039c39f346b4de2e3",
+    "VisualScripts\\ResultAnalysis\\compare_fiducial_domains.py": "c3235f2c582ae679df157891227e9520f87a67191c001b07e8a263d9a16dc0ee",
+    "VisualScripts\\DataAnalysis\\check_disk_lr_generalization.py": "7fba160d14d76ce2bb54a7c71becab033c21fbb4ae19e43edfcf7f359efd2137",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906\\hyperparameters.json": "99971bf815747d2ca6f882c590e149999a1282aba65f6bc3d4c30bf1fd4101f9",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_train.pt": "d32f5b5e31c5d52b10df46be2000c99433d0d75edcb63de12f1881295a1974ac",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_val.pt": "2d4599d2a3eb31496ec5e02af3dc033acc347e8b4885c00bc33bb1ea09cf594b",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_test.pt": "0f22bdec9cc374d6d5ed45e20f5e7ce7072a561268dcb3ca69b604136ef7d29a",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_out.pt": "b8cceb2f280f620d5813cb1971cdad2838969b6cf5347c91e4f8408dbb358e1e",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_SFRUNet_seed42_20261104_131515_e66884f5\\summary.json": "526acab38584f9c805b49b45c721482b005347c4bcedcf168f6aac9c812d529d",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_SFRUNet_seed42_20261104_131515_e66884f5\\contract.json": "862dfc8a6fd7ad6de77bfa068a03ef8bf6ebc6e7654ea3b03884c01828dbf742",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_SFRUNet_seed42_20261104_131515_e66884f5\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_metadata.json": "ff5134a6832714babeba75ebd49c8360fc494df36aa88d28883e501b24f20e91",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_norm.npz": "4a06f10473f48f5f1a133cc1f8e3af5cbe4024c97df3ba4cce059b0d9654dfed",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_SFRUNet_seed42_20261104_131515_e66884f5\\test_predictions.pt": "299a042fbc0299a624e7a4797012f09e210a2083aa491f23f3a1327f241885b5",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_SFRUNet_seed42_20261104_131515_e66884f5\\out_predictions.pt": "b03828a95437bf0a0523faa6abaad8f644d49f32a2c2f707e766e4df5234cfe0",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261106_155134_361de833\\summary.json": "ba7916943eee8be54652d29d206c980436a6bc9e21e78435ef3d5de5552069ab",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261106_155134_361de833\\contract.json": "52c216770bd277594eee9097e1afafe14dd9e3ca7793e2e3c404562c72e3c141",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261106_155134_361de833\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261106_155134_361de833\\test_predictions.pt": "2a2a2e69f8b0224d229979d98c62e01c7f67aa8ee58873215504ccf529a72d4f",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261106_155134_361de833\\out_predictions.pt": "a432f2fe04c5666839f4903d2000b735837d6ff9768ad35f2cb77c6f531860f8",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19\\summary.json": "c580cb1fb1706ff113a9ccf022057b198735c1b4b6321496c48221025261b120",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19\\contract.json": "52c216770bd277594eee9097e1afafe14dd9e3ca7793e2e3c404562c72e3c141",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19\\test_predictions.pt": "984ecc168ecce46113e7152eced38922fbc97b52cd11eda5fb9601a56f68cb93",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19\\out_predictions.pt": "9591382c8af3c8ffca5bbe5c98d13b8ed747c7ce6e4d41488d2ffd79b63f177a",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\summary.json": "105542df20faf7556626a75c3d10c6049d553a6aa91c464fb3e754f17e470fde",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\contract.json": "52c216770bd277594eee9097e1afafe14dd9e3ca7793e2e3c404562c72e3c141",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\test_predictions.pt": "0f0289f8f01ee856612b28bcd25b12fcbf2ea0e9290d108cf632a64aa7770373",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\out_predictions.pt": "469c35437b0ebfc56fadf25d86a02b3b7b8cd0cabc4bdd10dd78e6f3e4d1368d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372\\summary.json": "17d4772bc49f4c0a9a570aab02c112120fc84bab98842d08f5ef78ecbc774aab",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372\\contract.json": "52c216770bd277594eee9097e1afafe14dd9e3ca7793e2e3c404562c72e3c141",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372\\test_predictions.pt": "9b84fa1be6981d15a429c4528ad44a0e8fc0929bf6beea908efaa49a31b0b3da",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372\\out_predictions.pt": "cc138e1a7df206afa5522f06455fcacdc9de5113824b99042fa7d7bdcbd8957c",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050\\hyperparameters.json": "a9bca14eb397393bde97ff00acde857dce8f4b303e88182343b931cf5cfeb4e7",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050\\held_out_test_predictions.csv": "3a1d319ba0bf3202a75e074dac6c26e146b0c31b9bdaf10282dd1c43c6cecb0b",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial7_seed42_20261025_180348\\hyperparameters.json": "020355fd226bde86112b3e829e7d5b9dc9513bd0351392e642f636b94c8660f6",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial7_seed42_20261025_180348\\held_out_test_predictions.csv": "279e0e063ec5cd09152e84f786e918a238c211ad100c651e808712ba32feac3f",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_train.pt": "f02031e43a7396f2ee7e83150a74052d7bcdc6c323632a427803c02755ef8729",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_val.pt": "3c41cedc3360a117546faf9901e556e7483df6d5c4a46d7dbe9122290cffcdef",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_test.pt": "e511ac89998105ed51911447e420f369d3704ad72a978bbbefb6f8dd5d81e543",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_out.pt": "7f628abe45191f041e3db433ba57dd356cc9f17675d1072fb8eaa348248d1fda",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\summary.json": "66f7f691a48fd64aa2c630baee86316a554960f3cc36d4f72af65ea78e648b21",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\contract.json": "2736b5ec51883ba9aa65301c8ef82409dd30a61b6faa4b3c9e04b85ee83bbcdd",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\split_manifest.json": "ebc285cde9d4d632b50dd60d144e91dc249c44360a452848a6ac7586843c9983",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_metadata.json": "2153eb013084d8b8138f0445a287bda04eec2fce4d6cd82b4b5df76a9712af3f",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_norm.npz": "e40c6cf3b6b3899b8d7391ec4d468ac7338cc317304e108f9a2eca9eea993285",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\test_predictions.pt": "196b6bb1f8ecb2070820f78f51278992fb861d2d28a32594dc5c954414282565",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\out_predictions.pt": "1c990da05f783fe9b4e18d19f08665606153a4492297a8cbef950101f8c8bdb4",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202\\hyperparameters.json": "ec5b47c356f55634fc6ce4fcec983fc1125edff86087b6ec6e0d2f4eb8af3185",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202\\held_out_test_predictions.csv": "526c7d8adfa9a2d5fedacadb00ae240dce3ff7b210396715cebad6c5f94dbe8b",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_train.pt": "804ac996c361b8e4c96a61ca4fe6e309344d23c47fa08917294adc877f506a1e",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_val.pt": "c4b3a0110ae44749b3e96b2d3d352a47fbf7bc8743bd4bcbf133a4a1c248ce3e",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_test.pt": "2075dd697e9447878e7bd08a7e3575326c4c59d8783a3a870565e7985ef7bcf1",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_out.pt": "c73ef83804610c7380c7fa200f511ee184a1b3f8f6b919991e9eb7e3d38e3408",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\summary.json": "d7f7d329f75cf04adbfdc6717346598b2fdf67e4a5e957b9f9d7a7ce72794b5a",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\contract.json": "f4f158c8d43a9f1e64729496074309bb4239280befcefd31f6ff7f53a03cb623",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\split_manifest.json": "f0e5a85a7f15914134104f3b1ebc7dc942192718abdee383242b146dd2d658ad",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_metadata.json": "41813705cfb1dfb21867aed54b0f3e80330fb75beee1a25d74636db03c38a5a0",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_norm.npz": "dfaa9f30ed40a2691d8158c90aa61007707bc4b2142e3936280bd1b86c732b5f",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\test_predictions.pt": "d7e71104a496bfd1f2f66c13b924b94cf90f9258d041ecbc2cce137bed1e7648",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\out_predictions.pt": "25f48ed64fe90e0638c21b8db36c7967c96cf89843e8086ecef490fe717de69d",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_train.pt": "c7afaae3fa248b8affb438fdd55ff526626c92eb337862a3cdf18270b22fd292",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_val.pt": "ee8ca58804b08dc3d9084d913f7ad36cdf764a486218ba428425f4501e09585a",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_test.pt": "448106d399e23d38e7484fa60e1e7b93500167d096b4edffdf447621907763fc",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_out.pt": "6f02ea459d9ad41e27b9b7738d87ecbee54432966dfb68c34469551d9cdb2408",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906\\held_out_test_predictions.csv": "063f15cfb4288b7829c6093ba218a7ebed21bd2600aa539b072d7519d8c89f76"
+  },
+  "sources": {
+    "fiducial": {
+      "prefix": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_",
+      "train_unique": 10621,
+      "train_weighted": 21048,
+      "anchor_count": 713,
+      "ratio_floor": 0.3471019584025888,
+      "models": {
+        "UNet_original42": {
+          "folder": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_SFRUNet_seed42_20261104_131515_e66884f5",
+          "best_epoch": 94
+        },
+        "UNet_ReLU42_initial": {
+          "folder": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261106_155134_361de833",
+          "best_epoch": 96
+        },
+        "UNet_ReLU42": {
+          "folder": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed42_20261107_040054_2f216a19",
+          "best_epoch": 98
+        },
+        "UNet_ReLU43": {
+          "folder": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
+          "best_epoch": 94
+        },
+        "UNet_ReLU44": {
+          "folder": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed44_20261107_043829_12d55372",
+          "best_epoch": 70
+        },
+        "CNN43": {
+          "folder": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050",
+          "scope": "仅导出的 out；历史CNN有独立训练参考"
+        },
+        "CNN7": {
+          "folder": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial7_seed42_20261025_180348",
+          "scope": "仅导出的 out；历史CNN有独立训练参考"
+        }
+      }
+    },
+    "fiducial7": {
+      "prefix": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_",
+      "train_unique": 11463,
+      "train_weighted": 21048,
+      "anchor_count": 744,
+      "ratio_floor": 0.10100405626175346,
+      "models": {
+        "UNet": {
+          "folder": "Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351",
+          "best_epoch": 94
+        },
+        "CNN68": {
+          "folder": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202",
+          "scope": "仅导出的 out；历史CNN有独立训练参考"
+        }
+      }
+    },
+    "model075": {
+      "prefix": "Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_",
+      "train_unique": 15106,
+      "train_weighted": 21048,
+      "anchor_count": 698,
+      "ratio_floor": 0.19850455236152265,
+      "models": {
+        "UNet": {
+          "folder": "Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d",
+          "best_epoch": 99
+        }
+      }
+    },
+    "model075_cnn_history": {
+      "prefix": "Exp2_Rh12x20_FiveRuns_Closure_LOO_disk_galaxy_model_0_75_",
+      "train_unique": 15187,
+      "train_weighted": 21156,
+      "anchor_count": 698,
+      "ratio_floor": 0.1960103193513688,
+      "models": {
+        "CNN53_historical": {
+          "folder": "Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906",
+          "scope": "仅导出的 out；历史CNN有独立训练参考"
+        }
+      }
+    }
+  },
+  "units": "Msun/yr; snapshot 总闭合，不再乘体积",
+  "reference": "各模型实际去重train；排除同运行±0.25Gyr；每训练运行最多192个等时间锚点决定通道标尺，实际数量见anchor_count；全训练库最近邻；B caliper为事后诊断",
+  "training_predictions": "正式目录仅导出test/out，未将test预测冒称train预测，也未新推理",
+  "definitions": "C=Y-B; Chat=P-B 为最终有效闭合; Delta=C-Cref; R=Chat-Cref; error=R-Delta",
+  "limitations": "相关量共享C；斜率和alpha非因果参数；输入距离非零；全银河统计是各折cache的UID并集；不是完整原模拟；未按out选模型；全部尖峰保留"
+}
