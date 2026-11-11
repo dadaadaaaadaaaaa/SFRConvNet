@@ -5,6 +5,7 @@
 以及随后同权重的 seed42/43/44。全部原始输出进入统计，不裁剪负值或剔除尖峰。
 
 2026-11-10新增 `--case model075` 和 `--case fiducial7`；默认仍为原来的 `fiducial`。
+2026-11-11新增 `--case fiducial4`，读取用户指定的Final UNet。该折未配置CNN，配对bootstrap以MACER-LR Baseline为参照，`reference`列明确记录。
 各 case 的来源目录在 `CASES` 中明确列出，训练阈值与输入参考按各折实际 train 独立建立，不能复用 Fiducial 阈值。
 
 ```powershell

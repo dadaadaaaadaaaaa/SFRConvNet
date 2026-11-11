@@ -81,7 +81,9 @@ def scan(out,smoke):
     return pd.concat(frames,ignore_index=True)
 
 
-def analyze(f,out):
+def analyze(f,out,reference_dir=OLD,cases=None,moments_dir=None):
+    reference_dir=reference_dir.resolve()
+    if moments_dir:moments_dir=moments_dir.resolve()
     assert len(f)==26132 and not f.parent.duplicated().any()
     features=['all_f','inner30_f','all_M','all_Mcd','all_q','inner30_q','lr_f','hidden_cd_fraction']
     rows=[]
@@ -93,9 +95,12 @@ def analyze(f,out):
     errors=f.assign(relative=(f.all_Sff-f.Y)/f.Y.replace(0,np.nan),inner_share=f.inner30_Sff/f.all_Sff.replace(0,np.nan))
     errors.groupby('group').agg(N=('Y','size'),median_relative=('relative','median'),
         p99_absolute=('relative',lambda v:abs(v).quantile(.99)),median_inner_share=('inner_share','median')).to_csv(out/'ff_validation.csv')
-    pred=pd.read_csv(OLD/'predictions_and_references.csv.gz')
+    pred=pd.read_csv(reference_dir/'predictions_and_references.csv.gz')
     coverage=[];pairs=[];decomp=[];errors_by_fraction=[]
-    for case,model in [('fiducial','UNet_original42'),('model075','UNet'),('fiducial7','UNet')]:
+    models={'fiducial':'UNet_original42','model075':'UNet','fiducial7':'UNet','fiducial4':'UNet'}
+    selected=cases or ['fiducial','model075','fiducial7']
+    for case in selected:
+        model=models[case]
         payload=torch.load(ROOT/'.cache'/f"{CASES[case]['prefix']}train.pt",map_location='cpu',weights_only=False,mmap=True)
         ident=payload['sample_identity']
         train=pd.DataFrame(dict(uid=ident['sample_uid'],parent=ident['parent_hr_uid'])).drop_duplicates('uid')
@@ -158,10 +163,11 @@ def analyze(f,out):
             x=np.sort(a[col]);ax.plot(x,np.arange(1,len(x)+1)/len(x),label=group)
             ax.set(xlabel=col,ylabel='CDF');ax.set_xscale('symlog',linthresh=.001)
     axes[-1].legend();fig.savefig(out/'cold_dense_distributions.png',dpi=170);plt.close(fig)
-    source_paths=[Path(__file__),OLD/'predictions_and_references.csv.gz',OLD/'method.json']
+    source_paths=[Path(__file__),reference_dir/'predictions_and_references.csv.gz',reference_dir/'method.json']
     source_paths.extend(TIMES/f'{name}_snapshots.parquet' for name in RUNS)
-    previous=json.loads((OLD/'method.json').read_text(encoding='utf-8'))
-    for case in ['fiducial','model075','fiducial7']:
+    if moments_dir:source_paths.extend(moments_dir/f'{name}.parquet' for name in RUNS)
+    previous=json.loads((reference_dir/'method.json').read_text(encoding='utf-8'))
+    for case in selected:
         path=ROOT/'.cache'/f"{CASES[case]['prefix']}train.pt"
         assert file_hash(path)==previous['sha256'][str(path.relative_to(ROOT))]
         source_paths.append(path)
@@ -177,11 +183,20 @@ def analyze(f,out):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--output-dir',type=Path,required=True)
-    p.add_argument('--smoke',action='store_true');p.add_argument('--reuse',action='store_true');args=p.parse_args()
-    if args.reuse:
-        frame=pd.concat([pd.read_parquet(args.output_dir/f'{n}.parquet') for n in RUNS],ignore_index=True)
+    p.add_argument('--smoke',action='store_true');p.add_argument('--reuse',action='store_true')
+    p.add_argument('--reference-dir',type=Path,default=OLD)
+    p.add_argument('--cases',nargs='+',choices=CASES)
+    p.add_argument('--moments-dir',type=Path)
+    args=p.parse_args()
+    if args.moments_dir and (args.reuse or args.smoke):p.error('--moments-dir不能与--reuse或--smoke同时使用')
+    if args.reuse or args.moments_dir:
+        if args.moments_dir:
+            args.output_dir.mkdir(parents=True,exist_ok=False)
+            (args.output_dir/'.gitignore').write_text('*.parquet\n*.csv.gz\n',encoding='utf-8')
+        source=args.moments_dir or args.output_dir
+        frame=pd.concat([pd.read_parquet(source/f'{n}.parquet') for n in RUNS],ignore_index=True)
     else:
         args.output_dir.mkdir(parents=True,exist_ok=False)
         (args.output_dir/'.gitignore').write_text('*.parquet\n*.csv.gz\n',encoding='utf-8')
         frame=scan(args.output_dir,args.smoke)
-    if not args.smoke:analyze(frame,args.output_dir)
+    if not args.smoke:analyze(frame,args.output_dir,args.reference_dir,args.cases,args.moments_dir)

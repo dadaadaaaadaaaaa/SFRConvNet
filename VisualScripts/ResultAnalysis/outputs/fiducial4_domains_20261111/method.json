@@ -1,0 +1,93 @@
+{
+  "case": "fiducial4",
+  "cache_prefix": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_",
+  "held_out": "disk_galaxy_fiducial_4",
+  "sources": {
+    "UNet": "Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3"
+  },
+  "sha256": {
+    "VisualScripts\\ResultAnalysis\\compare_fiducial_domains.py": "3396bfea145c9c37c7a56a7e5b1e2981dfa0af9788d22ce1e0f03d29f25850b9",
+    "VisualScripts\\DataAnalysis\\check_disk_lr_generalization.py": "7fba160d14d76ce2bb54a7c71becab033c21fbb4ae19e43edfcf7f359efd2137",
+    "VisualScripts\\ResultAnalysis\\analyze_sfr_unet.py": "118bca753d961db73d50c2f5d8c135f2162e403c5a5beeb039c39f346b4de2e3",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_train.pt": "3e7ab4f5b412c3f5ee36c9d32c37e1f7809c56ad5404d963c2c70032340e1089",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_out.pt": "f59b3f7e77faf8d8a6d5054d32bfb3337c6df1bad418c4f9721c45bbd409561e",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_metadata.json": "2e53898e35e2a09670f9f295cce4fdc565d72f2e7c6323c7d9b09c8bcf301e34",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_norm.npz": "319e612aca3dc55bfa729f33975db885c307a1207007e35e982d2785eb6edc91",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\summary.json": "c8761e7b9a44a2f2f3f169253cf312e7f26cbe7b63b9abbdafef308a4c7198b6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\contract.json": "a8450e0ab43a43cb541b03a7a2b7971240d8f93aa0337b5266d3a3b3ad7175e6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\split_manifest.json": "77925556287e14e8097750c31bd84a0f9d312148c77c916386f80e3835f21505",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\config.json": "46c9353d77e1f91faf65b555144b3d8456b736491db5d8310df746022f888ef6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\out_predictions.pt": "e4b074de2e9efbf9e2080a8dd2e226042bba67649d48760503839647fdaa79d4"
+  },
+  "contracts": {
+    "UNet": {
+      "seed": 42,
+      "epochs": 100,
+      "output_constraint": "relu",
+      "candidate_weight": 1.0,
+      "best_epoch": 99,
+      "best_score": 0.008157120417225014
+    }
+  },
+  "train_unique_N": 10416,
+  "out_N": 8770,
+  "label_thresholds": {
+    "support": {
+      "low": 0.0,
+      "high": 84.08871005464344,
+      "quantiles": [
+        0,
+        1
+      ]
+    },
+    "p01_p99": {
+      "low": 0.0020837597018362433,
+      "high": 68.25248609744793,
+      "quantiles": [
+        0.01,
+        0.99
+      ]
+    },
+    "p05_p95": {
+      "low": 0.04000007867751121,
+      "high": 35.23025276422143,
+      "quantiles": [
+        0.05,
+        0.95
+      ]
+    }
+  },
+  "input_thresholds": {
+    "all_input": {
+      "0.9": 0.6419091316751291,
+      "0.95": 0.8779889695003705,
+      "0.99": 1.5003669934485548
+    },
+    "all_input_disk10": {
+      "0.9": 0.7129988321777,
+      "0.95": 0.8925062195041742,
+      "0.99": 1.4536925133241994
+    },
+    "thermo_inner30": {
+      "0.9": 0.7390040419946311,
+      "0.95": 0.870878650295544,
+      "0.99": 1.9119753268420634
+    }
+  },
+  "reference_N": 707,
+  "calibration_N": 240,
+  "input_method": "每训练运行最多192时间锚点；每运行最多64校准点；排除同运行±0.25Gyr近邻；参考通道标准化RMS；train-only阈值",
+  "bootstrap": {
+    "repeats": 2000,
+    "seed": 42,
+    "block_gyr": [
+      0.25,
+      0.5
+    ],
+    "scope": "给定训练模型与单一留出运行的描述性配对区间，不包含训练/运行间不确定性"
+  },
+  "units": "Msun/yr",
+  "time": "snapshot绝对时间/Gyr；未减0.5625Gyr",
+  "sfr_factor": 0.025,
+  "interpretation": "Y分层依赖事后标签，不能当成部署OOD检测器；X覆盖依赖度量及空间窗口，不是物理支持集证明。全部原始预测保留，无裁剪或排除。"
+}

@@ -1,0 +1,17 @@
+{
+  "sha256": {
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\pairs.csv.gz": "e9a9144fa8365761f724c33246294d257028bf5cfd6b02bbc87eb8f4168012fd",
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\method.json": "6df658a95b3ecf299734de92092d60741ce8825f5595b071fdce2f727e1d6380",
+    "VisualScripts\\ResultAnalysis\\outputs\\closure_comparison_20261111_verified\\method.json": "d8f2b33a8c1bd4bdc5cc4c348e6f856dbfefbe1a6d62ab7930a03882a6545a42",
+    "VisualScripts\\DataAnalysis\\outputs\\fiducial4_cold_dense_20261111\\pairs.csv.gz": "1f077330cde1c0424c7f1c8b637155ccb45e10b95ae4ee3448892232e977061d",
+    "VisualScripts\\DataAnalysis\\outputs\\fiducial4_cold_dense_20261111\\method.json": "4e88168d7a5f738585b2a015399bcb1eb8e2f5050139e6663a0b39227554d8a5",
+    "VisualScripts\\ResultAnalysis\\outputs\\fiducial4_closure_20261111\\method.json": "a95293880778a610896327060791377450b45a28a3603008100a29fe21172102",
+    "VisualScripts\\DataAnalysis\\compare_cold_dense_folds.py": "1b82a8be2c854653febe7a24e95aff973cd88d353425e23dbe6545054b378749"
+  },
+  "reference_method": "b10",
+  "units": "SFR: Msun/yr; fractions: mass fractions",
+  "fraction_bins": "inner30 query minus reference: <-0.05, [-0.05,0.05], >0.05",
+  "closure_direction": "delta > ratio_floor or delta < -ratio_floor; training-only ratio_floor from reference method",
+  "time_bins": "fixed 0.5 Gyr in snapshot absolute time; descriptive, not event boundaries",
+  "limitations": "paired descriptive analysis, nonzero input distance, no causal intervention or seed uncertainty"
+}

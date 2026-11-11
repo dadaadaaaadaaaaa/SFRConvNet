@@ -33,6 +33,9 @@ UNET = {
 }
 CASES = {
     "fiducial": dict(prefix=PREFIX, held=HELD, cnn=CNN, unet=UNET, title="Fiducial"),
+    "fiducial4": dict(prefix="Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_",
+        held="disk_galaxy_fiducial_4", title="Fiducial4", cnn={},
+        unet={"UNet": "Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3"}),
     "fiducial7": dict(prefix="Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_",
         held="disk_galaxy_fiducial_7", title="Fiducial7",
         cnn={"CNN68": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202"},
@@ -276,7 +279,7 @@ def run(output, repeats=2000, *, case="fiducial"):
             rows.append({"regime": regime, "model": model, "N": int(mask.sum()),
                 **(regression(y[mask], pred[mask]) if mask.any() else {})})
         if regime in ["Y_support_inside", "Y_support_outside", "X_all_input_p95_inside", "X_all_input_p95_outside"]:
-            reference_model = next(iter(cnn))
+            reference_model = next(iter(cnn), "Baseline")
             for model in unet:
                 for width in [.25, .5]:
                     low, high, nblock = block_delta_ci(t, y, predictions[model], predictions[reference_model], mask, width, repeats)

@@ -1,0 +1,3 @@
+model,true_mass_msun,predicted_mass_msun,relative_error_percent,excluded_gaps,covered_duration_gyr
+Baseline,110448261782.8006,43493010717.366,-60.62137147717531,3,10.96625
+UNet,110448261782.8006,108714830449.78516,-1.5694509854978778,3,10.96625

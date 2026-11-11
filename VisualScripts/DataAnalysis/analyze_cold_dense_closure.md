@@ -36,6 +36,13 @@ D:/conda_envs/physics_ai/python.exe VisualScripts/DataAnalysis/analyze_cold_dens
 
 smoke每组3帧，不生成正式覆盖或分解结论。主输出目录必须不存在。
 `--reuse`仅复用已完成的逐帧parquet，重算汇总与图；不再扫描fine。
+新增折可用 `--cases fiducial4 --reference-dir <该折闭合分析目录> --moments-dir <已有五组逐帧parquet目录> --output-dir <新的目录>`，
+只重新连接该折实际训练清单与正式预测，不覆盖旧分析。`--moments-dir`不能与`--reuse`或`--smoke`同用。
 逐帧parquet及配对csv.gz仅本地保存。主要输出为galaxy_summary、ff_validation、fold_coverage、paired_decomposition、errors_by_fraction和CDF图。
 errors_by_fraction按每折实际训练质量比例min/max分层，并另列Y超过该折训练Y最大值的高SFR子集。
 原始HR逐格SFR本地fine未保存，本次不将重建分支当成真实逐HR格点标签；标签是已保守归约的真实总量。
+
+四折对照入口为 `compare_cold_dense_folds.py --output-dir <新的目录>`，来源在其SOURCES中显式登记。
+它保留冷致密比例相对参考变化超过±5个百分点的固定分层、训练确定门槛下的闭合上调/下调分层、
+0.5 Gyr绝对时间分箱，以及相同UID在留出与已知运行test两种角色下的误差对照。
+跨折角色比较核对parent、Y/B/time，不将不同帧或不同模型的结果当成同一训练种子的受控消融。

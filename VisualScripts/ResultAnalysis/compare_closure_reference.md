@@ -1,6 +1,6 @@
 # Exp2：C、C_ref 与预测闭合的分布和关系
 
-`compare_closure_reference.py` 汇总留出 Fiducial、Model0.75、Fiducial7 的正式预测。
+`compare_closure_reference.py` 汇总留出 Fiducial、Fiducial4、Model0.75、Fiducial7 的正式预测。
 复用 `compare_fiducial_domains.py` 已核验的模型清单，Fiducial 的多个 UNet 版本全部保留，
 CNN 同时列作对照；不按 out 误差选模型。
 
@@ -10,6 +10,8 @@ C:/Users/augus/miniconda3/python.exe -m unittest tests.test_closure_reference te
 ```
 
 输出目录必须不存在。脚本只读取本项目可信 cache/PT/CSV，不加载权重，不重新训练、推理或校准。
+可加 `--cases fiducial4` 只分析指定折，避免重复检索已有结果；默认读取全部登记折。
+各图按实际包含的折和模型动态布局，单折同样保留闭合、参考及训练分布图。
 
 ## 定义与单位
 

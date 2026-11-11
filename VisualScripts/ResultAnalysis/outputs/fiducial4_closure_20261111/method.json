@@ -1,0 +1,40 @@
+{
+  "date": "2026-11-11",
+  "sha256": {
+    "VisualScripts\\ResultAnalysis\\compare_closure_reference.py": "1002002a0240de4bb1f3242a98d8f9077126813ce0c38dabcff238ce22dfb52f",
+    "VisualScripts\\ResultAnalysis\\analyze_sfr_unet.py": "118bca753d961db73d50c2f5d8c135f2162e403c5a5beeb039c39f346b4de2e3",
+    "VisualScripts\\ResultAnalysis\\compare_fiducial_domains.py": "3396bfea145c9c37c7a56a7e5b1e2981dfa0af9788d22ce1e0f03d29f25850b9",
+    "VisualScripts\\DataAnalysis\\check_disk_lr_generalization.py": "7fba160d14d76ce2bb54a7c71becab033c21fbb4ae19e43edfcf7f359efd2137",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_train.pt": "3e7ab4f5b412c3f5ee36c9d32c37e1f7809c56ad5404d963c2c70032340e1089",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_val.pt": "684793800948f96f171dc9a36e6dd2366d8f4941a20e60fc4963f05cc7ff8050",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_test.pt": "1cf70b515dc2f2b6aa6ebf341b3565e331fa1e8af8895a1475a765a2a5a92571",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_out.pt": "f59b3f7e77faf8d8a6d5054d32bfb3337c6df1bad418c4f9721c45bbd409561e",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\summary.json": "c8761e7b9a44a2f2f3f169253cf312e7f26cbe7b63b9abbdafef308a4c7198b6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\contract.json": "a8450e0ab43a43cb541b03a7a2b7971240d8f93aa0337b5266d3a3b3ad7175e6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\split_manifest.json": "77925556287e14e8097750c31bd84a0f9d312148c77c916386f80e3835f21505",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_metadata.json": "2e53898e35e2a09670f9f295cce4fdc565d72f2e7c6323c7d9b09c8bcf301e34",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_norm.npz": "319e612aca3dc55bfa729f33975db885c307a1207007e35e982d2785eb6edc91",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\test_predictions.pt": "58f1533ec8fe2de274aa2fb5e47b4526dd916a58b02230082a15eecd34c375cd",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\out_predictions.pt": "e4b074de2e9efbf9e2080a8dd2e226042bba67649d48760503839647fdaa79d4"
+  },
+  "sources": {
+    "fiducial4": {
+      "prefix": "Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_",
+      "train_unique": 10416,
+      "train_weighted": 20228,
+      "anchor_count": 707,
+      "ratio_floor": 0.1,
+      "models": {
+        "UNet": {
+          "folder": "Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3",
+          "best_epoch": 99
+        }
+      }
+    }
+  },
+  "units": "Msun/yr; snapshot 总闭合，不再乘体积",
+  "reference": "各模型实际去重train；排除同运行±0.25Gyr；每训练运行最多192个等时间锚点决定通道标尺，实际数量见anchor_count；全训练库最近邻；B caliper为事后诊断",
+  "training_predictions": "正式目录仅导出test/out，未将test预测冒称train预测，也未新推理",
+  "definitions": "C=Y-B; Chat=P-B 为最终有效闭合; Delta=C-Cref; R=Chat-Cref; error=R-Delta",
+  "limitations": "相关量共享C；斜率和alpha非因果参数；输入距离非零；全银河统计是各折cache的UID并集；不是完整原模拟；未按out选模型；全部尖峰保留"
+}

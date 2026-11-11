@@ -161,7 +161,7 @@ def block_summary(a, width, repeats=1000):
     return row
 
 
-def run(output):
+def run(output, cases=None):
     if output.exists():
         raise FileExistsError('输出目录已存在，拒绝覆盖。')
     output.mkdir(parents=True)
@@ -178,14 +178,15 @@ def run(output):
                    'VisualScripts/ResultAnalysis/compare_fiducial_domains.py',
                    'VisualScripts/DataAnalysis/check_disk_lr_generalization.py']:
         record(ROOT/module)
-    specs={key:dict(value) for key,value in CASES.items()}
-    historical=next(iter(specs['model075']['cnn'].values()))
-    hpath=ROOT/'Results'/historical/'hyperparameters.json'
-    hyper=json.loads(hpath.read_text(encoding='utf-8'))
-    record(hpath)
-    specs['model075']['cnn']={}
-    specs['model075_cnn_history']=dict(prefix=hyper['data_exp'],held=specs['model075']['held'],
-        title='Model0.75 historical CNN',cnn={'CNN53_historical':historical},unet={})
+    specs={key:dict(CASES[key]) for key in (cases or CASES)}
+    if 'model075' in specs:
+        historical=next(iter(specs['model075']['cnn'].values()))
+        hpath=ROOT/'Results'/historical/'hyperparameters.json'
+        hyper=json.loads(hpath.read_text(encoding='utf-8'))
+        record(hpath)
+        specs['model075']['cnn']={}
+        specs['model075_cnn_history']=dict(prefix=hyper['data_exp'],held=specs['model075']['held'],
+            title='Model0.75 historical CNN',cnn={'CNN53_historical':historical},unet={})
     distribution, training, predictions, comparisons, binned, cis, unions = [],[],[],[],[],[],[]
     plot_records={}
     sources={}
@@ -358,9 +359,11 @@ def make_plots(output,records,galaxy,training):
     ax.legend()
     fig.savefig(output/'galaxy_closure_cdf.png',dpi=170)
     plt.close(fig)
-    display={'fiducial':['UNet_original42','UNet_ReLU42','UNet_ReLU43','CNN43'],
-             'model075':['UNet'],'fiducial7':['UNet','CNN68']}
-    fig,axes=plt.subplots(3,2,figsize=(13,14),constrained_layout=True)
+    preferred={'fiducial':['UNet_original42','UNet_ReLU42','UNet_ReLU43','CNN43'],
+               'fiducial4':['UNet'],'model075':['UNet'],'fiducial7':['UNet','CNN68']}
+    display={case:[m for m in models if (case,m) in records] for case,models in preferred.items()}
+    display={case:models for case,models in display.items() if models}
+    fig,axes=plt.subplots(len(display),2,figsize=(13,4.7*len(display)),constrained_layout=True,squeeze=False)
     for row,(case,models) in enumerate(display.items()):
         for model in models:
             a=records[(case,model)]
@@ -380,7 +383,8 @@ def make_plots(output,records,galaxy,training):
         axes[row,1].set(xlabel='Delta = C - Cref [Msun/yr]',ylabel='R = Chat - Cref [Msun/yr]',title=case+': identity = truth; horizontal zero = reference')
     fig.savefig(output/'closure_reference_relations.png',dpi=160)
     plt.close(fig)
-    fig,axes=plt.subplots(1,3,figsize=(15,4.8),constrained_layout=True)
+    fig,axes=plt.subplots(1,len(display),figsize=(5*len(display),4.8),constrained_layout=True,squeeze=False)
+    axes=axes[0]
     for ax,(case,models) in zip(axes,display.items()):
         base=records[(case,models[0])]
         valid=np.isfinite(base.Cref)
@@ -396,7 +400,8 @@ def make_plots(output,records,galaxy,training):
         ax.legend(fontsize=8)
     fig.savefig(output/'closure_reference_distributions.png',dpi=170)
     plt.close(fig)
-    fig,axes=plt.subplots(1,3,figsize=(16,5),constrained_layout=True)
+    fig,axes=plt.subplots(1,len(display),figsize=(5.4*len(display),5),constrained_layout=True,squeeze=False)
+    axes=axes[0]
     for ax,(case,models) in zip(axes,display.items()):
         entries=[]
         for mode in ['unique','sampling_weighted']:
@@ -423,4 +428,6 @@ def make_plots(output,records,galaxy,training):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir',type=Path,required=True)
-    run(parser.parse_args().output_dir.resolve())
+    parser.add_argument('--cases',nargs='+',choices=CASES)
+    args=parser.parse_args()
+    run(args.output_dir.resolve(),args.cases)

@@ -1,0 +1,28 @@
+{
+  "sources": {
+    "VisualScripts\\DataAnalysis\\analyze_cold_dense_closure.py": "4836b2fc19e2f87df05c2301fbf53c7b6157a2f7fdc6bd81baf7e3bfc09db89e",
+    "VisualScripts\\ResultAnalysis\\outputs\\fiducial4_closure_20261111\\predictions_and_references.csv.gz": "a03568d991e06aa9a42a938f77852e2f2bb7f0f2ca9938ca0bbdb160b9322de8",
+    "VisualScripts\\ResultAnalysis\\outputs\\fiducial4_closure_20261111\\method.json": "a95293880778a610896327060791377450b45a28a3603008100a29fe21172102",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\fiducial_snapshots.parquet": "ec2126e62f994c82292383cfb6e09174604a704cad8944e45ac9172430d624f1",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\fiducial_4_snapshots.parquet": "aeedca9bb64faae084b9ad2fef492df4686efb1f5ad2169c3e8611a9de3a2c13",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\fiducial_7_snapshots.parquet": "8efb7551ab8f3e8b21f2386489ead757be9c35c1b4151bdba49582bcc4018c8d",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\model_0_75_snapshots.parquet": "7bc6769acc56f937875eeadd56a928d043b6b5cf1e914d261a02951308270320",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\model_1_1_snapshots.parquet": "53f040b7f6ede5fd2337da18c60481f5bf05e3754f83cb4052c3f8292d9f5a6f",
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\fiducial.parquet": "cdc105aa29e4f1d73edc102ee58e5a7beff1a862cc38bc8ad1ce808f81096c26",
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\fiducial_4.parquet": "db933ed6649b98810237f8f7969eb73e8ba2113ca3d202d98c8347d4b5e299d7",
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\fiducial_7.parquet": "64e3ba2a3e47277d746694ecd47ce58a08436a00684fafffcb7320eefd341e58",
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\model_0_75.parquet": "8de94978b8be54b30f7be4251c7726d9e3fe52efd7c7454557eddda436d80cbb",
+    "VisualScripts\\DataAnalysis\\outputs\\cold_dense_closure_20261111\\model_1_1.parquet": "c5abf560de1466792f44f2bf65cf38457ce7ce2ca890fde8c59edbe183b4df06",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_4_train.pt": "3e7ab4f5b412c3f5ee36c9d32c37e1f7809c56ad5404d963c2c70032340e1089"
+  },
+  "N": 26132,
+  "threshold": "T<4e4 K; 1.02*rho>1",
+  "regions": [
+    "whole domain",
+    "r<30 kpc"
+  ],
+  "units": "mass: code mass (2.5e7 Msun); density moment: sqrt(code density); Sff: Msun/yr",
+  "decomposition": "Symmetric three-factor product Shapley; descriptive, not causal",
+  "checks": "15-frame smoke; positive volumes; mass conservation; source parent/time/Y; prediction Y/time; exact product and decomposition; actual train SHA256",
+  "limitations": "raw HR cell SFR unavailable; Y remains true aggregate; Sff is diagnostic; zero eligible mass has q=0 by convention; changing aperture changes factor contributions"
+}

@@ -1,0 +1,9 @@
+regime,model,block_gyr,reference,delta_MAE,CI025,CI975,nonempty_blocks
+Y_support_inside,UNet,0.25,Baseline,-4.641331837038333,-5.380847084151497,-3.983108800206072,47
+Y_support_inside,UNet,0.5,Baseline,-4.641331837038333,-5.628426885383935,-3.763332608184364,24
+Y_support_outside,UNet,0.25,Baseline,,,,0
+Y_support_outside,UNet,0.5,Baseline,,,,0
+X_all_input_p95_inside,UNet,0.25,Baseline,-4.353643424229378,-4.983313199049167,-3.7698149041137547,47
+X_all_input_p95_inside,UNet,0.5,Baseline,-4.353643424229378,-5.14069213233598,-3.608279337610767,24
+X_all_input_p95_outside,UNet,0.25,Baseline,-8.164863031985481,-9.977746780380427,-5.018079135647907,24
+X_all_input_p95_outside,UNet,0.5,Baseline,-8.164863031985481,-9.821706751506536,-3.8388674056807988,13
