@@ -3267,3 +3267,13 @@ Fiducial7单帧最大平方误差占比仅0.231%，主要为持续幅值不足�
 新测试覆盖历史对照的输入/标签不匹配拒绝、UID隔离、空域外统计；不足5个时间块的CI留空。
 Fiducial7高标签组只有4个0.25Gyr块或2个0.5Gyr块，未伪造置信区间。
 新两折各只有一个UNet种子，未验证其他种子、严格时间块重新训练或真实GIZMO。
+
+
+## 2026-11-12：真实零格子最终SFR L1
+
+新增可选zero_l1_weight，默认0。L_zero按每帧Y==0精确掩码对abs(Y_hat)/train cell_scale取均值，无零格帧贡献0，再在batch平均；不惩罚closure，不乘体积，不加入hurdle。
+保留原cell/total/candidate及none/relu功能，默认0保留原损失算式。训练核心共用参数自动接通正式/HPO入口；可选搜索{0,.01,.03,.1,.3,1}，默认搜索不变。
+loss contract升级v3；权重参与config/恢复/HPO身份；prediction v2及旧分析继续可用。history保留原五列并另存train_zero_l1_loss，TB增加train/zero_l1；固定validation选模分数不加入新辅助项。
+分析新增零格虚假正SFR与正格低估量的逐帧列和均值，可比较抑制背景与真实恒星形成损失。命令见Experiment/zero_l1_comparison.md。
+验证：python -m unittest tests.test_sfr_unet_zero_l1 tests.test_sfr_unet_nonnegative tests.test_sfr_unet_training tests.test_analyze_sfr_unet tests.test_sfr_unet -q，35项通过。覆盖手算、梯度、精确零/极小正值、无零格、默认兼容、单位、Exp2恢复、HPO导出、CUDA FP32/BF16及旧分析。
+未重建真实cache或开展正式训练，不登记Train_history；未验证新权重能改善泛化。

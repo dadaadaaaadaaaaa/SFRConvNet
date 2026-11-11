@@ -94,3 +94,9 @@ notebook无需更改结构，改 RESULT_DIR 即可。新训练参数详见 Exper
 
 
 异常时刻的cache气体输入、邻帧与训练分布检查，见 [inspect_sfr_unet_inputs.md](inspect_sfr_unet_inputs.md)。notebook末尾启用INSPECT_INPUTS即可；需要对应train/out cache。
+
+
+## 2026-11-12：零格子L1对照指标
+
+metrics.csv新增ZeroCellFalseSFR_mean和PositiveCellUnderSFR_mean，分别为真实零格子的虚假正SFR、真实正格子的低估量，逐帧求和后平均，单位Msun/yr。
+预测CSV新增model/baseline_zero_cell_false_sfr与model/baseline_positive_cell_under_sfr。兼容旧预测及带loss contract v3的新训练。

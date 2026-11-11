@@ -193,3 +193,10 @@ history.train_loss 保留前4项（总损失、cell、global、negative），追
 TensorBoard `train/candidate` 为未乘权重的辅助损失，`train/total` 已包含其加权贡献。
 分析器同时支持旧v1与新v2；v2额外检查 q=B+Delta、Y_hat=ReLU(q)/q、非负性以及与训练loss契约一致。
 现有 Results_stat_Exp2_SFRUNet.ipynb 无需改结构，切换 RESULT_DIR 即可分析新结果。
+
+
+## 2026-11-12：真实零格子L1
+
+新增 `--zero-l1-weight`（默认0，有限非负）；真实零格子最终SFR的归一化L1，保留现有功能。
+训练、日志、loss contract v3与HPO身份均保存该值；默认搜索列表不变，可选搜索范围为0/0.01/0.03/0.1/0.3/1。
+已有cache可复用，需从头进行对照训练；完整公式、Fiducial多种子命令与分析见[对照指南](zero_l1_comparison.md)。

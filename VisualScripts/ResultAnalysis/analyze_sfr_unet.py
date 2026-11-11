@@ -122,6 +122,10 @@ def sample_frame(data, split):
         frame[label+"_spatial_abs_error"] = abs(error).sum((1,2,3))
         frame[label+"_negative_cell_fraction"] = (data[key+"_map"] < 0).mean((1,2,3))
         frame[label+"_negative_sfr_magnitude"] = np.maximum(-data[key+"_map"],0).sum((1,2,3))*SFR_FACTOR
+        truth = data["target_map"]
+        # 每帧虚假正SFR与正标签低估量，单位Msun/yr；不与零真值做除法。
+        frame[label+"_zero_cell_false_sfr"] = (np.maximum(data[key+"_map"],0)*(truth==0)).sum((1,2,3))*SFR_FACTOR
+        frame[label+"_positive_cell_under_sfr"] = (np.maximum(truth-data[key+"_map"],0)*(truth>0)).sum((1,2,3))*SFR_FACTOR
     return frame
 
 
@@ -333,7 +337,11 @@ def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., bu
                 row={"split":split,"run":group,"method":label,"n":len(part),
                      **regression(data["target_total"][indices]*SFR_FACTOR,data[key+"_total"][indices]*SFR_FACTOR)}
                 cells=regression(data["target_map"][indices].ravel()*SFR_FACTOR,data[key+"_map"][indices].ravel()*SFR_FACTOR)
-                row.update({"Cell_"+k:v for k,v in cells.items()}); rows.append(row)
+                row.update({"Cell_"+k:v for k,v in cells.items()})
+                prefix = "model" if label == "Model" else "baseline"
+                row["ZeroCellFalseSFR_mean"] = float(part[prefix+"_zero_cell_false_sfr"].mean())
+                row["PositiveCellUnderSFR_mean"] = float(part[prefix+"_positive_cell_under_sfr"].mean())
+                rows.append(row)
             trajectory=None
             if split=="out":
                 row,trajectory=integral_row(part,split=split,group=group,gap_factor=gap_factor)

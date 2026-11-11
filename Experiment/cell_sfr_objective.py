@@ -98,14 +98,14 @@ class CellSFRLoss(nn.Module):
 
     def __init__(self, *, closure_scale, cell_scale, total_scale,
                  total_weight=1.0, negative_weight=1.0, check_finite=True,
-                 output_constraint="none", candidate_weight=0.0):
+                 output_constraint="none", candidate_weight=0.0, zero_l1_weight=0.0):
         super().__init__()
         for name, value in (("closure_scale", closure_scale), ("cell_scale", cell_scale),
                             ("total_scale", total_scale)):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须为有限正数。")
         for name, value in (("total_weight", total_weight), ("negative_weight", negative_weight),
-                            ("candidate_weight", candidate_weight)):
+                            ("candidate_weight", candidate_weight), ("zero_l1_weight", zero_l1_weight)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} 必须有限且非负。")
         if output_constraint not in {"none", "relu"}:
@@ -113,6 +113,7 @@ class CellSFRLoss(nn.Module):
         if (output_constraint == "relu" and candidate_weight <= 0) or (output_constraint == "none" and candidate_weight != 0):
             raise ValueError("relu 要求 candidate_weight>0；none 要求 candidate_weight=0。")
         self.output_constraint = output_constraint
+        self.zero_l1_weight = float(zero_l1_weight)
         self.register_buffer("scales", torch.tensor([closure_scale, cell_scale, total_scale], dtype=torch.float64))
         # relu 已严格非负，旧负值惩罚停用，避免把候选辅助项误当成同一种惩罚。
         self.register_buffer("weights", torch.tensor([total_weight, negative_weight if output_constraint == "none" else 0.,
@@ -142,6 +143,12 @@ class CellSFRLoss(nn.Module):
         per_negative = (F.relu(-predicted) / scales[1]).square().mean(dim=(1, 2, 3))
         per_candidate = ((composed["candidate_sfr_map_physical"] - y.to(dtype)) / scales[1]).square().mean(dim=(1, 2, 3))
         per_sample = per_cell + weights[0] * per_total + weights[1] * per_negative + weights[2] * per_candidate
+        # 精确零标签；先按每帧零格数平均，再在batch平均。无零格帧贡献零。
+        # 惩罚最终SFR的绝对值，不惩罚允许为负的closure，也不再乘体积。
+        zero_mask = y == 0
+        per_zero_l1 = ((predicted.abs() / scales[1]) * zero_mask).sum(dim=(1, 2, 3)) / zero_mask.sum(dim=(1, 2, 3)).clamp_min(1)
+        if self.zero_l1_weight > 0:
+            per_sample = per_sample + self.zero_l1_weight * per_zero_l1
         loss = per_sample.mean()
         if self.check_finite:
             valid = torch.stack([torch.isfinite(loss), torch.isfinite(composed["candidate_sfr_map_physical"]).all(),
@@ -151,13 +158,16 @@ class CellSFRLoss(nn.Module):
                 raise FloatingPointError("逐格损失非有限或 Y/B 非法；不以 clamp/nan_to_num 隐藏问题。")
         return loss, {"cell_loss": per_cell.mean(), "total_sfr_loss": per_total.mean(),
                       "negative_penalty": per_negative.mean(), "candidate_loss": per_candidate.mean(),
-                      "per_sample_loss": per_sample, **composed}
+                      "zero_l1_loss": per_zero_l1.mean(), "per_sample_loss": per_sample, **composed}
 
     def loss_contract(self):
         """保存权重、尺度、归约和单位；它们不能从旧标量 objective 静默继承。"""
         c, cell, total = self.scales.detach().cpu().tolist()
         w_total, w_neg, w_candidate = self.weights.detach().cpu().tolist()
-        return {"schema_name": "macnet_cell_sfr_loss", "schema_version": 2,
+        return {"schema_name": "macnet_cell_sfr_loss", "schema_version": 3,
+                "zero_l1_weight": self.zero_l1_weight,
+                "zero_l1_definition": "mean_snapshot(sum(where(Y==0,abs(prediction)/cell_scale,0))/max(count(Y==0),1))",
+                "zero_l1_mask": "exact_target_zero", "zero_l1_no_zero_snapshot": 0,
                 "objective": "signed_closure", "loss_space": "physical_sfr",
                 "closure_transform": "signed_asinh", "closure_scale": c,
                 "cell_scale": cell, "total_scale": total, "total_weight": w_total,

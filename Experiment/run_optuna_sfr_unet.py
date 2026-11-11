@@ -27,7 +27,7 @@ CATEGORICAL = {"batch_size": [32, 64, 128, 256], "base_ch": [16, 32, 64],
                "p_drop": [0., .1, .2, .3], "bottleneck_depth": [1, 2],
                "pos_num_bands": [2, 4, 8], "pos_max_freq": [2., 4., 8., 16.],
                "se_reduction": [4, 8, 16], "total_weight": [0., .3, 1., 3.], "negative_weight": [.3, 1., 3.],
-               "candidate_weight": [.1, .3, 1.]}
+               "candidate_weight": [.1, .3, 1.], "zero_l1_weight": [0., .01, .03, .1, .3, 1.]}
 LOG_RANGES = {"lr": [1e-5, 3e-3], "weight_decay": [1e-7, 1e-3]}
 
 

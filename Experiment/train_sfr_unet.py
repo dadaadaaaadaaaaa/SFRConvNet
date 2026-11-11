@@ -61,6 +61,7 @@ class TrainConfig:
     negative_weight: float = 1.0
     output_constraint: str = "none"  # relu：在训练内投影最终 SFR，候选值仍可负。
     candidate_weight: float = 0.0  # relu 模式必须显式设置正辅助权重。
+    zero_l1_weight: float = 0.0  # 真实零格子的最终SFR L1，默认关闭。
     amp: str = "none"
     tensorboard: bool = True
     resume: str = ""
@@ -87,7 +88,7 @@ class TrainConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} 必须为有限正数。")
-        for name in ("weight_decay", "total_weight", "negative_weight", "candidate_weight"):
+        for name in ("weight_decay", "total_weight", "negative_weight", "candidate_weight", "zero_l1_weight"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} 必须为有限非负数。")
@@ -311,7 +312,8 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
     objective = CellSFRLoss.from_scale_contract(bundle.scales, total_weight=config.total_weight,
                                                negative_weight=config.negative_weight,
                                                output_constraint=config.output_constraint,
-                                               candidate_weight=config.candidate_weight).to(device)
+                                               candidate_weight=config.candidate_weight,
+                                               zero_l1_weight=config.zero_l1_weight).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     warmup = math.ceil(config.epochs * config.warmup_ratio)
     def schedule(epoch):
@@ -356,7 +358,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
         writer = SummaryWriter(str(output / "tensorboard"), purge_step=start+1 if start else None)
     print(f"SFRUNet: objective=signed_closure; loss_space=physical_sfr; conditioning=none; device={device}")
     print(f"Output constraint={config.output_constraint}; candidate_weight={config.candidate_weight}; "
-          f"effective negative_weight={objective.loss_contract()['negative_weight']}; selection excludes candidate loss")
+          f"zero_l1_weight={config.zero_l1_weight}; effective negative_weight={objective.loss_contract()['negative_weight']}; selection excludes candidate/zero L1 loss")
     print(f"Input channels: {ds.input_channels}; shape={ds.spatial_shape}; scales={bundle.scales['closure_scale']:.6g},"
           f"{bundle.scales['cell_scale']:.6g},{bundle.scales['total_scale']:.6g}; CPU threads={torch.get_num_threads()}")
     print(f"Output: {output}", flush=True)
@@ -369,6 +371,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
             begin = time.perf_counter()
             model.train()
             sums = torch.zeros(5, device=device, dtype=torch.float64)
+            zero_l1_sum = torch.zeros((), device=device, dtype=torch.float64)
             lr = optimizer.param_groups[0]["lr"]
             for indices in batch_indices(len(ds), config.batch_size, shuffle=True):
                 x, coord, b, y = move_batch(ds, indices, device)
@@ -386,6 +389,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                 optimizer.step()
                 sums += torch.stack([loss.detach(), detail["cell_loss"].detach(), detail["total_sfr_loss"].detach(),
                                      detail["negative_penalty"].detach(), detail["candidate_loss"].detach()]) * len(indices)
+                zero_l1_sum += detail["zero_l1_loss"].detach() * len(indices)
             validation, _ = evaluate(model, bundle.datasets["val"], objective, bundle.scales, device=device,
                                      batch_size=config.batch_size, amp=config.amp)
             score = validation["model"]["macro_joint_score"]
@@ -398,6 +402,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                 stale += 1
             scheduler.step()
             row = {"epoch": epoch+1, "train_loss": (sums / len(ds)).cpu().tolist(), "val": validation,
+                   "train_zero_l1_loss": float((zero_l1_sum / len(ds)).cpu()),
                    "score": score, "lr": lr, "seconds": time.perf_counter()-begin}
             history.append(row)
             checkpoint = {"schema": "macnet_sfr_unet_checkpoint_v1", "hpo": hpo,
@@ -417,6 +422,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                 for key, value in zip(("total", "cell", "global", "negative", "candidate"), row["train_loss"]):
                     writer.add_scalar(f"train/{key}", value, epoch+1)
                 writer.add_scalar("val/macro_joint", score, epoch+1)
+                writer.add_scalar("train/zero_l1", row["train_zero_l1_loss"], epoch+1)
                 for group, metrics in validation["model"]["per_run"].items():
                     for key in ("cell_rmse", "total_rmse", "total_mae", "negative_fraction"):
                         writer.add_scalar(f"val/{group}/{key}", metrics[key], epoch+1)
