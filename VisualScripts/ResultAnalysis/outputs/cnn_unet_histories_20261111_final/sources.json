@@ -1,0 +1,83 @@
+{
+  "sources": {
+    "fiducial": {
+      "CNN": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050",
+      "UNet": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
+      "matched_N": 8429,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 1.965716091234526e-06
+    },
+    "fiducial4": {
+      "CNN": "Exp2_LOOfiducial4_NoAug_20260817_172856",
+      "UNet": "Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3",
+      "matched_N": 8770,
+      "cnn_extra_N": 46,
+      "max_truth_difference": 1.0042303685509069e-05,
+      "legacy_time_mapping": {
+        "mode": "segmented_restart_absolute",
+        "index_zero_time": 0.0,
+        "positive_index_offset": 0.5625,
+        "segment_cycle_size": 999,
+        "extra_time_steps_per_segment": 1
+      },
+      "legacy_index_min": 0,
+      "legacy_index_max": 9531,
+      "comparison": "Historical CNN: 3 runs, 8 channels, direct SFR; UNet: 5 runs, 12 channels, cell-supervised closure. Not an architecture-only ablation."
+    },
+    "fiducial7": {
+      "CNN": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202",
+      "UNet": "Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351",
+      "matched_N": 7025,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 5.383651384249788e-06
+    },
+    "model075": {
+      "CNN": "Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906",
+      "UNet": "Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d",
+      "matched_N": 954,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 3.6712515338876983e-06,
+      "comparison": "Historical CNN; training cache and normalization differ from UNet."
+    },
+    "fiducial_trial7_supplement": {
+      "CNN": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial7_seed42_20261025_180348",
+      "UNet": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
+      "matched_N": 8429,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 1.965716091234526e-06
+    }
+  },
+  "sha256": {
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\summary.json": "105542df20faf7556626a75c3d10c6049d553a6aa91c464fb3e754f17e470fde",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\contract.json": "52c216770bd277594eee9097e1afafe14dd9e3ca7793e2e3c404562c72e3c141",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\out_predictions.pt": "469c35437b0ebfc56fadf25d86a02b3b7b8cd0cabc4bdd10dd78e6f3e4d1368d",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050\\held_out_test_predictions.csv": "3a1d319ba0bf3202a75e074dac6c26e146b0c31b9bdaf10282dd1c43c6cecb0b",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050\\hyperparameters.json": "a9bca14eb397393bde97ff00acde857dce8f4b303e88182343b931cf5cfeb4e7",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\summary.json": "c8761e7b9a44a2f2f3f169253cf312e7f26cbe7b63b9abbdafef308a4c7198b6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\contract.json": "a8450e0ab43a43cb541b03a7a2b7971240d8f93aa0337b5266d3a3b3ad7175e6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\split_manifest.json": "77925556287e14e8097750c31bd84a0f9d312148c77c916386f80e3835f21505",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\out_predictions.pt": "e4b074de2e9efbf9e2080a8dd2e226042bba67649d48760503839647fdaa79d4",
+    "Results\\Exp2_LOOfiducial4_NoAug_20260817_172856\\held_out_test_predictions.csv": "c6996c5e44b8d3e02ab1fd257dac8fc04b1dc4ca9c9bae6417364bc3eab997a1",
+    "Results\\Exp2_LOOfiducial4_NoAug_20260817_172856\\hyperparameters.json": "3436dd0accf5e4d99ae04351fd1806f502b27c1a1337873eeaa1e4d7272be97f",
+    ".config\\RawDataConfig.json": "149a7640dcbab58e4df577acc878863d5cc85ebb15ef2edd47535bfe9b335505",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\summary.json": "66f7f691a48fd64aa2c630baee86316a554960f3cc36d4f72af65ea78e648b21",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\contract.json": "2736b5ec51883ba9aa65301c8ef82409dd30a61b6faa4b3c9e04b85ee83bbcdd",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\split_manifest.json": "ebc285cde9d4d632b50dd60d144e91dc249c44360a452848a6ac7586843c9983",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\out_predictions.pt": "1c990da05f783fe9b4e18d19f08665606153a4492297a8cbef950101f8c8bdb4",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202\\held_out_test_predictions.csv": "526c7d8adfa9a2d5fedacadb00ae240dce3ff7b210396715cebad6c5f94dbe8b",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202\\hyperparameters.json": "ec5b47c356f55634fc6ce4fcec983fc1125edff86087b6ec6e0d2f4eb8af3185",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\summary.json": "d7f7d329f75cf04adbfdc6717346598b2fdf67e4a5e957b9f9d7a7ce72794b5a",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\contract.json": "f4f158c8d43a9f1e64729496074309bb4239280befcefd31f6ff7f53a03cb623",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\split_manifest.json": "f0e5a85a7f15914134104f3b1ebc7dc942192718abdee383242b146dd2d658ad",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\out_predictions.pt": "25f48ed64fe90e0638c21b8db36c7967c96cf89843e8086ecef490fe717de69d",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906\\held_out_test_predictions.csv": "063f15cfb4288b7829c6093ba218a7ebed21bd2600aa539b072d7519d8c89f76",
+    "Results\\Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906\\hyperparameters.json": "99971bf815747d2ca6f882c590e149999a1282aba65f6bc3d4c30bf1fd4101f9",
+    "Results\\Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial7_seed42_20261025_180348\\held_out_test_predictions.csv": "279e0e063ec5cd09152e84f786e918a238c211ad100c651e808712ba32feac3f",
+    "VisualScripts\\ResultAnalysis\\plot_cnn_unet_histories.py": "b4b06c41d501f1bdd9072e5d6d662ceec2630f6baa468e9e05154c2a048cdc6d"
+  },
+  "units": "Msun/yr; all plotted CSV SFR values multiplied by 0.025",
+  "axes": "Absolute snapshot Gyr; x=[0.5,12.5]; each pair shares y-limits, ticks, scale; per-row y ranges differ between galaxies",
+  "handling": "No smoothing, clipping or downsampling; gaps >5*median cadence are broken and shaded; only shared UNet snapshots plotted",
+  "scale": "Main linear; supplementary symlog with linthresh=0.1 Msun/yr"
+}
