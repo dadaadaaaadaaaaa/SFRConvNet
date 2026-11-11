@@ -15,7 +15,9 @@ Exp2_LOOfiducial4_NoAug_20260817_172856；Fiducial7 CNN Trial68；Model0.75 CNN�
 每组左CNN右UNet，共用横纵坐标。横轴统一snapshot绝对时间0.5–12.5 Gyr；
 纵轴使用同组真值和两模型的联合范围加7%边距，不截断峰值。
 不同星系各自行使纵轴范围，四行汇总图只在每行左右共享纵轴。
-主图为线性坐标，补充symlog图共同采用0.1 Msun/yr线性阈值。
+按用户参考图，主图为symlog坐标，共同采用1e-4 Msun/yr线性阈值，保留零点及10的幂次刻度；另存线性图。
+黑色为真值、红色为各模型、绿色为MACER-LR baseline。两侧使用同一份UNet正式导出的权威物理baseline；
+历史CNN的KS baseline定义不同，不混用为MACER-LR baseline。
 所有图均导出PNG（220 dpi）、矢量PDF和SVG；不平滑、不抽稀。
 大于5倍中位cadence的缺口断线并着灰，不把缺失区间连接为已预测轨迹。
 
@@ -30,4 +32,4 @@ Fiducial4历史CNN是3-run、8通道、直接SFR，UNet是5-run、12通道、逐
 Model0.75历史CNN训练cache与归一化也不同。图只比较已有实验性能，不能称为纯架构消融。
 即使其他折同粗数据，监督信息和优化设置也不同。
 
-本次成品位于outputs/cnn_unet_histories_20261111_final。
+最新含baseline成品位于outputs/cnn_unet_histories_baseline_20261111；此前不含baseline版本保留。

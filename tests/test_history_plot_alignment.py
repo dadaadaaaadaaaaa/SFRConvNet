@@ -15,10 +15,11 @@ class HistoryAlignmentTests(unittest.TestCase):
 
     def test_legacy_alignment_checks_truth_and_shared_frames(self):
         cnn=pd.DataFrame(dict(time=[0.,.62,.62125],Y=[0.,2.,3.],P=[1.,2.,4.]))
-        unet=pd.DataFrame(dict(time=[.62125,.62],Y=[3.,2.],P=[3.,2.]))
+        unet=pd.DataFrame(dict(time=[.62125,.62],Y=[3.,2.],P=[3.,2.],B=[.3,.2]))
         paired,audit=align_predictions(cnn,unet,legacy=True)
         self.assertEqual(audit['cnn_extra_N'],1)
         self.assertEqual(paired.CNN.tolist(),[2.,4.])
+        np.testing.assert_allclose(paired.Baseline,[.2,.3])
         cnn.loc[1,'Y']=99.
         with self.assertRaises(ValueError):align_predictions(cnn,unet,legacy=True)
 
