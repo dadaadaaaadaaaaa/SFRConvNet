@@ -1,0 +1,59 @@
+{
+  "sha256": {
+    "VisualScripts\\ResultAnalysis\\outputs\\cnn_unet_histories_baseline_20261111\\metrics.csv": "e43a6923e0cb6af65637c49089c60bd433d12befb9c4314ee8c17ffb743e4e1e",
+    "VisualScripts\\ResultAnalysis\\outputs\\cnn_unet_histories_baseline_20261111\\sources.json": "3691dccb219503e75e3a9c0239c6e69fabeb47cf2ebdf9c30c163914c4ceaafb",
+    "VisualScripts\\ResultAnalysis\\plot_cnn_unet_statistics.py": "429932aa1e814e8641697f9d79c10b8ef90e84bcf06d9031fae8dde82aca2b1a"
+  },
+  "model_sources": {
+    "fiducial": {
+      "CNN": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial43_seed42_20261025_224050",
+      "UNet": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
+      "matched_N": 8429,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 1.965716091234526e-06
+    },
+    "fiducial4": {
+      "CNN": "Exp2_LOOfiducial4_NoAug_20260817_172856",
+      "UNet": "Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3",
+      "matched_N": 8770,
+      "cnn_extra_N": 46,
+      "max_truth_difference": 1.0042303685509069e-05,
+      "legacy_time_mapping": {
+        "mode": "segmented_restart_absolute",
+        "index_zero_time": 0.0,
+        "positive_index_offset": 0.5625,
+        "segment_cycle_size": 999,
+        "extra_time_steps_per_segment": 1
+      },
+      "legacy_index_min": 0,
+      "legacy_index_max": 9531,
+      "comparison": "Historical CNN: 3 runs, 8 channels, direct SFR; UNet: 5 runs, 12 channels, cell-supervised closure. Not an architecture-only ablation."
+    },
+    "fiducial7": {
+      "CNN": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_7_Trial68_seed42_20261026_125202",
+      "UNet": "Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351",
+      "matched_N": 7025,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 5.383651384249788e-06
+    },
+    "model075": {
+      "CNN": "Exp2_Rh12x20_FiveRuns_Closure_LOO_Model075_Trial53_Final_20260913_004906",
+      "UNet": "Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d",
+      "matched_N": 954,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 3.6712515338876983e-06,
+      "comparison": "Historical CNN; training cache and normalization differ from UNet."
+    },
+    "fiducial_trial7_supplement": {
+      "CNN": "Exp2_Rh12x20_Closure_v7_LOO_Fiducial_Trial7_seed42_20261025_180348",
+      "UNet": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
+      "matched_N": 8429,
+      "cnn_extra_N": 0,
+      "max_truth_difference": 1.965716091234526e-06
+    }
+  },
+  "units": "MAE/RMSE/Bias: Msun/yr; relative error: nonzero true Y only; plot percentages multiply by 100",
+  "comparison": "Exact same models and matched snapshots as the preceding SFR history plots",
+  "uncertainty": "Descriptive point estimates for fixed models; adjacent frames are correlated; no significance or seed uncertainty estimated",
+  "definitions": "Bias=mean(prediction-truth); R2 relative change is not used; error_reduction only for positive error metrics"
+}
