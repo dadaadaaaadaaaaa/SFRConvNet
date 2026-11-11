@@ -1,0 +1,25 @@
+{
+  "sources": {
+    "VisualScripts\\DataAnalysis\\analyze_cold_dense_closure.py": "5e056fa9cf2cd3c558489764ac0a5a1d4bb5dea82feed0a03ecc31ddc11c2230",
+    "VisualScripts\\ResultAnalysis\\outputs\\closure_comparison_20261111_verified\\predictions_and_references.csv.gz": "411ca97524760f937873ae51f456fffc2010be9be8332198008b5725cad81191",
+    "VisualScripts\\ResultAnalysis\\outputs\\closure_comparison_20261111_verified\\method.json": "d8f2b33a8c1bd4bdc5cc4c348e6f856dbfefbe1a6d62ab7930a03882a6545a42",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\fiducial_snapshots.parquet": "ec2126e62f994c82292383cfb6e09174604a704cad8944e45ac9172430d624f1",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\fiducial_4_snapshots.parquet": "aeedca9bb64faae084b9ad2fef492df4686efb1f5ad2169c3e8611a9de3a2c13",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\fiducial_7_snapshots.parquet": "8efb7551ab8f3e8b21f2386489ead757be9c35c1b4151bdba49582bcc4018c8d",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\model_0_75_snapshots.parquet": "7bc6769acc56f937875eeadd56a928d043b6b5cf1e914d261a02951308270320",
+    "VisualScripts\\DataAnalysis\\outputs\\sf_timescales_20261111\\model_1_1_snapshots.parquet": "53f040b7f6ede5fd2337da18c60481f5bf05e3754f83cb4052c3f8292d9f5a6f",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_train.pt": "d32f5b5e31c5d52b10df46be2000c99433d0d75edcb63de12f1881295a1974ac",
+    ".cache\\Exp2_Rh12x20_UNet_Model075_v7_Closure_LOO_disk_galaxy_model_0_75_train.pt": "804ac996c361b8e4c96a61ca4fe6e309344d23c47fa08917294adc877f506a1e",
+    ".cache\\Exp2_Rh12x20_FiveRuns_Closure_v7_LOO_disk_galaxy_fiducial_7_train.pt": "f02031e43a7396f2ee7e83150a74052d7bcdc6c323632a427803c02755ef8729"
+  },
+  "N": 26132,
+  "threshold": "T<4e4 K; 1.02*rho>1",
+  "regions": [
+    "whole domain",
+    "r<30 kpc"
+  ],
+  "units": "mass: code mass (2.5e7 Msun); density moment: sqrt(code density); Sff: Msun/yr",
+  "decomposition": "Symmetric three-factor product Shapley; descriptive, not causal",
+  "checks": "15-frame smoke; positive volumes; mass conservation; source parent/time/Y; prediction Y/time; exact product and decomposition; actual train SHA256",
+  "limitations": "raw HR cell SFR unavailable; Y remains true aggregate; Sff is diagnostic; zero eligible mass has q=0 by convention; changing aperture changes factor contributions"
+}
