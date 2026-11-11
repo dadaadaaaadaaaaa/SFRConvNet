@@ -80,7 +80,10 @@ def draw_row(axes,f,title,scale):
 
 def save(fig,base):
     for suffix in ['png','pdf','svg']:
-        fig.savefig(base.with_suffix('.'+suffix),dpi=220)
+        path=base.with_suffix('.'+suffix)
+        fig.savefig(path,dpi=220)
+        if suffix=='svg':
+            path.write_text('\n'.join(line.rstrip() for line in path.read_text(encoding='utf-8').splitlines())+'\n',encoding='utf-8')
     plt.close(fig)
 
 
