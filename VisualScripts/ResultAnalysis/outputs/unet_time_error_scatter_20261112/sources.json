@@ -1,0 +1,147 @@
+{
+  "sha256": {
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\out_predictions.pt": "469c35437b0ebfc56fadf25d86a02b3b7b8cd0cabc4bdd10dd78e6f3e4d1368d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\contract.json": "52c216770bd277594eee9097e1afafe14dd9e3ca7793e2e3c404562c72e3c141",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\summary.json": "105542df20faf7556626a75c3d10c6049d553a6aa91c464fb3e754f17e470fde",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\split_manifest.json": "8a4a074dabebe3e77f763ca331928901baad588fd8af6cbca8bf20c2fdc8c14d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\analysis_sfr_unet_20261110_140345_b48a71\\out_predictions.csv": "af2c91146604539a31e99a2761d1e93d2935fff5824205132e48390151d47ba6",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\analysis_sfr_unet_20261110_140345_b48a71\\analysis.json": "ff5ea2e7d55879a1f3746feeac275cd3c368b7e3e2b70a8cc04cce3d579ed1b4",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\analysis_sfr_unet_20261110_140345_b48a71\\out_disk_galaxy_fiducial\\scatter_and_cell_error.png": "e77c738f56720f94df187f31841ef0941b0874ca28f4fcb7de1090eea0c4ec6d",
+    "Results\\Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2\\analysis_sfr_unet_20261110_140345_b48a71\\out_disk_galaxy_fiducial\\sfr_history.png": "d14c4da6f88bda2e8f206dcc31349a0af1592cdb78af17f1cc8e9581c16cf219",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\out_predictions.pt": "e4b074de2e9efbf9e2080a8dd2e226042bba67649d48760503839647fdaa79d4",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\contract.json": "a8450e0ab43a43cb541b03a7a2b7971240d8f93aa0337b5266d3a3b3ad7175e6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\summary.json": "c8761e7b9a44a2f2f3f169253cf312e7f26cbe7b63b9abbdafef308a4c7198b6",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\split_manifest.json": "77925556287e14e8097750c31bd84a0f9d312148c77c916386f80e3835f21505",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\analysis_sfr_unet_20261111_182713_92d23b\\out_predictions.csv": "fddc04b1045a4627e3e9d2c77a430756a5a26b965047b05cdbf96347dd50b0dd",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\analysis_sfr_unet_20261111_182713_92d23b\\analysis.json": "c2a4025705663fde3aa8a70ffd18728b3a81136d587096b5eef1fd721960aedf",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\analysis_sfr_unet_20261111_182713_92d23b\\out_disk_galaxy_fiducial_4\\scatter_and_cell_error.png": "1417a53b51dde9982a37e99bdb14f090342d1df45360dfbc96eaad84c399ca8b",
+    "Results\\Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3\\analysis_sfr_unet_20261111_182713_92d23b\\out_disk_galaxy_fiducial_4\\sfr_history.png": "6e28be52a168198999dd4dead403157b97d752e8982720e19b18824b047e1c8e",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\out_predictions.pt": "1c990da05f783fe9b4e18d19f08665606153a4492297a8cbef950101f8c8bdb4",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\contract.json": "2736b5ec51883ba9aa65301c8ef82409dd30a61b6faa4b3c9e04b85ee83bbcdd",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\summary.json": "66f7f691a48fd64aa2c630baee86316a554960f3cc36d4f72af65ea78e648b21",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\split_manifest.json": "ebc285cde9d4d632b50dd60d144e91dc249c44360a452848a6ac7586843c9983",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\analysis_sfr_unet_20261110_033819_005bb4\\out_predictions.csv": "1ef70441243259981bea8b97e6168a2f40674eaa946d0f3aae3bb626a9b44754",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\analysis_sfr_unet_20261110_033819_005bb4\\analysis.json": "e239016928341fbc1167a29ea3711b778437ecd87d0584141347575408155b37",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\analysis_sfr_unet_20261110_033819_005bb4\\out_disk_galaxy_fiducial_7\\scatter_and_cell_error.png": "fccbb3fa8b861d8c1d453b99203746a774e1703423aefce8eac726c61aa2e375",
+    "Results\\Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351\\analysis_sfr_unet_20261110_033819_005bb4\\out_disk_galaxy_fiducial_7\\sfr_history.png": "87ce42b40856fd5d786d19d85ee1a80a24d7336738616e633287fb91cb02ee03",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\out_predictions.pt": "25f48ed64fe90e0638c21b8db36c7967c96cf89843e8086ecef490fe717de69d",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\contract.json": "f4f158c8d43a9f1e64729496074309bb4239280befcefd31f6ff7f53a03cb623",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\summary.json": "d7f7d329f75cf04adbfdc6717346598b2fdf67e4a5e957b9f9d7a7ce72794b5a",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\split_manifest.json": "f0e5a85a7f15914134104f3b1ebc7dc942192718abdee383242b146dd2d658ad",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\analysis_sfr_unet_20261109_170220_dc6eab\\out_predictions.csv": "beb9fcf1172e387546fedd78aa14391a7ee62cb663fa366c8af3c3ebe4d80303",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\analysis_sfr_unet_20261109_170220_dc6eab\\analysis.json": "f530c6e786f4b9d5d2c2aefc5cbdf4be10a03235da9f14392d3de6acdd30d0e7",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\analysis_sfr_unet_20261109_170220_dc6eab\\out_disk_galaxy_model_0_75\\scatter_and_cell_error.png": "3cc6ebb6e57aeacdfe978103ad646e058b4b32c40dace49cf69d3db3483057bb",
+    "Results\\Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d\\analysis_sfr_unet_20261109_170220_dc6eab\\out_disk_galaxy_model_0_75\\sfr_history.png": "921ab68c3e3e8b2571f2a23052a256b519cbee0ebe1fbe6db0ec61ab01cf0ef7",
+    "VisualScripts\\ResultAnalysis\\plot_unet_residual_scatter.py": "9d18a55844f1d995959e114479c4a69e0e3b064f5466f4928f7e76c240fb3d09"
+  },
+  "experiments": {
+    "fiducial": {
+      "result_dir": "Exp2_LOO_Fiducial_SFRUNet_ReLU_Candidate1_seed43_20261107_041950_b08b68f2",
+      "analysis_dir": "analysis_sfr_unet_20261110_140345_b48a71",
+      "N": 8429,
+      "scatter_xlim": [
+        -1.703904955699775,
+        35.782004069695276
+      ],
+      "signed_error_xlim": [
+        0.0266249999999999,
+        13.080875
+      ],
+      "signed_error_ylim": [
+        -14.768094831499024,
+        11.293996014276894
+      ],
+      "predicted_sfr_ylim": [
+        -1.703904955699775,
+        35.782004069695276
+      ]
+    },
+    "fiducial4": {
+      "result_dir": "Exp2_LOO_Fiducial4_SFRUNet_ReLU_Candidate1_Final_20261111_175216_a6a6b5c3",
+      "analysis_dir": "analysis_sfr_unet_20261111_182713_92d23b",
+      "N": 8770,
+      "scatter_xlim": [
+        -2.2330030084658476,
+        46.8930631777828
+      ],
+      "signed_error_xlim": [
+        0.0266249999999999,
+        13.080875
+      ],
+      "signed_error_ylim": [
+        -28.414076542476764,
+        6.402112307533236
+      ],
+      "predicted_sfr_ylim": [
+        -2.2330030084658476,
+        46.8930631777828
+      ]
+    },
+    "fiducial7": {
+      "result_dir": "Exp2_LOO_Fiducial7_SFRUNet_ReLU_Candidate1_Final_20261110_031212_9b4f1351",
+      "analysis_dir": "analysis_sfr_unet_20261110_033819_005bb4",
+      "N": 7025,
+      "scatter_xlim": [
+        -4.217919875191365,
+        88.57631737901866
+      ],
+      "signed_error_xlim": [
+        0.0266249999999999,
+        13.080875
+      ],
+      "signed_error_ylim": [
+        -58.90258938805054,
+        6.954103262952149
+      ],
+      "predicted_sfr_ylim": [
+        -4.217919875191365,
+        88.57631737901866
+      ]
+    },
+    "model075": {
+      "result_dir": "Exp2_LOO_Model075_SFRUNet_ReLU_Candidate1_Final_20261109_142102_519eb27d",
+      "analysis_dir": "analysis_sfr_unet_20261109_170220_dc6eab",
+      "N": 954,
+      "scatter_xlim": [
+        -2.7039369414374237,
+        56.7826757701859
+      ],
+      "signed_error_xlim": [
+        -0.020625000000000004,
+        13.083125
+      ],
+      "signed_error_ylim": [
+        -36.148725614545484,
+        8.868953288875574
+      ],
+      "predicted_sfr_ylim": [
+        -2.7039369414374237,
+        56.7826757701859
+      ]
+    }
+  },
+  "parameters": {
+    "scatter_size": 5,
+    "scatter_alpha": 0.5,
+    "colors": [
+      "tab:blue",
+      "tab:orange"
+    ],
+    "scale": "linear",
+    "zero_line_width": 0.6,
+    "identity_line": "gray dashed",
+    "dpi": 150,
+    "layout": "signed error above; predicted SFR below",
+    "residual_x": "time",
+    "signed_error": "prediction - true SFR",
+    "single_figure_inches": [
+      6.5,
+      8
+    ],
+    "height_ratio": [
+      1,
+      2
+    ]
+  },
+  "handling": "all out frames; no binning/smoothing/clipping; original physical units Msun/yr; time residual preserves original history curves and gap shading"
+}
