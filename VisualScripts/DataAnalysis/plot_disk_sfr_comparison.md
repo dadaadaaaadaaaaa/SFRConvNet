@@ -20,6 +20,8 @@ Model0.25 尚未登记在当前 RawDataConfig 中。本脚本仅为绘图使用
 `symlog(linthresh=1e-4)`，保留零值；不平滑、不插值，超过正常 cadence
 1.5 倍的时间间隔断线。Fiducial 组与 Model 组原始采样间隔不同，比较高频
 起伏时应注意该差异。图表示模拟存储的全网格瞬时 SFR，不是累计恒星质量。
+样式参考用户提供的 sSFR 图：仅显示细实线、不显示点标记，保留完整坐标边框、
+浅色虚线网格和右上角双列图例；纵轴仍为本任务的 SFR。Model0.25 使用棕色。
 
 ```powershell
 $env:MPLBACKEND = 'Agg'

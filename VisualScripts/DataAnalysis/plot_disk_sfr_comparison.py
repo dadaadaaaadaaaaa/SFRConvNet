@@ -132,9 +132,9 @@ def load_sfr(configs):
 
 def plot_comparison(frame):
     """保留零 SFR，并在缺帧或初始化至正式运行的时间跳跃处断线。"""
-    plt.rcParams.update({'font.size': 12, 'axes.spines.top': False, 'axes.spines.right': False})
-    fig, axis = plt.subplots(figsize=(13, 6.5), layout='constrained')
-    colors = ('#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00', '#56B4E9')
+    plt.rcParams.update({'font.size': 12, 'axes.spines.top': True, 'axes.spines.right': True})
+    fig, axis = plt.subplots(figsize=(12, 6), layout='constrained')
+    colors = ('#1f77b4', '#ff7f0e', '#2ca02c', '#8c564b', '#ff0000', '#9467bd')
     for label, color in zip(LABELS.values(), colors):
         group = frame.loc[frame.label.eq(label)].sort_values('time_gyr')
         x, y = [], []
@@ -146,14 +146,13 @@ def plot_comparison(frame):
             x.append(row.time_gyr)
             y.append(row.sfr_msun_per_yr)
             previous = row.time_gyr
-        axis.plot(x, y, color=color, lw=0.65, alpha=0.85, label=label,
-                  marker='.', markersize=1.2, rasterized=True)
+        axis.plot(x, y, color=color, lw=0.8, alpha=0.9, label=label,
+                  linestyle='-', marker='None')
     axis.set_yscale('symlog', linthresh=1e-4, linscale=0.6)
     axis.set(xlabel='Simulation time [Gyr]', ylabel=r'SFR [$M_\odot\,\mathrm{yr}^{-1}$]',
-             title='Instantaneous SFR evolution of six disk-galaxy runs', xlim=(-0.05, 12.6))
+             title='SFR evolution: six disk galaxies', xlim=(-0.05, 12.6))
     axis.grid(True, which='major', ls='--', alpha=0.25)
-    fig.legend(*axis.get_legend_handles_labels(), ncol=6, loc='outside lower center',
-               fontsize=10, frameon=False)
+    axis.legend(ncol=2, loc='upper right', framealpha=0.8)
     return fig
 
 
