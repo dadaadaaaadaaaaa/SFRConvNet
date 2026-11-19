@@ -3277,3 +3277,25 @@ loss contract升级v3；权重参与config/恢复/HPO身份；prediction v2及�
 分析新增零格虚假正SFR与正格低估量的逐帧列和均值，可比较抑制背景与真实恒星形成损失。命令见Experiment/zero_l1_comparison.md。
 验证：python -m unittest tests.test_sfr_unet_zero_l1 tests.test_sfr_unet_nonnegative tests.test_sfr_unet_training tests.test_analyze_sfr_unet tests.test_sfr_unet -q，35项通过。覆盖手算、梯度、精确零/极小正值、无零格、默认兼容、单位、Exp2恢复、HPO导出、CUDA FP32/BF16及旧分析。
 未重建真实cache或开展正式训练，不登记Train_history；未验证新权重能改善泛化。
+
+## 2026-11-19：二维 hurdle 逐格 UNet 首次验收
+
+固定 R_h 复用逐格 Y/B/C sidecar。活动标签为保守归约 Y>0，baseline 只用于输出组合。
+直接强度和 baseline 辅助强度共用 UNet 主干与概率头；训练/输出契约、物理单位、阈值策略
+及服务器入口见 [训练说明](Experiment/train_sfr_unet.md#hurdle-双头训练与查看地图)。
+
+Fiducial 12×20 FiveRuns 原 split 内按 run 抽独立 UID，沿用原训练归一化。
+CUDA smoke 共 192/48/32/12 帧（train/val/test/out），base_ch=16、batch=16、seed=42，
+辅助 baseline 的三项版训练 6 轮，第 2 轮暂停后从 last.pt 恢复，验证最佳为第 5 轮。
+参考历史 ReLU+zero-L1=0.1 的 best.pt，在相同 48 个 val 帧实测 525/10380 真零格误报，
+将此目标误报率传给 smoke，得到 τ=0.22736867596772822。阈值冻结后导出 test/out。
+导出回读检查概率、双图组合与总和、单位、UID、两套 closure；两组逐帧硬图误差分解
+的最大舍入残差小于 9e-15 Msun/yr。抽帧结果只用于端到端验收。
+
+旧单头按同一批输入比较本次与修改前实现，48 张验证图及 12 张 out 图逐元素一致。
+以历史 batch=32 和原缓存顺序重放 12 张 out，逐元素复现历史预测。
+回归命令使用 python -m unittest，模块为 tests.test_hurdle_sfr、tests.test_sfr_unet、
+tests.test_sfr_unet_training、tests.test_sfr_unet_nonnegative、tests.test_sfr_unet_zero_l1、
+tests.test_analyze_sfr_unet、tests.test_cell_sfr_supervision 和 tests.test_spatial_coarsening_module。
+共 51 项通过，涵盖零值、损失梯度、旧模型/新模型恢复、投影、缓存契约、HDF5 与粗粒化守恒。
+尚未进行正式训练、跨种子/跨银河比较或生产模拟验证。

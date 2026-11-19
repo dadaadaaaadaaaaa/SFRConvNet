@@ -1,6 +1,6 @@
 # train_sfr_unet.py：逐格训练核心（Exp1/Exp2）
 
-本脚本训练独立 `SFRUNet`，**固定为 signed-closure、物理空间逐格 MSE**。
+本脚本训练独立 `SFRUNet`，默认单头 signed-closure，也支持逐格 hurdle 双头。
 原 `train.py/models.py` 的标量 Direct/Closure 流程不变。当前不接受 Exp3 或其他实验策略。
 先阅读 [SFRUNet.md](SFRUNet.md) 和研究计划 2026-11-03 记录。
 
@@ -29,7 +29,43 @@
 `cell_exp` 默认等于 `data_exp`，附加文件目录默认等于 `cache_dir`。文件名中的前缀应含最后的下划线。
 **旧 scalar cache 单独不够，需要逐格 sidecar；不必重新 split 或标准化。**
 原 scalar cache 可以是 Direct 或 Closure，但必须包含完整物理 Y/B/C。
-新模型的 objective 不随原 cache 的 prepared_objective 改变，始终为逐格 signed_closure。
+模型的 objective 由逐格训练配置决定。原 cache 的 prepared_objective 不决定输出模式。
+
+## Hurdle 双头训练与查看地图
+
+`--model-mode single` 为原单头。`hurdle_closure` 在解码器末级增加一个概率头，原幅度头产生
+`q=B+s_C*sinh(z)`。`hurdle_direct` 的幅度头直接输出无量纲分数。两者均读取整帧，
+发生标签为逐格物理 Y 严格大于零。baseline 只参与闭合组合和结果核验。
+
+令 s 为本折训练缓存正 Y 的中位数（含缓存内重复项，全部为零时取 1 code SFR）。
+闭合模式的正值强度为 s·softplus(q/s)，直接模式为 s·softplus(z)。
+softplus 的机器下限只用于避免浮点下溢为零。p 为发生分数的 sigmoid。
+期望图为 p·μ，硬图在 p≥τ 时取 μ，其余为零。预测 closure 为各自地图减去 B。
+两张图都按格直接求和，乘 0.025 转为太阳质量/年。
+
+训练损失为三项之和。分类项在全部格子上用普通 BCE，权重固定为 1。
+正格项只对批内 Y>0 的 (μ−Y)/cell_scale 求均方，空正格批次贡献零，
+权重 `--positive-weight` 默认 1。总量项对每帧 sum(p·μ−Y)/total_scale 求均方，
+`--total-weight 0` 可关闭。epoch 的正格误差按累计正格数归约。
+选模仍对各 run 等权，用期望图的固定物理分数。训练历史另记录验证 AP 和 Brier 分数。
+
+选定 best 后，在 val 真零格上选择满足目标误报率的硬门。相同概率一同处理，记录实际达到的误报率。
+`--hurdle-reference` 接受同一训练及验证缓存下训练的 ReLU+zero-L1 best.pt，
+使用其在 val 的严格正预测误报率。省略时使用 `--hurdle-target-fpr`（默认 0.05）。
+最终阈值、验证 UID 摘要、静态位置对照 AP 等在 calibration.json。test/out 复用该阈值。
+HPO 仅使用期望图验证分数。resume 仍从 last.pt 恢复。以下为服务器单折命令，
+从既有对照配置继承主干、优化器及调度参数，运行前准备相同 cache 和对应 checkpoint。
+
+```bash
+ref=Results/ZeroL1_Fiducial_AB/Exp2_LOO_Fiducial_UNet_ZeroL1_0.1_seed42_20261112_140244_fcab01bb
+python Experiment/run_train_sfr_unet.py --config "$ref/config.json" --model-mode hurdle_closure --output-constraint none --candidate-weight 0 --zero-l1-weight 0 --total-weight 1 --hurdle-reference "$ref/best.pt" --run-name Fiducial_Hurdle_Total1 --output-root Results/FiducialHurdle --device cuda
+python VisualScripts/ResultAnalysis/analyze_sfr_unet.py --result-dir <本次结果目录>
+```
+
+同一配置把 total-weight 改为 0、使用新 run-name，可比较两项版。预测格式
+`macnet_sfr_unet_hurdle_predictions_v1` 的 prediction_map/total 表示期望图，
+hard_map/total 表示硬图。分析目录包含逐帧误报、漏报、正确活跃区强度误差，
+以及真值、期望图、硬图、基线、条件强度、概率并排图。图轴为原粗格索引。
 
 入口检查实际运行名、metadata 声明、UID/parent 跨 split 隔离、地图摘要与标量总和、
 通道/形状/输入变换，以及 norm.npz 的 mean/std。norm.npz 随 checkpoint 保存；不重新估计输入统计。

@@ -37,7 +37,8 @@ def file_hash(path):
 def load_predictions(path, *, identity, expected_groups, expected_loss=None):
     """核对文件 schema、单位、逐格恒等式、总和、UID、运行及时间，不猜测旧标量格式。"""
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if (payload.get("schema") not in {"macnet_sfr_unet_predictions_v1", "macnet_sfr_unet_predictions_v2"}
+    hurdle = payload.get("schema") == "macnet_sfr_unet_hurdle_predictions_v1"
+    if ((not hurdle and payload.get("schema") not in {"macnet_sfr_unet_predictions_v1", "macnet_sfr_unet_predictions_v2"})
             or payload.get("units") != "MACER_mass_code/Gyr" or payload.get("to_msun_per_yr") != SFR_FACTOR):
         raise ValueError("预测 schema/单位不匹配。")
     result = {k: array(payload[k]).astype(np.float64) for k in
@@ -57,7 +58,26 @@ def load_predictions(path, *, identity, expected_groups, expected_loss=None):
         raise ValueError("未知输出约束。")
     if expected_loss is not None and constraint != expected_loss.get("output_constraint", "none"):
         raise ValueError("预测输出约束与训练 loss 契约不一致。")
-    if payload["schema"] == "macnet_sfr_unet_predictions_v2":
+    if hurdle:
+        if (payload.get("prediction_definition") != "mean"
+                or payload.get("loss_contract", {}).get("schema_name") != "macnet_hurdle_cell_loss"
+                or (expected_loss is not None and payload["loss_contract"] != expected_loss)):
+            raise ValueError("hurdle 输出与训练契约不符。")
+        for key in ("probability_map", "amount_map", "hard_map", "hard_closure_map"):
+            result[key] = array(payload[key]).astype(np.float64)
+            if result[key].shape != shape or not np.isfinite(result[key]).all():
+                raise ValueError(f"{key} 形状或有限性不合法。")
+        p, amount, hard = (result[k] for k in ("probability_map", "amount_map", "hard_map"))
+        cal = payload["calibration"]
+        tau = cal["threshold"]
+        if (not np.isfinite(tau) or cal["source_split"] != "val" or cal["comparison"] != ">="
+                or ((p < 0) | (p > 1)).any() or (amount <= 0).any()
+                or not np.allclose(p*amount, result["prediction_map"], rtol=1e-12, atol=0)
+                or not np.array_equal(np.where(p >= tau, amount, 0), hard)
+                or not np.allclose(result["baseline_map"]+result["hard_closure_map"], hard, rtol=1e-10, atol=1e-10)):
+            raise ValueError("hurdle 双图物理恒等式错误。")
+        result["calibration"] = cal
+    elif payload["schema"] == "macnet_sfr_unet_predictions_v2":
         if "output_constraint" not in payload or payload.get("loss_contract", {}).get("output_constraint") != constraint:
             raise ValueError("v2 缺少一致的输出约束契约。")
         if expected_loss is not None and payload["loss_contract"] != expected_loss:
@@ -76,7 +96,7 @@ def load_predictions(path, *, identity, expected_groups, expected_loss=None):
         raise ValueError("v1 只支持旧无约束输出。")
     if constraint == "relu" and (result["prediction_map"] < 0).any():
         raise ValueError("relu 模式的最终 SFR 不得为负。")
-    for name in ("prediction", "target", "baseline"):
+    for name in (("prediction", "target", "baseline", "hard") if hurdle else ("prediction", "target", "baseline")):
         total = array(payload[name+"_total"]).reshape(-1)
         if total.shape != (shape[0],) or not np.isfinite(total).all() or not np.allclose(
                 total, result[name+"_map"].sum((1,2,3)), rtol=1e-10, atol=1e-10):
@@ -273,6 +293,8 @@ def plot_group(frame, directory, *, trajectory=None, burst_window=None, time_off
 
 
 def plot_maps(data,index,path):
+    if "hard_map" in data:
+        return plot_hurdle_maps(data, index, path)
     """仅索引网格，不伪装为真实等面积空间；统一色标比较逐格积分SFR。"""
     y,b,p=[data[name+"_map"][index,0]*SFR_FACTOR for name in ("target","baseline","prediction")]
     high=max(float(np.max(abs(x))) for x in (y,b,p)) or 1e-9
@@ -291,8 +313,31 @@ def plot_maps(data,index,path):
     save_figure(fig,path)
 
 
+def plot_hurdle_maps(data, index, path):
+    """同帧五张 SFR 图共用色标；概率图在线性 0–1 色标上标出冻结的阈值。"""
+    fig, axes = plt.subplots(2, 3, figsize=(13, 6.5), constrained_layout=True)
+    panels = (("target_map", "HR truth"), ("prediction_map", "Expected SFR"),
+              ("hard_map", "Hard-gated SFR"), ("baseline_map", "MACER-LR"),
+              ("amount_map", "SFR if active"), ("probability_map", "Probability of activity"))
+    peak = max(float(data[key][index].max()) * SFR_FACTOR for key, _ in panels[:-1])
+    peak = peak if peak > 0 else 1.
+    norm = SymLogNorm(linthresh=peak*1e-3, vmin=0, vmax=peak)
+    for axis, (key, title) in zip(axes.flat, panels):
+        values = data[key][index, 0]
+        if key == "probability_map":
+            im = axis.imshow(values, origin="lower", cmap="cividis", vmin=0, vmax=1)
+            title += f"  (gate ≥ {data['calibration']['threshold']:.3f})"
+            fig.colorbar(im, ax=axis, label="Probability")
+        else:
+            im = axis.imshow(values*SFR_FACTOR, origin="lower", cmap="magma", norm=norm)
+            fig.colorbar(im, ax=axis, label="Cell SFR [M☉/yr]")
+        axis.set(title=title, xlabel="Radial cell", ylabel="Polar cell")
+    fig.suptitle(f"{data['groups'][index]}  ·  {data['time'][index]:.5f} Gyr")
+    save_figure(fig, path)
+
+
 def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., burst_window=None,
-                   time_offset=0., burst_threshold=None):
+                   time_offset=0., burst_threshold=None, map_indices=()):
     """读取正式结果，生成独立分析目录；不覆盖已有分析，不重跑模型或访问训练数据。"""
     root=Path(result_dir).resolve()
     if not np.isfinite(gap_factor) or gap_factor<=1:
@@ -319,20 +364,45 @@ def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., bu
     loaded={s:load_predictions(root/f"{s}_predictions.pt",identity=manifest[s],
                               expected_groups=held if s=="out" else train_groups, expected_loss=contract.get("loss"))
             for s in (["test","out"] if exp=="exp2" else ["test"])}
+    if contract.get("loss", {}).get("schema_name") == "macnet_hurdle_cell_loss":
+        calibration = json.loads((root/"calibration.json").read_text(encoding="utf-8"))
+        if any(d.get("calibration") != calibration for d in loaded.values()):
+            raise ValueError("导出阈值与验证集校准记录不符。")
     if burst_window and exp!="exp2":
         raise ValueError("burst 分析仅对 Exp2 held-out 轨迹启用。")
+    extra_maps = {s: set() for s in loaded}
+    for split, index in map_indices:
+        if split not in loaded or not 0 <= int(index) < len(loaded[split]["sample_uid"]):
+            raise ValueError("指定的地图 split 或帧行号越界。")
+        extra_maps[split].add(int(index))
     stamp=datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
     output=Path(output_dir) if output_dir else root/f"analysis_sfr_unet_{stamp}_{uuid4().hex[:6]}"
     output.mkdir(parents=True,exist_ok=False)
     rows,integrals,bursts=[],[],[]
     for split,data in loaded.items():
         frame=sample_frame(data,split)
+        if "hard_map" in data:
+            y, hard = data["target_map"], data["hard_map"]
+            active, opened = y > 0, hard > 0
+            for key, values in {"hard_sfr": hard, "false_sfr": hard*(~active),
+                                "missed_sfr": y*(~opened), "active_amount_error": (hard-y)*opened*active}.items():
+                frame[key+"_msun_per_yr"] = values.sum((1, 2, 3))*SFR_FACTOR
+            for key, mask in {"tp": active & opened, "fp": ~active & opened, "fn": active & ~opened,
+                              "tn": ~active & ~opened, "recovered_baseline_miss": active & opened & (data["baseline_map"] == 0),
+                              "baseline_miss": active & (data["baseline_map"] == 0)}.items():
+                frame[key+"_cells"] = mask.sum((1, 2, 3))
         frame.to_csv(output/f"{split}_predictions.csv",index=False)
         for group,part in frame.groupby("type",sort=True):
             part=part.sort_values("time_gyr")
             if np.any(np.diff(part.time_gyr)<=0):
                 raise ValueError("同一运行存在重复/倒序时间。")
             indices=part.index.to_numpy()
+            if "hard_map" in data:
+                row = {"split": split, "run": group, "method": "HurdleHard", "n": len(part),
+                       **regression(data["target_total"][indices]*SFR_FACTOR, data["hard_total"][indices]*SFR_FACTOR)}
+                row.update({"Cell_"+k:v for k,v in regression(data["target_map"][indices].ravel()*SFR_FACTOR,
+                           data["hard_map"][indices].ravel()*SFR_FACTOR).items()})
+                rows.append(row)
             for label,key in (("Model","prediction"),("Baseline","baseline")):
                 row={"split":split,"run":group,"method":label,"n":len(part),
                      **regression(data["target_total"][indices]*SFR_FACTOR,data[key+"_total"][indices]*SFR_FACTOR)}
@@ -343,9 +413,19 @@ def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., bu
                 row["PositiveCellUnderSFR_mean"] = float(part[prefix+"_positive_cell_under_sfr"].mean())
                 rows.append(row)
             trajectory=None
-            if split=="out":
+            if split=="out" and not meta.get("smoke_subset"):
                 row,trajectory=integral_row(part,split=split,group=group,gap_factor=gap_factor)
                 integrals.append(row); trajectory.to_csv(output/f"{split}_trajectory.csv",index=False)
+                if "hard_map" in data:
+                    row["model_map"] = "mean"
+                    hard_part = sample_frame(dict(data, prediction_map=data["hard_map"],
+                                                  prediction_total=data["hard_total"]), split).loc[indices]
+                    hard_row, hard_history = integral_row(hard_part, split=split, group=group, gap_factor=gap_factor)
+                    integrals.append(dict(hard_row, model_map="hard"))
+                    hard_history.to_csv(output/f"{split}_hard_trajectory.csv", index=False)
+                    if burst_window:
+                        bursts.extend(dict(event, model_map="hard") for event in burst_metrics(
+                            hard_part, burst_window, offset=time_offset, threshold=burst_threshold, gap_factor=gap_factor))
                 if burst_window:
                     bursts.extend(burst_metrics(part,burst_window,offset=time_offset,threshold=burst_threshold,gap_factor=gap_factor))
             if plots:
@@ -353,6 +433,7 @@ def analyze_result(result_dir, *, output_dir=None, plots=True, gap_factor=5., bu
                 plot_group(part,folder,trajectory=trajectory,burst_window=burst_window if split=="out" else None,
                            time_offset=time_offset,gap_factor=gap_factor)
                 selected={indices[0],indices[-1],indices[np.argmax(data["target_total"][indices])]}
+                selected.update(extra_maps[split].intersection(indices))
                 for index in sorted(selected):
                     plot_maps(data,index,folder/f"maps_{index:05d}.png")
     metrics=pd.DataFrame(rows); integrated=pd.DataFrame(integrals)
@@ -390,6 +471,8 @@ def main(argv=None):
     parser.add_argument("--burst-window",type=float,nargs=2)
     parser.add_argument("--time-offset",type=float,default=0.)
     parser.add_argument("--burst-threshold",type=float)
+    parser.add_argument("--map-index", dest="map_indices", action="append", nargs=2, default=[],
+                        metavar=("SPLIT", "ROW"), help="另绘指定 split 的零基导出行号，可重复。")
     args=parser.parse_args(argv)
     result=analyze_result(**vars(args))
     print(result["metrics"].to_string(index=False)); print("Analysis:",result["output_dir"])

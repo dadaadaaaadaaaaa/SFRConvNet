@@ -2,7 +2,7 @@
 
 使用 [train_sfr_unet.py](train_sfr_unet.md) 的全部参数和同一训练核心，额外支持 Exp2 manifest、多 seed。
 不读取旧 `.config/ExperimentSetting.json`，避免误继承标量模型或 loss 设置。
-仅支持当前 Exp1/Exp2，objective 固定为逐格 signed closure。
+支持当前 Exp1/Exp2。默认逐格 signed closure，双头模式、阈值与服务器命令见[训练核心](train_sfr_unet.md#hurdle-双头训练与查看地图)。
 
 ## 单实验/单折
 

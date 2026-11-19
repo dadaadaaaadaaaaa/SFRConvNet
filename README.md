@@ -1,5 +1,7 @@
 # MACNet：面向宇宙学模拟的 MACER 小尺度物理闭合模型
 
+二维逐格 SFRUNet 增加可选 [hurdle 双头训练与双图导出](Experiment/train_sfr_unet.md#hurdle-双头训练与查看地图)，使用同一份固定 R_h 缓存。
+
 > **2026-11-02：方案 C 已完成二维逐格监督数据层。** 新 raw→fine→R_h 可保存逐格 Y/B/C；
 > [旧产品补齐入口](raw_data_processing/build_cell_sfr_supervision.md) 与
 > [原 cache 的逐格监督附加文件](Experiment/build_cell_supervision_cache.md) 已接通。

@@ -1,5 +1,8 @@
 # run_optuna_sfr_unet.py：逐格 SFRUNet 的 Exp1/Exp2 HPO
 
+hurdle 配置复用同一入口，允许搜索 `positive_weight` 和 `total_weight`。
+固定验证指标使用期望图。模型模式和训练尺度纳入 study 身份，阈值在正式训练选定 best 后校准。
+
 与正式训练共用 [train_sfr_unet.py](train_sfr_unet.md)。仅加载 train/val，
 不打开 test/out，不用 held-out 星系的标签、指标或尺度选参。
 每折的 dataset、逐格尺度仅加载/拟合一次，trial 间复用。

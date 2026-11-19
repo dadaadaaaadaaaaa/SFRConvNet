@@ -25,6 +25,7 @@ import torch
 from Experiment.SFRUNet import SFRUNet
 from Experiment.cell_sfr_dataset import CellSFRDataset, validate_cell_splits
 from Experiment.cell_sfr_objective import CellSFRLoss
+from Experiment.hurdle_sfr import HurdleCellSFRLoss, calibrate_threshold, occurrence_metrics
 from raw_data_processing.metadata_schema import sha256_file
 
 
@@ -62,6 +63,10 @@ class TrainConfig:
     output_constraint: str = "none"  # relu：在训练内投影最终 SFR，候选值仍可负。
     candidate_weight: float = 0.0  # relu 模式必须显式设置正辅助权重。
     zero_l1_weight: float = 0.0  # 真实零格子的最终SFR L1，默认关闭。
+    model_mode: str = "single"
+    positive_weight: float = 1.0
+    hurdle_target_fpr: float = .05
+    hurdle_reference: str = ""  # 可选同折 zero-L1 best.pt，优先用其验证集误报率。
     amp: str = "none"
     tensorboard: bool = True
     resume: str = ""
@@ -94,6 +99,15 @@ class TrainConfig:
                 raise ValueError(f"{name} 必须为有限非负数。")
         if self.output_constraint not in {"none", "relu"}:
             raise ValueError("output_constraint 只能为 none/relu。")
+        if self.model_mode not in {"single", "hurdle_direct", "hurdle_closure"}:
+            raise ValueError("未知逐格输出模式。")
+        if not math.isfinite(self.positive_weight) or self.positive_weight <= 0 or not 0 <= self.hurdle_target_fpr <= 1:
+            raise ValueError("正格权重须为正，目标误报率须在 [0,1]。")
+        if self.model_mode != "single" and (self.output_constraint != "none" or self.candidate_weight
+                                            or self.zero_l1_weight or self.negative_weight != 1):
+            raise ValueError("hurdle 使用独立三项损失，请移除旧输出约束和权重设置。")
+        if self.model_mode == "single" and (self.hurdle_reference or self.positive_weight != 1 or self.hurdle_target_fpr != .05):
+            raise ValueError("hurdle 参数需要双头模式。")
         if ((self.output_constraint == "relu" and self.candidate_weight <= 0)
                 or (self.output_constraint == "none" and self.candidate_weight != 0)):
             raise ValueError("relu 要求 candidate_weight>0；none 要求 candidate_weight=0。")
@@ -190,6 +204,9 @@ class DataBundle:
                     or ds.base.geometry_input_contract != train.base.geometry_input_contract):
                 raise ValueError("split 间输入变换契约不一致。")
         self.scales = train.fit_scales()
+        if config.model_mode != "single":
+            positive = train.target[train.target > 0]
+            self.scales["amount_scale"] = float(torch.quantile(positive, .5)) if positive.numel() else 1.
         # HPO 与正式训练共享 train/val 契约；test/out 身份另行保存，不进入参数选择。
         self.contract = {"schema": "macnet_sfr_unet_data_v1", "metadata_sha256": sha256_file(metadata_path),
                          "norm_sha256": sha256_file(norm_path), "experiment": experiment,
@@ -201,6 +218,9 @@ class DataBundle:
             (Path(__file__).parent / name).read_text(encoding="utf-8").encode("utf-8")).hexdigest() for name in
             ("SFRUNet.py", "cell_sfr_objective.py", "cell_sfr_dataset.py", "train_sfr_unet.py")}
         self.evaluation_identities = {s: v for s, v in identities.items() if s not in {"train", "val"}}
+        if config.model_mode != "single":
+            source = Path(__file__).with_name("hurdle_sfr.py").read_text(encoding="utf-8")
+            self.contract["implementation_sha256"]["hurdle_sfr.py"] = hashlib.sha256(source.encode()).hexdigest()
 
 
 def batch_indices(n, size, *, shuffle=False):
@@ -236,10 +256,13 @@ def summarize_statistics(rows):
 
 
 @torch.no_grad()
-def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none", save_predictions=False):
+def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none", save_predictions=False,
+             calibration=None):
     """固定系数联合指标，先各运行内部平均再等权平均；不随训练 loss 权重变化。"""
     model.eval()
     stats, baseline_stats, maps, candidates, candidate_corrections = [], [], [], [], []
+    hurdle = isinstance(objective, HurdleCellSFRLoss)
+    probabilities, amounts = [], []
     for indices in batch_indices(len(dataset), batch_size):
         x, coord, b, y = move_batch(dataset, indices, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp == "bfloat16"):
@@ -248,10 +271,15 @@ def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none
         p = detail["sfr_map_physical"]
         stats.append(_statistics(p, y, scales).cpu())
         baseline_stats.append(_statistics(b, y, scales).cpu())
+        if hurdle:
+            probabilities.append(detail["probability_map"].cpu())
         if save_predictions:
             maps.append(p.cpu())
-            candidates.append(detail["candidate_sfr_map_physical"].cpu())
-            candidate_corrections.append(detail["candidate_closure_map_physical"].cpu())
+            if hurdle:
+                amounts.append(detail["amount_map"].cpu())
+            else:
+                candidates.append(detail["candidate_sfr_map_physical"].cpu())
+                candidate_corrections.append(detail["candidate_closure_map_physical"].cpu())
     stats, baseline_stats = torch.cat(stats), torch.cat(baseline_stats)
     groups = dataset.base.groups.flatten()
     def aggregate(rows):
@@ -259,18 +287,34 @@ def evaluate(model, dataset, objective, scales, *, device, batch_size, amp="none
         return {"all_samples": summarize_statistics(rows), "per_run": per_group,
                 "macro_joint_score": sum(v["joint_score"] for v in per_group.values()) / len(per_group)}
     metrics = {"model": aggregate(stats), "baseline": aggregate(baseline_stats), "units": "MACER_mass_code/Gyr"}
+    if hurdle:
+        probability = torch.cat(probabilities)
+        metrics["occurrence"] = occurrence_metrics(probability, dataset.target)
     predictions = None
     if save_predictions:
         p = torch.cat(maps)
         predictions = {"schema": "macnet_sfr_unet_predictions_v2", "sample_uid": dataset.sample_uid,
-                       "output_constraint": objective.output_constraint, "loss_contract": objective.loss_contract(),
-                       "candidate_map": torch.cat(candidates), "candidate_closure_map": torch.cat(candidate_corrections),
+                       "loss_contract": objective.loss_contract(),
                        "parent_hr_uid": dataset.parent_hr_uid, "time": dataset.base.time,
                        "groups": [dataset.base.group_names[i] for i in groups.tolist()],
                        "prediction_map": p, "target_map": dataset.target, "baseline_map": dataset.baseline,
                        "closure_map": p - dataset.baseline, "prediction_total": p.sum((1, 2, 3)),
                        "target_total": dataset.target.sum((1, 2, 3)), "baseline_total": dataset.baseline.sum((1, 2, 3)),
                        "units": "MACER_mass_code/Gyr", "to_msun_per_yr": .025}
+        if hurdle:
+            amount = torch.cat(amounts)
+            predictions.update(schema="macnet_sfr_unet_hurdle_predictions_v1", probability_map=probability,
+                               amount_map=amount, prediction_definition="mean")
+            if calibration is not None:
+                hard = torch.where(probability >= calibration["threshold"], amount, 0.)
+                predictions.update(hard_map=hard, hard_total=hard.sum((1, 2, 3)),
+                                   hard_closure_map=hard-dataset.baseline, calibration=calibration)
+                metrics["hard"] = aggregate(_statistics(hard, dataset.target, scales))
+            elif dataset.split != "val":
+                raise ValueError("硬图导出缺少验证集阈值。")
+        else:
+            predictions.update(output_constraint=objective.output_constraint, candidate_map=torch.cat(candidates),
+                               candidate_closure_map=torch.cat(candidate_corrections))
     return metrics, predictions
 
 
@@ -278,6 +322,8 @@ def invariant_config(config):
     """允许换输出位置/执行设备与暂停长度，其余恢复条件必须相同。"""
     excluded = {"cache_dir", "cell_cache_dir", "output_root", "run_name", "device", "cpu_threads",
                 "tensorboard", "resume", "stop_after_epochs"}
+    if config.model_mode == "single":
+        excluded.update(("model_mode", "positive_weight", "hurdle_target_fpr", "hurdle_reference"))
     return json.loads(json.dumps({k: v for k, v in asdict(config).items() if k not in excluded}))
 
 
@@ -290,6 +336,51 @@ def _restore_rng(state):
     random.setstate(state["python"]); np.random.set_state(state["numpy"]); torch.set_rng_state(state["torch"])
     if state["cuda"] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def resume_data_matches(saved, current, mode):
+    if fingerprint(saved) == fingerprint(current):
+        return True
+    # 仅迁移接入双头前已回归验证的单头实现；数据、尺度及其余源码指纹仍逐项核对。
+    previous = {"SFRUNet.py": "d312430a993c6c2786e16c6de80d012a24b64f212d276f6dffc32a11633f397e",
+                "train_sfr_unet.py": "c94277961c0d8621663bbe570eed6430f676e5f17702c210e25882e5b4397b44"}
+    migrated = dict(current, implementation_sha256={**current["implementation_sha256"], **previous})
+    return mode == "single" and fingerprint(saved) == fingerprint(migrated)
+
+
+def validation_calibration(config, bundle, model, objective, device, best_epoch):
+    val = bundle.datasets["val"]
+    kwargs = dict(device=device, batch_size=config.batch_size, amp=config.amp, save_predictions=True)
+    _, predictions = evaluate(model, val, objective, bundle.scales, **kwargs)
+    target_fpr = config.hurdle_target_fpr
+    source = {"method": "configured_fpr"}
+    if config.hurdle_reference:
+        path = Path(config.hurdle_reference)
+        ref = torch.load(path, map_location="cpu", weights_only=False)
+        loss = ref["loss_contract"]
+        if (path.name != "best.pt" or ref.get("hpo") is not False or loss.get("output_constraint") != "relu"
+                or loss.get("zero_l1_weight", 0) <= 0 or ref["data_contract"]["train_val"] != bundle.contract["train_val"]
+                or ref["data_contract"]["normalization"] != bundle.normalization):
+            raise ValueError("比较模型须为同一训练/验证缓存、归一化和 ReLU+zero-L1 的 best.pt。")
+        ref_model = SFRUNet(**ref["model_contract"]["config"]).to(device)
+        ref_model.load_state_dict(ref["model"])
+        ref_loss = CellSFRLoss.from_scale_contract(ref["data_contract"]["scales"], **{
+            key: loss[key] for key in ("total_weight", "negative_weight", "candidate_weight",
+                                       "output_constraint", "zero_l1_weight")}).to(device)
+        _, legacy = evaluate(ref_model, val, ref_loss, bundle.scales, **kwargs)
+        zeros = val.target == 0
+        if not zeros.any():
+            raise ValueError("验证集无真零格。")
+        target_fpr = float((legacy["prediction_map"][zeros] > 0).double().mean())
+        source = {"method": "matched_zero_l1_val_fpr", "reference_sha256": sha256_file(path)}
+    calibration = calibrate_threshold(predictions["probability_map"], val.target, target_fpr, split=val.split)
+    train_ds = bundle.datasets["train"]
+    unique_rows = np.unique(train_ds.sample_uid, return_index=True)[1]
+    position_rate = (train_ds.target[unique_rows] > 0).double().mean(0)
+    return {**calibration, **source, "best_epoch": best_epoch,
+            "validation_occurrence": occurrence_metrics(predictions["probability_map"], val.target),
+            "validation_position_only": occurrence_metrics(position_rate.expand_as(val.target), val.target),
+            "val_cache": bundle.contract["train_val"]["val"], "val_uids_sha256": fingerprint(val.sample_uid)}
 
 
 def train(config, *, bundle=None, hpo=False, epoch_callback=None):
@@ -308,12 +399,17 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
         raise ValueError("训练至少需要两个 snapshot。")
     config_model = {k: getattr(config, k) for k in ("base_ch", "encoder_depths", "decoder_depths", "bottleneck_depth",
                     "pos_num_bands", "pos_max_freq", "p_drop", "se_reduction")}
-    model = SFRUNet(len(ds.input_channels), **config_model).to(device)
-    objective = CellSFRLoss.from_scale_contract(bundle.scales, total_weight=config.total_weight,
-                                               negative_weight=config.negative_weight,
-                                               output_constraint=config.output_constraint,
-                                               candidate_weight=config.candidate_weight,
-                                               zero_l1_weight=config.zero_l1_weight).to(device)
+    hurdle = config.model_mode != "single"
+    model = SFRUNet(len(ds.input_channels), hurdle=hurdle, **config_model).to(device)
+    if hurdle:
+        objective = HurdleCellSFRLoss(bundle.scales, mode=config.model_mode, amount_scale=bundle.scales["amount_scale"],
+                                     positive_weight=config.positive_weight, total_weight=config.total_weight).to(device)
+    else:
+        objective = CellSFRLoss.from_scale_contract(bundle.scales, total_weight=config.total_weight,
+                                                   negative_weight=config.negative_weight,
+                                                   output_constraint=config.output_constraint,
+                                                   candidate_weight=config.candidate_weight,
+                                                   zero_l1_weight=config.zero_l1_weight).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     warmup = math.ceil(config.epochs * config.warmup_ratio)
     def schedule(epoch):
@@ -330,7 +426,7 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         if (checkpoint.get("schema") != "macnet_sfr_unet_checkpoint_v1" or checkpoint["hpo"] != hpo
                 or checkpoint["invariant_config"] != invariant_config(config)
-                or fingerprint(checkpoint["data_contract"]) != fingerprint(bundle.contract)
+                or not resume_data_matches(checkpoint["data_contract"], bundle.contract, config.model_mode)
                 or checkpoint["evaluation_identities"] != bundle.evaluation_identities):
             raise ValueError("恢复配置或数据契约与 checkpoint 不一致。")
         output = path.resolve().parent
@@ -356,9 +452,8 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
     if config.tensorboard:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(str(output / "tensorboard"), purge_step=start+1 if start else None)
-    print(f"SFRUNet: objective=signed_closure; loss_space=physical_sfr; conditioning=none; device={device}")
-    print(f"Output constraint={config.output_constraint}; candidate_weight={config.candidate_weight}; "
-          f"zero_l1_weight={config.zero_l1_weight}; effective negative_weight={objective.loss_contract()['negative_weight']}; selection excludes candidate/zero L1 loss")
+    print(f"SFRUNet: objective={objective.loss_contract()['objective']}; conditioning=none; device={device}")
+    print("Loss contract:", objective.loss_contract())
     print(f"Input channels: {ds.input_channels}; shape={ds.spatial_shape}; scales={bundle.scales['closure_scale']:.6g},"
           f"{bundle.scales['cell_scale']:.6g},{bundle.scales['total_scale']:.6g}; CPU threads={torch.get_num_threads()}")
     print(f"Output: {output}", flush=True)
@@ -387,9 +482,14 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                         raise FloatingPointError("梯度非有限，停止当前训练。") from exc
                     raise
                 optimizer.step()
-                sums += torch.stack([loss.detach(), detail["cell_loss"].detach(), detail["total_sfr_loss"].detach(),
-                                     detail["negative_penalty"].detach(), detail["candidate_loss"].detach()]) * len(indices)
-                zero_l1_sum += detail["zero_l1_loss"].detach() * len(indices)
+                if hurdle:
+                    n = len(indices)
+                    sums += torch.stack([loss*n, detail["occurrence_loss"]*n, detail["total_sfr_loss"]*n,
+                                         detail["positive_loss_sum"], detail["positive_count"]]).detach()
+                else:
+                    sums += torch.stack([loss.detach(), detail["cell_loss"].detach(), detail["total_sfr_loss"].detach(),
+                                         detail["negative_penalty"].detach(), detail["candidate_loss"].detach()]) * len(indices)
+                    zero_l1_sum += detail["zero_l1_loss"].detach() * len(indices)
             validation, _ = evaluate(model, bundle.datasets["val"], objective, bundle.scales, device=device,
                                      batch_size=config.batch_size, amp=config.amp)
             score = validation["model"]["macro_joint_score"]
@@ -404,6 +504,12 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
             row = {"epoch": epoch+1, "train_loss": (sums / len(ds)).cpu().tolist(), "val": validation,
                    "train_zero_l1_loss": float((zero_l1_sum / len(ds)).cpu()),
                    "score": score, "lr": lr, "seconds": time.perf_counter()-begin}
+            if hurdle:
+                weighted, occurrence, total, pos_sum, count = sums.tolist()
+                row.pop("train_zero_l1_loss")
+                row["train_loss"] = [weighted / len(ds)]
+                row["train_hurdle"] = {"occurrence": occurrence / len(ds), "positive": pos_sum / max(count, 1),
+                                       "global": total / len(ds), "positive_count": int(count)}
             history.append(row)
             checkpoint = {"schema": "macnet_sfr_unet_checkpoint_v1", "hpo": hpo,
                           "config": asdict(config), "invariant_config": invariant_config(config),
@@ -422,7 +528,11 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
                 for key, value in zip(("total", "cell", "global", "negative", "candidate"), row["train_loss"]):
                     writer.add_scalar(f"train/{key}", value, epoch+1)
                 writer.add_scalar("val/macro_joint", score, epoch+1)
-                writer.add_scalar("train/zero_l1", row["train_zero_l1_loss"], epoch+1)
+                if hurdle:
+                    for key, value in row["train_hurdle"].items():
+                        writer.add_scalar("train/"+key, value, epoch+1)
+                else:
+                    writer.add_scalar("train/zero_l1", row["train_zero_l1_loss"], epoch+1)
                 for group, metrics in validation["model"]["per_run"].items():
                     for key in ("cell_rmse", "total_rmse", "total_mae", "negative_fraction"):
                         writer.add_scalar(f"val/{group}/{key}", metrics[key], epoch+1)
@@ -436,10 +546,15 @@ def train(config, *, bundle=None, hpo=False, epoch_callback=None):
         if completed and not hpo:
             model.load_state_dict(torch.load(output / "best.pt", map_location=device, weights_only=False)["model"])
             report["evaluation"] = {}
+            calibration = None
+            if hurdle:
+                calibration = validation_calibration(config, bundle, model, objective, device, best_epoch)
+                atomic_save(output / "calibration.json", calibration, json_format=True)
             for split in ("test", "out"):
                 if split in bundle.datasets:
                     metrics, predictions = evaluate(model, bundle.datasets[split], objective, bundle.scales,
-                        device=device, batch_size=config.batch_size, amp=config.amp, save_predictions=True)
+                        device=device, batch_size=config.batch_size, amp=config.amp, save_predictions=True,
+                        calibration=calibration)
                     report["evaluation"][split] = metrics
                     atomic_save(output / f"{split}_predictions.pt", predictions)
         atomic_save(output / "summary.json", report, json_format=True)

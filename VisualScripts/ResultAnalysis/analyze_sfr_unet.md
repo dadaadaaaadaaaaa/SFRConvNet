@@ -1,5 +1,10 @@
 # SFRUNet 结果分析与 Exp2 notebook
 
+命令行分析器支持 hurdle 双头预测。六联图依次显示 HR 真值、期望 SFR、硬门 SFR、
+MACER-LR、条件正值强度与开启概率，五幅 SFR 图共用物理色标。可用
+`--map-index out 9` 指定更多导出行号，帧 UID 和时间见逐帧 CSV。硬图的总量和
+误差分解单独输出。完整 out 时序支持硬图积分；带 smoke_subset 标记的抽帧数据跳过积分。
+
 `analyze_sfr_unet.py` 直接读取正式训练已保存的物理预测文件；不加载网络、不访问 raw/HDF5/cache。
 对应交互入口为 `Results_stat_Exp2_SFRUNet.ipynb`，每个代码 cell 均有中文总注释。
 不修改旧 `analysis_utils.py/analyze_exp2.py` 和旧 notebook。

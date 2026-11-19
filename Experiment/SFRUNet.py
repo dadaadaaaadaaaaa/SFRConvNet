@@ -33,7 +33,7 @@ class SFRUNet(nn.Module):
                  encoder_depths=(2, 2), bottleneck_depth: int = 2,
                  decoder_depths=(2, 2), pos_num_bands: int = 4,
                  pos_max_freq: float = 4.0, p_drop: float = 0.0,
-                 se_reduction: int = 4):
+                 se_reduction: int = 4, hurdle: bool = False):
         super().__init__()
         for name, value in (("c_in", c_in), ("base_ch", base_ch),
                             ("bottleneck_depth", bottleneck_depth),
@@ -80,6 +80,10 @@ class SFRUNet(nn.Module):
         # 小幅初始 closure 接近物理 baseline，非全零权重仍允许首步梯度进入主干。
         nn.init.normal_(self.head.weight, std=1e-3)
         nn.init.zeros_(self.head.bias)
+        if hurdle:
+            self.config["hurdle"] = True
+            self.prediction_mode = "hurdle"
+            self.occurrence_head = nn.Conv2d(c1, 1, 1)
 
     def forward(self, x, r, theta, conditioning_scalar=None):
         """返回逐格 z_hat；只允许 inactive 的全零条件占位，兼容旧 predict_batch 调用形状。"""
@@ -102,12 +106,16 @@ class SFRUNet(nn.Module):
         d2 = self.decoder2(torch.cat([u2, e2], dim=1))
         u1 = self.up1_projection(F.interpolate(d2, size=e1.shape[-2:], mode="bilinear", align_corners=False))
         d1 = self.decoder1(torch.cat([u1, e1], dim=1))
+        if self.prediction_mode == "hurdle":
+            return {"occurrence_logits": self.occurrence_head(d1), "amount_raw": self.head(d1)}
         return self.head(d1)
 
     def model_contract(self):
         """供 checkpoint 保存；不是原标量模型配置的替代品。"""
-        return {"architecture": "SFRUNet", "version": 1, "config": dict(self.config),
-                "output": "signed_asinh_cell_closure", "output_axes": ["sample", "channel", "theta", "r"],
+        hurdle = self.prediction_mode == "hurdle"
+        return {"architecture": "SFRUNet", "version": 2 if hurdle else 1, "config": dict(self.config),
+                "output": ["occurrence_logits", "amount_raw"] if hurdle else "signed_asinh_cell_closure",
+                "output_axes": ["sample", "channel", "theta", "r"],
                 "conditioning": "none", "spatial_output": True,
                 "baseline_is_model_input": False}
 

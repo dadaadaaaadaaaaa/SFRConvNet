@@ -1,5 +1,8 @@
 # SFRUNet：二维逐格 signed-closure 模型
 
+可选 hurdle 模式复用下述主干，在最后一级解码器上并行输出 `occurrence_logits` 和
+`amount_raw`。训练参数、公式及地图示例命令见[双头训练说明](train_sfr_unet.md#hurdle-双头训练与查看地图)。
+
 此模块实现方案 C 的**逐格预测与逐格监督**，独立于 `models.py` 的标量 SFRConvNet。
 网络、损失和数据适配器已经接通；现有 `run_train.py/run_optuna.py` 仍是标量入口。
 2026-11-03 新增独立 [run_train_sfr_unet.py](run_train_sfr_unet.md) 和
